@@ -248,7 +248,8 @@ public class BedrockAgentCoreControlController {
         try {
             JsonNode req = objectMapper.readTree(body != null && !body.isBlank() ? body : "{}");
             AgentRuntimeEndpoint endpoint = service.createEndpoint(id, text(req, "name"),
-                    text(req, "agentRuntimeVersion"), text(req, "description"), text(req, "clientToken"), region);
+                    text(req, "agentRuntimeVersion"), text(req, "description"), text(req, "clientToken"),
+                    stringMap(req.get("tags")), region);
             AgentRuntime runtime = service.getAgentRuntime(id, region);
             return Response.status(202).entity(endpointResponse(runtime, endpoint, region, false)).build();
         } catch (Exception e) {

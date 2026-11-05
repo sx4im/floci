@@ -330,6 +330,60 @@ public class BedrockAgentCoreControlService {
         storage.put(key(region, runtime.getAgentRuntimeId()), runtime);
     }
 
+    /** The tags stored on an endpoint, addressed by either endpoint ARN form. */
+    public Map<String, String> getEndpointTagsByArn(String region, String arn) {
+        return new HashMap<>(requireEndpointByArn(region, arn).endpoint().getTags());
+    }
+
+    public void tagEndpointByArn(String region, String arn, Map<String, String> tags) {
+        EndpointLocation location = requireEndpointByArn(region, arn);
+        synchronized (runtimeLock(region, location.runtime().getAgentRuntimeId())) {
+            AgentRuntime runtime = getAgentRuntime(location.runtime().getAgentRuntimeId(), region);
+            AgentRuntimeEndpoint endpoint = findEndpoint(runtime, location.endpoint().getName());
+            endpoint.getTags().putAll(tags);
+            storage.put(key(region, runtime.getAgentRuntimeId()), runtime);
+        }
+    }
+
+    public void untagEndpointByArn(String region, String arn, List<String> keys) {
+        EndpointLocation location = requireEndpointByArn(region, arn);
+        synchronized (runtimeLock(region, location.runtime().getAgentRuntimeId())) {
+            AgentRuntime runtime = getAgentRuntime(location.runtime().getAgentRuntimeId(), region);
+            AgentRuntimeEndpoint endpoint = findEndpoint(runtime, location.endpoint().getName());
+            keys.forEach(endpoint.getTags()::remove);
+            storage.put(key(region, runtime.getAgentRuntimeId()), runtime);
+        }
+    }
+
+    /**
+     * The endpoint an ARN names, by the {@code agentEndpoint/<uuid>} ARN
+     * {@link #endpointArn} returns or by the nested
+     * {@code runtime/<runtimeId>/runtime-endpoint/<name>} ARN shape. A well-formed ARN
+     * naming nothing is ResourceNotFoundException, matching AWS for a missing endpoint,
+     * not a validation error.
+     */
+    private EndpointLocation requireEndpointByArn(String region, String arn) {
+        String resource = BedrockAgentCoreArns.resource(arn);
+        if (resource != null && resource.startsWith("agentEndpoint/")) {
+            return findEndpointByArn(region, arn)
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                            "AgentCore resource not found: " + arn, 404));
+        }
+        if (resource != null && resource.startsWith("runtime/")) {
+            String rest = resource.substring("runtime/".length());
+            int split = rest.indexOf("/runtime-endpoint/");
+            if (split > 0) {
+                String runtimeId = rest.substring(0, split);
+                String name = rest.substring(split + "/runtime-endpoint/".length());
+                if (!name.isEmpty()) {
+                    AgentRuntime runtime = getAgentRuntime(runtimeId, region);
+                    return new EndpointLocation(runtime, findEndpoint(runtime, name));
+                }
+            }
+        }
+        throw new AwsException("ValidationException", "Unsupported resource ARN: " + arn, 400);
+    }
+
     /** The runtime a runtime ARN names, at any version; ResourceNotFoundException when none does. */
     public AgentRuntime getAgentRuntimeByArn(String region, String arn) {
         String uuid = uuidFromArn(arn);
@@ -354,6 +408,12 @@ public class BedrockAgentCoreControlService {
 
     public AgentRuntimeEndpoint createEndpoint(String runtimeId, String name, String agentRuntimeVersion,
                                                String description, String clientToken, String region) {
+        return createEndpoint(runtimeId, name, agentRuntimeVersion, description, clientToken, null, region);
+    }
+
+    public AgentRuntimeEndpoint createEndpoint(String runtimeId, String name, String agentRuntimeVersion,
+                                               String description, String clientToken, Map<String, String> tags,
+                                               String region) {
         synchronized (runtimeLock(region, runtimeId)) {
             AgentRuntime runtime = getAgentRuntime(runtimeId, region);
             if (clientToken != null) {
@@ -378,6 +438,9 @@ public class BedrockAgentCoreControlService {
             requirePublishedVersion(runtime, version);
             AgentRuntimeEndpoint endpoint = newEndpoint(name, version, description, Instant.now());
             endpoint.setClientToken(clientToken);
+            if (tags != null) {
+                endpoint.getTags().putAll(tags);
+            }
             runtime.getEndpoints().add(endpoint);
             storage.put(key(region, runtimeId), runtime);
             LOG.infov("Created AgentCore endpoint {0} on runtime {1}", name, runtimeId);

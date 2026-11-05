@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -444,6 +445,77 @@ class BedrockAgentCoreControlServiceTest {
         // A different token against the now-missing endpoint still 404s.
         assertEquals(404, assertThrows(AwsException.class,
                 () -> service.deleteEndpoint(id, "prod", "other", REGION)).getHttpStatus());
+    }
+
+    @Test
+    void createEndpointStoresCreateTagsApartFromRuntimeTags() {
+        AgentRuntime rt = service.createAgentRuntime("tagAgent", artifact(), network(),
+                "arn:aws:iam::000000000000:role/agent", null, null, null, null,
+                Map.of("team", "runtime"), null, REGION);
+        String id = rt.getAgentRuntimeId();
+        AgentRuntimeEndpoint ep = service.createEndpoint(id, "prod", null, null, null,
+                Map.of("team", "core"), REGION);
+
+        assertEquals(Map.of("team", "core"), ep.getTags());
+        assertEquals(Map.of("team", "core"),
+                service.getEndpointTagsByArn(REGION, service.endpointArn(ep, REGION)));
+        assertEquals(Map.of("team", "runtime"),
+                service.getTagsByArn(REGION, service.arn(rt, "1", REGION)));
+    }
+
+    @Test
+    void endpointTagUntagRoundTripByArn() {
+        AgentRuntime rt = create("tagAgent");
+        String id = rt.getAgentRuntimeId();
+        AgentRuntimeEndpoint ep = service.createEndpoint(id, "prod", null, null, null, REGION);
+        String arn = service.endpointArn(ep, REGION);
+
+        service.tagEndpointByArn(REGION, arn, Map.of("env", "dev"));
+        assertEquals(Map.of("env", "dev"), service.getEndpointTagsByArn(REGION, arn));
+        service.untagEndpointByArn(REGION, arn, List.of("env"));
+        assertEquals(Map.of(), service.getEndpointTagsByArn(REGION, arn));
+        // The runtime's own tags are untouched by endpoint tagging.
+        assertEquals(Map.of(), service.getTagsByArn(REGION, service.arn(rt, "1", REGION)));
+    }
+
+    @Test
+    void endpointTagsResolveByNestedArn() {
+        AgentRuntime rt = create("tagAgent");
+        String id = rt.getAgentRuntimeId();
+        service.createEndpoint(id, "prod", null, null, null, Map.of("team", "core"), REGION);
+        String nested = "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/" + id + "/runtime-endpoint/prod";
+
+        assertEquals(Map.of("team", "core"), service.getEndpointTagsByArn(REGION, nested));
+        service.tagEndpointByArn(REGION, nested, Map.of("env", "dev"));
+        assertEquals(Map.of("team", "core", "env", "dev"), service.getEndpointTagsByArn(REGION, nested));
+    }
+
+    @Test
+    void endpointTagsForMissingEndpointReturn404() {
+        AgentRuntime rt = create("tagAgent");
+        String id = rt.getAgentRuntimeId();
+        String unknownUuid = "arn:aws:bedrock-agentcore:us-east-1:000000000000:agentEndpoint/00000000-0000-0000-0000-000000000000";
+        assertEquals(404, assertThrows(AwsException.class,
+                () -> service.getEndpointTagsByArn(REGION, unknownUuid)).getHttpStatus());
+        String unknownNested = "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/" + id + "/runtime-endpoint/nope";
+        assertEquals(404, assertThrows(AwsException.class,
+                () -> service.getEndpointTagsByArn(REGION, unknownNested)).getHttpStatus());
+        String unknownRuntime = "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/ghost-abcdefghij/runtime-endpoint/prod";
+        assertEquals(404, assertThrows(AwsException.class,
+                () -> service.getEndpointTagsByArn(REGION, unknownRuntime)).getHttpStatus());
+    }
+
+    @Test
+    void endpointCreateReplayKeepsOriginalTags() {
+        AgentRuntime rt = create("tagAgent");
+        String id = rt.getAgentRuntimeId();
+        AgentRuntimeEndpoint first = service.createEndpoint(id, "prod", null, null, "ep-tag-replay-1",
+                Map.of("team", "core"), REGION);
+        AgentRuntimeEndpoint replay = service.createEndpoint(id, "prod", null, null, "ep-tag-replay-1",
+                Map.of("env", "dev"), REGION);
+
+        assertEquals(first.getUuid(), replay.getUuid());
+        assertEquals(Map.of("team", "core"), replay.getTags());
     }
 
     @Test

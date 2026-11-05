@@ -90,6 +90,45 @@ class BedrockAgentCorePersistenceTest {
     }
 
     @Test
+    void endpointTagsSurvivePersistentStorageRoundTrip(@TempDir Path dir) {
+        BedrockAgentCoreControlService svc = new BedrockAgentCoreControlService(
+                new InMemoryStorage<>(), new RegionResolver(REGION, "000000000000"));
+
+        ObjectNode artifact = mapper.createObjectNode();
+        artifact.putObject("containerConfiguration").put("containerUri", "x:latest");
+        ObjectNode network = mapper.createObjectNode();
+        network.put("networkMode", "PUBLIC");
+
+        AgentRuntime created = svc.createAgentRuntime("persistEpTagAgent", artifact, network,
+                "arn:aws:iam::000000000000:role/agent", null, null, null, null,
+                Map.of("team", "runtime"), null, REGION);
+        String id = created.getAgentRuntimeId();
+        svc.createEndpoint(id, "prod", null, null, null, Map.of("team", "core"), REGION);
+        AgentRuntime before = svc.getAgentRuntime(id, REGION);
+        svc.tagEndpointByArn(REGION, svc.endpointArn(before.getEndpoints().stream()
+                .filter(e -> "prod".equals(e.getName())).findFirst().orElseThrow(), REGION),
+                Map.of("env", "dev"));
+        before = svc.getAgentRuntime(id, REGION);
+
+        Path file = dir.resolve("bedrock-agentcore-endpoint-tags.json");
+        TypeReference<Map<String, AgentRuntime>> ref = new TypeReference<>() {};
+        PersistentStorage<String, AgentRuntime> writer = new PersistentStorage<>(file, ref);
+        writer.put("runtime:" + REGION + ":" + id, before);
+        writer.flush();
+
+        PersistentStorage<String, AgentRuntime> reader = new PersistentStorage<>(file, ref);
+        reader.load();
+        AgentRuntime loaded = reader.get("runtime:" + REGION + ":" + id).orElseThrow();
+
+        // Endpoint tags survive on the endpoint, apart from the runtime's own tags.
+        assertEquals("runtime", loaded.getTags().get("team"));
+        assertEquals("core", loaded.getEndpoints().stream()
+                .filter(e -> "prod".equals(e.getName())).findFirst().orElseThrow().getTags().get("team"));
+        assertEquals("dev", loaded.getEndpoints().stream()
+                .filter(e -> "prod".equals(e.getName())).findFirst().orElseThrow().getTags().get("env"));
+    }
+
+    @Test
     void tagsSentToCreateAgentRuntimeAreInTheWalRecord(@TempDir Path dir) throws IOException {
         TypeReference<Map<String, AgentRuntime>> ref = new TypeReference<>() {};
         Path wal = dir.resolve("runtimes.wal");
