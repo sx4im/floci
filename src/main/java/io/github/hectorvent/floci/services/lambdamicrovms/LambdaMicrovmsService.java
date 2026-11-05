@@ -123,6 +123,17 @@ public class LambdaMicrovmsService {
         public String state;
         public String status;
         public Instant createdAt;
+        /**
+         * The build spec this version was minted from. A version describes the
+         * build that produced it, so these are snapshotted when the version is
+         * created rather than read off the image, whose fields move on with
+         * every update. Null on records stored before the snapshot existed;
+         * readers fall back to the image's values for those.
+         */
+        public String baseImageArn;
+        public String baseImageVersion;
+        public String buildRoleArn;
+        public String codeArtifactUri;
         public final List<MicrovmBuild> builds = new ArrayList<>();
     }
 
@@ -180,6 +191,10 @@ public class LambdaMicrovmsService {
         version.state = "SUCCESSFUL";
         version.status = "ACTIVE";
         version.createdAt = Instant.now();
+        version.baseImageArn = image.baseImageArn;
+        version.baseImageVersion = image.baseImageVersion;
+        version.buildRoleArn = image.buildRoleArn;
+        version.codeArtifactUri = image.codeArtifactUri;
         // A version is built once per Graviton generation the service targets,
         // newest first. Recorded live: two builds per version, not one.
         for (String generation : CHIPSET_GENERATIONS) {
