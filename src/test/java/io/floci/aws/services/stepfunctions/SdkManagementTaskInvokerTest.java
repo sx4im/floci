@@ -19,9 +19,10 @@ class SdkManagementTaskInvokerTest {
 
     private final ObjectMapper mapper = new ObjectMapper();
     private final EcsJsonHandler ecs = mock(EcsJsonHandler.class);
+    private final LambdaController lambda = mock(LambdaController.class);
     private final ServiceRegistry registry = mock(ServiceRegistry.class);
     private final SdkManagementTaskInvoker invoker = new SdkManagementTaskInvoker(ecs,
-            mock(LambdaController.class), mock(SecretsManagerJsonHandler.class), registry, mapper);
+            lambda, mock(SecretsManagerJsonHandler.class), registry, mapper);
 
     @Test
     void recasesModeledEcsMembersWithoutChangingLogOptionKeysOrValues() throws Exception {
@@ -83,6 +84,48 @@ class SdkManagementTaskInvokerTest {
                 () -> invoker.invoke(integration(), mapper.createObjectNode(), "us-east-1"));
         assertEquals("Ecs.ClientException", error.error);
         assertEquals("synthetic failure", error.cause);
+    }
+
+    @Test
+    void updateEventSourceMappingAcceptsUuidParameter() throws Exception {
+        when(registry.isServiceEnabled("lambda")).thenReturn(true);
+        when(lambda.updateEventSourceMapping(eq("abc-123"), anyString()))
+                .thenReturn(Response.ok(mapper.readTree("{\"UUID\":\"abc-123\",\"Enabled\":false}")).build());
+        JsonNode result = invoker.invoke(lambdaIntegration("updateEventSourceMapping"),
+                mapper.readTree("{\"Uuid\":\"abc-123\",\"Enabled\":false}"), "us-east-1");
+
+        ArgumentCaptor<String> body = ArgumentCaptor.forClass(String.class);
+        verify(lambda).updateEventSourceMapping(eq("abc-123"), body.capture());
+        assertEquals("abc-123", result.path("UUID").asText());
+        assertFalse(mapper.readTree(body.getValue()).has("Uuid"));
+    }
+
+    @Test
+    void updateEventSourceMappingStillAcceptsUppercaseUuidParameter() throws Exception {
+        when(registry.isServiceEnabled("lambda")).thenReturn(true);
+        when(lambda.updateEventSourceMapping(eq("abc-123"), anyString()))
+                .thenReturn(Response.ok(mapper.readTree("{\"UUID\":\"abc-123\",\"Enabled\":false}")).build());
+        invoker.invoke(lambdaIntegration("updateEventSourceMapping"),
+                mapper.readTree("{\"UUID\":\"abc-123\",\"Enabled\":false}"), "us-east-1");
+
+        ArgumentCaptor<String> body = ArgumentCaptor.forClass(String.class);
+        verify(lambda).updateEventSourceMapping(eq("abc-123"), body.capture());
+        assertFalse(mapper.readTree(body.getValue()).has("UUID"));
+    }
+
+    @Test
+    void updateEventSourceMappingWithoutAnyUuidFails() {
+        when(registry.isServiceEnabled("lambda")).thenReturn(true);
+        AslExecutor.FailStateException error = assertThrows(AslExecutor.FailStateException.class,
+                () -> invoker.invoke(lambdaIntegration("updateEventSourceMapping"),
+                        mapper.readTree("{\"Enabled\":false}"), "us-east-1"));
+        assertEquals("Lambda.InvalidParameterValueException", error.error);
+        assertEquals("UUID is required.", error.cause);
+        verifyNoInteractions(lambda);
+    }
+
+    private static StatesIntegration lambdaIntegration(String api) {
+        return StatesIntegration.parse("arn:aws:states:::aws-sdk:lambda:" + api).orElseThrow();
     }
 
     private static StatesIntegration integration() {
