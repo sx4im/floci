@@ -1305,6 +1305,18 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
     }
 
     private boolean matchesArrayField(JsonNode arrayNode, JsonNode actual) {
+        if (actual != null && actual.isArray()) {
+            // AWS matches an array-valued field when it shares at least one
+            // value with the pattern array, so test each member in turn.
+            for (JsonNode member : actual) {
+                for (JsonNode element : arrayNode) {
+                    if (matchesSingleElement(element, member)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
         for (JsonNode element : arrayNode) {
             if (matchesSingleElement(element, actual)) {
                 return true;
