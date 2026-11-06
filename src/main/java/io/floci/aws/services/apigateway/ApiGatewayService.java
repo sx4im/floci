@@ -31,6 +31,8 @@ import io.floci.aws.services.apigateway.model.BasePathMapping;
 import io.floci.aws.services.apigateway.model.CustomDomain;
 import io.floci.aws.services.apigateway.model.Deployment;
 import io.floci.aws.services.apigateway.model.DeploymentExportSnapshot;
+import io.floci.aws.services.apigateway.model.DocumentationPart;
+import io.floci.aws.services.apigateway.model.DocumentationPartLocation;
 import io.floci.aws.services.apigateway.model.EndpointConfiguration;
 import io.floci.aws.services.apigateway.model.EndpointType;
 import io.floci.aws.services.apigateway.model.GatewayResponse;
@@ -124,6 +126,7 @@ public class ApiGatewayService implements ResourceProvider {
     private final StorageBackend<String, RequestValidator> requestValidatorStore;
     private final StorageBackend<String, GatewayResponse> gatewayResponseStore;
     private final StorageBackend<String, Model> modelStore;
+    private final StorageBackend<String, DocumentationPart> documentationPartStore;
     private final StorageBackend<String, VpcLink> vpcLinkStore;
     private final StorageBackend<String, Account> accountStore;
     private final AccountAwareStorageBackend<CustomDomain> domainStore;
@@ -227,6 +230,9 @@ public class ApiGatewayService implements ResourceProvider {
                 new TypeReference<>() {
                 });
         this.modelStore = storageFactory.create("apigateway", "apigateway-models.json",
+                new TypeReference<>() {
+                });
+        this.documentationPartStore = storageFactory.create("apigateway", "apigateway-documentationparts.json",
                 new TypeReference<>() {
                 });
         this.vpcLinkStore = storageFactory.create("apigateway", "apigateway-vpclinks.json",
@@ -2228,6 +2234,112 @@ public class ApiGatewayService implements ResourceProvider {
     public void deleteModel(String region, String apiId, String modelName) {
         getModel(region, apiId, modelName);
         modelStore.delete(modelKey(region, apiId, modelName));
+    }
+
+    // ──────────────────────────── Documentation Parts ────────────────────────────
+
+    public DocumentationPart createDocumentationPart(String region, String apiId, Map<String, Object> request) {
+        getRestApi(region, apiId);
+        DocumentationPart part = new DocumentationPart();
+        part.setId(shortId(6));
+        part.setLocation(documentationPartLocation(request));
+        part.setProperties((String) request.get("properties"));
+
+        documentationPartStore.put(documentationPartKey(region, apiId, part.getId()), part);
+        LOG.infov("Created documentation part {0} for API {1}", part.getId(), apiId);
+        return part;
+    }
+
+    public DocumentationPart getDocumentationPart(String region, String apiId, String partId) {
+        return documentationPartStore.get(documentationPartKey(region, apiId, partId))
+                .orElseThrow(() -> new AwsException("NotFoundException", "Invalid documentation part id specified", 404));
+    }
+
+    public List<DocumentationPart> getDocumentationParts(String region, String apiId) {
+        getRestApi(region, apiId);
+        String prefix = region + "::" + apiId + "::";
+        return documentationPartStore.scan(k -> k.startsWith(prefix));
+    }
+
+    public DocumentationPart updateDocumentationPart(String region, String apiId, String partId,
+                                                     List<Map<String, String>> patchOperations) {
+        DocumentationPart part = getDocumentationPart(region, apiId, partId);
+        // The store hands back live objects, so every op is validated against pending values first and
+        // only applied once the whole patch is known to be good.
+        DocumentationPartLocation newLocation = copyLocation(part.getLocation());
+        String newProperties = part.getProperties();
+        if (patchOperations != null) {
+            for (Map<String, String> op : patchOperations) {
+                if (op == null) {
+                    throw new AwsException("BadRequestException", "Invalid patch operation", 400);
+                }
+                String opType = op.get("op");
+                String path = op.get("path");
+                String value = op.get("value");
+                if (!"add".equals(opType) && !"replace".equals(opType)) {
+                    throw new AwsException("BadRequestException", "Invalid operation", 400);
+                }
+                if (path == null || value == null) {
+                    throw new AwsException("BadRequestException", "Missing path or value", 400);
+                }
+                if ("/properties".equals(path)) {
+                    newProperties = value;
+                } else if (path.startsWith("/location/")) {
+                    applyLocationPatch(newLocation, path.substring("/location/".length()), value);
+                } else {
+                    throw new AwsException("BadRequestException", "Unsupported path: " + path, 400);
+                }
+            }
+        }
+        part.setLocation(newLocation);
+        part.setProperties(newProperties);
+        documentationPartStore.put(documentationPartKey(region, apiId, partId), part);
+        return part;
+    }
+
+    public void deleteDocumentationPart(String region, String apiId, String partId) {
+        getDocumentationPart(region, apiId, partId);
+        documentationPartStore.delete(documentationPartKey(region, apiId, partId));
+    }
+
+    private DocumentationPartLocation documentationPartLocation(Map<String, Object> request) {
+        if (!(request.get("location") instanceof Map<?, ?> location)) {
+            throw new AwsException("BadRequestException", "location is required", 400);
+        }
+        if (location.get("type") == null) {
+            throw new AwsException("BadRequestException", "location.type is required", 400);
+        }
+        DocumentationPartLocation result = new DocumentationPartLocation();
+        result.setType((String) location.get("type"));
+        result.setPath((String) location.get("path"));
+        result.setMethod((String) location.get("method"));
+        result.setStatusCode((String) location.get("statusCode"));
+        result.setName((String) location.get("name"));
+        return result;
+    }
+
+    private DocumentationPartLocation copyLocation(DocumentationPartLocation location) {
+        DocumentationPartLocation copy = new DocumentationPartLocation();
+        if (location == null) {
+            return copy;
+        }
+        copy.setType(location.getType());
+        copy.setPath(location.getPath());
+        copy.setMethod(location.getMethod());
+        copy.setStatusCode(location.getStatusCode());
+        copy.setName(location.getName());
+        return copy;
+    }
+
+    private void applyLocationPatch(DocumentationPartLocation location, String field, String value) {
+        switch (field) {
+            case "type" -> location.setType(value);
+            case "path" -> location.setPath(value);
+            case "method" -> location.setMethod(value);
+            case "statusCode" -> location.setStatusCode(value);
+            case "name" -> location.setName(value);
+            default -> throw new AwsException("BadRequestException", "Unsupported path: /location/" + field, 400);
+        }
     }
 
     // ──────────────────────────── Custom Domains ────────────────────────────
@@ -4731,6 +4843,10 @@ public class ApiGatewayService implements ResourceProvider {
 
     private String modelKey(String region, String apiId, String modelName) {
         return region + "::" + apiId + "::" + modelName;
+    }
+
+    private String documentationPartKey(String region, String apiId, String partId) {
+        return region + "::" + apiId + "::" + partId;
     }
 
     private String accountKey(String region) {

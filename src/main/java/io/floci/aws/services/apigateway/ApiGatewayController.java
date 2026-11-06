@@ -18,6 +18,7 @@ import io.floci.aws.services.apigateway.model.ApiGatewayResource;
 import io.floci.aws.services.apigateway.model.ApiKey;
 import io.floci.aws.services.apigateway.model.BasePathMapping;
 import io.floci.aws.services.apigateway.model.CustomDomain;
+import io.floci.aws.services.apigateway.model.DocumentationPart;
 import io.floci.aws.services.apigateway.model.EndpointConfiguration;
 import io.floci.aws.services.apigateway.model.EndpointType;
 import io.floci.aws.services.apigateway.model.GatewayResponse;
@@ -1219,6 +1220,63 @@ public class ApiGatewayController {
                                 @PathParam("modelName") String modelName) {
         String region = regionResolver.resolveRegion(headers);
         service.deleteModel(region, apiId, modelName);
+        return Response.accepted().build();
+    }
+
+    // ──────────────────────────── Documentation Parts (v1) ────────────────────────────
+
+    @POST
+    @Path("/restapis/{apiId}/documentation/parts")
+    public Response createDocumentationPart(@Context HttpHeaders headers, @PathParam("apiId") String apiId, String body) {
+        String region = regionResolver.resolveRegion(headers);
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> request = objectMapper.readValue(body, Map.class);
+            DocumentationPart part = service.createDocumentationPart(region, apiId, request);
+            return Response.status(201).entity(toDocumentationPartNode(part).toString()).type(MediaType.APPLICATION_JSON).build();
+        } catch (IOException e) {
+            throw new AwsException("BadRequestException", e.getMessage(), 400);
+        }
+    }
+
+    @GET
+    @Path("/restapis/{apiId}/documentation/parts")
+    public Response getDocumentationParts(@Context HttpHeaders headers, @PathParam("apiId") String apiId) {
+        String region = regionResolver.resolveRegion(headers);
+        List<DocumentationPart> parts = service.getDocumentationParts(region, apiId);
+        ObjectNode root = objectMapper.createObjectNode();
+        ArrayNode items = root.putArray("item");
+        parts.forEach(p -> items.add(toDocumentationPartNode(p)));
+        return Response.ok(root.toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @GET
+    @Path("/restapis/{apiId}/documentation/parts/{partId}")
+    public Response getDocumentationPart(@Context HttpHeaders headers,
+                                         @PathParam("apiId") String apiId,
+                                         @PathParam("partId") String partId) {
+        String region = regionResolver.resolveRegion(headers);
+        DocumentationPart part = service.getDocumentationPart(region, apiId, partId);
+        return Response.ok(toDocumentationPartNode(part).toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @PATCH
+    @Path("/restapis/{apiId}/documentation/parts/{partId}")
+    public Response updateDocumentationPart(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                            @PathParam("partId") String partId, String body) {
+        String region = regionResolver.resolveRegion(headers);
+        List<Map<String, String>> patchOperations = parsePatchOperations(body);
+        DocumentationPart part = service.updateDocumentationPart(region, apiId, partId, patchOperations);
+        return Response.ok(toDocumentationPartNode(part).toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @DELETE
+    @Path("/restapis/{apiId}/documentation/parts/{partId}")
+    public Response deleteDocumentationPart(@Context HttpHeaders headers,
+                                            @PathParam("apiId") String apiId,
+                                            @PathParam("partId") String partId) {
+        String region = regionResolver.resolveRegion(headers);
+        service.deleteDocumentationPart(region, apiId, partId);
         return Response.accepted().build();
     }
 
@@ -2670,6 +2728,21 @@ public class ApiGatewayController {
         if (m.getDescription() != null) node.put("description", m.getDescription());
         node.put("contentType", m.getContentType());
         if (m.getSchema() != null) node.put("schema", m.getSchema());
+        return node;
+    }
+
+    private ObjectNode toDocumentationPartNode(DocumentationPart part) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("id", part.getId());
+        if (part.getLocation() != null) {
+            ObjectNode location = node.putObject("location");
+            if (part.getLocation().getType() != null) location.put("type", part.getLocation().getType());
+            if (part.getLocation().getPath() != null) location.put("path", part.getLocation().getPath());
+            if (part.getLocation().getMethod() != null) location.put("method", part.getLocation().getMethod());
+            if (part.getLocation().getStatusCode() != null) location.put("statusCode", part.getLocation().getStatusCode());
+            if (part.getLocation().getName() != null) location.put("name", part.getLocation().getName());
+        }
+        if (part.getProperties() != null) node.put("properties", part.getProperties());
         return node;
     }
 
