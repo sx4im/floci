@@ -69,6 +69,72 @@ class SsmServiceTest {
                 new ParameterStringFilter("KeyId", null, List.of("alias/legacy-key"))), "us-east-1").size());
     }
 
+    @Test
+    void getParameterReturnsCanonicalArnForRetainedLegacyRecord() {
+        InMemoryStorage<String, Parameter> parameters = new InMemoryStorage<>();
+        SsmService service = new SsmService(parameters, new InMemoryStorage<>(), 5);
+        Parameter retained = new Parameter("example-endpoint", "value", "String");
+        retained.setVersion(1);
+        retained.setArn("arn:aws:ssm:eu-west-2:000000000000:parameterexample-endpoint");
+        parameters.put("eu-west-2::example-endpoint", retained);
+
+        Parameter read = service.getParameter("example-endpoint", "eu-west-2");
+
+        assertEquals("arn:aws:ssm:eu-west-2:000000000000:parameter/example-endpoint", read.getArn());
+        assertEquals("value", read.getValue());
+        assertEquals(1, read.getVersion());
+        // Read-time normalization only: the stored record keeps its legacy ARN.
+        assertEquals("arn:aws:ssm:eu-west-2:000000000000:parameterexample-endpoint",
+                parameters.get("eu-west-2::example-endpoint").orElseThrow().getArn());
+    }
+
+    @Test
+    void getParameterVersionSelectorReturnsCanonicalArnForRetainedLegacyRecord() {
+        InMemoryStorage<String, Parameter> parameters = new InMemoryStorage<>();
+        InMemoryStorage<String, List<ParameterHistory>> history = new InMemoryStorage<>();
+        SsmService service = new SsmService(parameters, history, 5);
+        Parameter retained = new Parameter("example-endpoint", "value", "String");
+        retained.setVersion(1);
+        retained.setArn("arn:aws:ssm:eu-west-2:000000000000:parameterexample-endpoint");
+        parameters.put("eu-west-2::example-endpoint", retained);
+        history.put("eu-west-2::example-endpoint", List.of(new ParameterHistory(retained)));
+
+        Parameter read = service.getParameter("example-endpoint:1", "eu-west-2");
+
+        assertEquals("arn:aws:ssm:eu-west-2:000000000000:parameter/example-endpoint", read.getArn());
+        assertEquals("value", read.getValue());
+    }
+
+    @Test
+    void describeParametersReturnsCanonicalArnForRetainedLegacyRecord() {
+        InMemoryStorage<String, Parameter> parameters = new InMemoryStorage<>();
+        SsmService service = new SsmService(parameters, new InMemoryStorage<>(), 5);
+        Parameter retained = new Parameter("example-endpoint", "value", "String");
+        retained.setVersion(1);
+        retained.setArn("arn:aws:ssm:eu-west-2:000000000000:parameterexample-endpoint");
+        parameters.put("eu-west-2::example-endpoint", retained);
+
+        List<Parameter> described = service.describeParameters(List.of(), "eu-west-2");
+
+        assertEquals(1, described.size());
+        assertEquals("arn:aws:ssm:eu-west-2:000000000000:parameter/example-endpoint",
+                described.get(0).getArn());
+    }
+
+    @Test
+    void getParameterLeavesSlashNameArnUntouched() {
+        InMemoryStorage<String, Parameter> parameters = new InMemoryStorage<>();
+        SsmService service = new SsmService(parameters, new InMemoryStorage<>(), 5);
+        Parameter stored = new Parameter("/legacy/param", "value", "String");
+        stored.setVersion(1);
+        stored.setArn("arn:aws:ssm:eu-west-2::parameter/legacy/param");
+        parameters.put("eu-west-2::/legacy/param", stored);
+
+        Parameter read = service.getParameter("/legacy/param", "eu-west-2");
+
+        assertEquals("arn:aws:ssm:eu-west-2::parameter/legacy/param", read.getArn());
+    }
+
     @BeforeEach
     void setUp() {
         ssmService = new SsmService(

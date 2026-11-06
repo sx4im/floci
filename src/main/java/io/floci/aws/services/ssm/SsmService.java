@@ -552,13 +552,62 @@ public class SsmService implements ResourceProvider {
     private Optional<Parameter> findParameter(String name, String region) {
         Optional<Parameter> stored = parameterStore.get(regionKey(region, name));
         if (stored.isPresent()) {
-            return stored;
+            return Optional.of(withCanonicalArn(stored.get(), region));
         }
         Optional<Parameter> selected = findSelectedVersion(name, region);
         if (selected.isPresent()) {
-            return selected;
+            return Optional.of(withCanonicalArn(selected.get(), region));
         }
         return publicParameter(name, region);
+    }
+
+    /**
+     * Retained pre-#5261 records still carry the legacy {@code :parameter<name>} ARN
+     * (the slash after {@code parameter} is missing), while new writes mint the
+     * canonical {@code parameter/<name>} form. A read rebuilds the ARN from the name
+     * and answers a copy, so the retained value, version, tags and history are
+     * preserved and the stored record is left untouched. Names starting with a slash
+     * cannot be legacy-malformed (the old and new forms agree there), and a public
+     * parameter keeps its own account-less ARN, so both are returned as stored.
+     */
+    private Parameter withCanonicalArn(Parameter parameter, String region) {
+        String name = parameter.getName();
+        String arn = parameter.getArn();
+        if (name == null || name.startsWith("/") || arn == null) {
+            return parameter;
+        }
+        try {
+            if (!("parameter" + name).equals(AwsArnUtils.parse(arn).resource())) {
+                return parameter;
+            }
+        } catch (IllegalArgumentException expected) {
+            // Not a parseable ARN; leave the stored metadata exactly as it is.
+            LOG.debugv("Stored ARN does not parse, leaving it as stored: {0}", arn);
+            return parameter;
+        }
+        Parameter copy = copyParameter(parameter);
+        copy.setArn(regionResolver.buildArn("ssm", region, parameterResource(name)));
+        return copy;
+    }
+
+    /** A read-time copy of a stored parameter: every field is preserved. */
+    private static Parameter copyParameter(Parameter parameter) {
+        Parameter copy = new Parameter(parameter.getName(), parameter.getValue(), parameter.getType());
+        copy.setEncryptedValue(parameter.getEncryptedValue());
+        copy.setVersion(parameter.getVersion());
+        copy.setDescription(parameter.getDescription());
+        copy.setLastModifiedDate(parameter.getLastModifiedDate());
+        copy.setKeyId(parameter.getKeyId());
+        copy.setArn(parameter.getArn());
+        copy.setDataType(parameter.getDataType());
+        copy.setAllowedPattern(parameter.getAllowedPattern());
+        copy.setTier(parameter.getTier());
+        copy.setPolicies(parameter.getPolicies() != null ? List.copyOf(parameter.getPolicies()) : null);
+        copy.setResourcePolicy(parameter.getResourcePolicy());
+        copy.setTags(parameter.getTags() != null ? new HashMap<>(parameter.getTags()) : null);
+        copy.setSelector(parameter.getSelector());
+        copy.setSourceResult(parameter.getSourceResult());
+        return copy;
     }
 
     /**
@@ -671,7 +720,7 @@ public class SsmService implements ResourceProvider {
                 return false;
             }
             return underPath(key.substring(prefix.length()), normalizedPath, recursive);
-        }));
+        }).stream().map(parameter -> withCanonicalArn(parameter, region)).toList());
         if (imageCatalog != null) {
             // The public names answer to the same path and Recursive rules as stored ones, so a
             // recursive query on an ancestor such as /aws lists them too.
@@ -749,6 +798,7 @@ public class SsmService implements ResourceProvider {
         String prefix = region + "::";
         return parameterStore.scan(key -> key.startsWith(prefix)).stream()
                 .filter(p -> filters.stream().allMatch(f -> matchesParameterFilter(p, f)))
+                .map(p -> withCanonicalArn(p, region))
                 .toList();
     }
 
