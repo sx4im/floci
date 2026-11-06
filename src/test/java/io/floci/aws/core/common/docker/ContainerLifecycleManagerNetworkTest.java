@@ -7,6 +7,7 @@ import com.github.dockerjava.api.command.CreateContainerCmd;
 import com.github.dockerjava.api.command.CreateContainerResponse;
 import com.github.dockerjava.api.command.CreateNetworkCmd;
 import com.github.dockerjava.api.command.DisconnectFromNetworkCmd;
+import com.github.dockerjava.api.command.InfoCmd;
 import com.github.dockerjava.api.command.InspectContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.InspectNetworkCmd;
@@ -18,6 +19,7 @@ import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.ExposedPort;
 import com.github.dockerjava.api.model.HostConfig;
+import com.github.dockerjava.api.model.Info;
 import com.github.dockerjava.api.model.Network;
 import com.github.dockerjava.api.model.NetworkSettings;
 import com.github.dockerjava.api.model.Ports;
@@ -42,6 +44,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -250,6 +253,101 @@ class ContainerLifecycleManagerNetworkTest {
         assertTrue(info.publishedHostPort(9200).isEmpty());
     }
 
+    /**
+     * Off Docker Desktop a publishing container is created on its configured network, so it
+     * never joins the default bridge beside it (#7705).
+     */
+    @Test
+    void createSetsNetworkModeForPublishingContainerOffDockerDesktop() {
+        daemonReports("Ubuntu 24.04.3 LTS");
+
+        manager().create(spec("floci-net", Map.of(8080, 18080), List.of()));
+
+        HostConfig hostConfig = createdHostConfig();
+        assertEquals("floci-net", hostConfig.getNetworkMode());
+        assertNotNull(hostConfig.getPortBindings());
+        assertTrue(hostConfig.getPortBindings().getBindings().containsKey(ExposedPort.tcp(8080)));
+        verify(connectCmd, never()).exec();
+    }
+
+    @Test
+    void createAndStartDoesNotReconnectPublishingContainerOffDockerDesktop() {
+        daemonReports("Ubuntu 24.04.3 LTS");
+        when(dockerClient.startContainerCmd("container-id")).thenReturn(mock(StartContainerCmd.class));
+        InspectContainerResponse inspect = inspectOf("container-id");
+        NetworkSettings networks = mock(NetworkSettings.class);
+        when(inspect.getNetworkSettings()).thenReturn(networks);
+        when(networks.getPorts()).thenReturn(null);
+
+        ContainerInfo info = manager().createAndStart(spec("floci-net", Map.of(8080, 18080), List.of()));
+
+        assertEquals("floci-net", createdHostConfig().getNetworkMode());
+        verify(connectCmd, never()).exec();
+        assertTrue(info.publishedHostPort(8080).isEmpty());
+    }
+
+    /**
+     * On Docker Desktop naming the network at create together with port bindings suppresses the
+     * published ports, so publishing containers keep the create-then-connect path there.
+     */
+    @Test
+    void createLeavesNetworkModeUnsetForPublishingContainerOnDockerDesktop() {
+        daemonReports("Docker Desktop");
+
+        manager().create(spec("floci-net", Map.of(8080, 18080), List.of()));
+
+        HostConfig hostConfig = createdHostConfig();
+        assertNull(hostConfig.getNetworkMode());
+        assertNotNull(hostConfig.getPortBindings());
+    }
+
+    @Test
+    void createAndStartConnectsPublishingContainerAfterStartOnDockerDesktop() {
+        daemonReports("Docker Desktop");
+        when(dockerClient.startContainerCmd("container-id")).thenReturn(mock(StartContainerCmd.class));
+        InspectContainerResponse inspect = inspectOf("container-id");
+        NetworkSettings networks = mock(NetworkSettings.class);
+        when(inspect.getNetworkSettings()).thenReturn(networks);
+        when(networks.getPorts()).thenReturn(null);
+
+        manager().createAndStart(spec("floci-net", Map.of(8080, 18080), List.of()));
+
+        verify(connectCmd).withContainerId("container-id");
+        verify(connectCmd).withNetworkId("floci-net");
+        verify(connectCmd).exec();
+    }
+
+    /**
+     * When GET /info cannot be read the daemon cannot be told apart from Docker Desktop, so the
+     * create-then-connect path is kept rather than risking suppressed ports.
+     */
+    @Test
+    void createKeepsCreateThenConnectPathWhenDaemonInfoIsUnreadable() {
+        when(dockerClient.infoCmd()).thenThrow(new RuntimeException("daemon unreachable"));
+
+        manager().create(spec("floci-net", Map.of(8080, 18080), List.of()));
+
+        assertNull(createdHostConfig().getNetworkMode());
+    }
+
+    /**
+     * Off Docker Desktop a publishing container with link-local addresses is created on its
+     * network, so the pre-start attach disconnects the plain attachment first, exactly as the
+     * non-publishing path already does.
+     */
+    @Test
+    void createDisconnectsBeforeReconnectingLinkLocalEndpointOffDockerDesktop() {
+        daemonReports("Ubuntu 24.04.3 LTS");
+
+        manager().create(specWithLinkLocalIp(Map.of(8080, 18080)));
+
+        InOrder order = inOrder(createCmd, disconnectCmd, connectCmd);
+        order.verify(createCmd).exec();
+        order.verify(disconnectCmd).exec();
+        order.verify(connectCmd).exec();
+        assertEquals("test-network", createdHostConfig().getNetworkMode());
+    }
+
     @Test
     void endpointsOfHostNetworkContainersPointAtLocalhostWhenFlociRunsInDocker() {
         when(containerDetector.isRunningInContainer()).thenReturn(true);
@@ -420,6 +518,14 @@ class ContainerLifecycleManagerNetworkTest {
         ArgumentCaptor<HostConfig> hostConfig = ArgumentCaptor.forClass(HostConfig.class);
         verify(createCmd).withHostConfig(hostConfig.capture());
         return hostConfig.getValue();
+    }
+
+    private void daemonReports(String operatingSystem) {
+        InfoCmd infoCmd = mock(InfoCmd.class);
+        Info info = mock(Info.class);
+        when(dockerClient.infoCmd()).thenReturn(infoCmd);
+        when(infoCmd.exec()).thenReturn(info);
+        when(info.getOperatingSystem()).thenReturn(operatingSystem);
     }
 
     @Test
