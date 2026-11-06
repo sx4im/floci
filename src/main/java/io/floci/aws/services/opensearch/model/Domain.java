@@ -276,6 +276,24 @@ public class Domain {
         this.endpoint = endpoint;
     }
 
+    /**
+     * The AWS-shaped endpoint: a bare host[:port] with no URI scheme, as {@code DomainStatus.Endpoint}
+     * returns it. Records persisted before the scheme was dropped store the full {@code http://} URL,
+     * so every reader normalizes through here instead of trusting the stored value.
+     */
+    public static String endpointHostAndPort(String endpoint) {
+        if (endpoint == null || endpoint.isBlank()) {
+            return "";
+        }
+        if (endpoint.startsWith("http://")) {
+            return endpoint.substring("http://".length());
+        }
+        if (endpoint.startsWith("https://")) {
+            return endpoint.substring("https://".length());
+        }
+        return endpoint;
+    }
+
     public Map<String, String> getTags() {
         return tags;
     }

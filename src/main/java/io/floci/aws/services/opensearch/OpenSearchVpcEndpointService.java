@@ -194,6 +194,7 @@ public class OpenSearchVpcEndpointService {
     public Optional<String> endpointAddress(OpenSearchVpcEndpoint endpoint) {
         return domains.findDomainByArn(endpoint.getDomainArn())
                 .map(Domain::getEndpoint)
+                .map(Domain::endpointHostAndPort)
                 .filter(address -> !address.isEmpty());
     }
 

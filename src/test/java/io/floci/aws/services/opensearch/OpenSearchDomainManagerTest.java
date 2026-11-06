@@ -1,5 +1,6 @@
 package io.floci.aws.services.opensearch;
 
+import com.sun.net.httpserver.HttpServer;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.docker.ContainerBuilder;
@@ -22,6 +23,8 @@ import org.mockito.MockMakers;
 import org.mockito.MockedStatic;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -29,6 +32,7 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -185,7 +189,7 @@ class OpenSearchDomainManagerTest {
 
         verify(portAllocator).allocate(9400, 9499);
         verify(builder).withPortBinding(9200, 9401);
-        assertEquals("http://172.17.0.5:9200", domain.getEndpoint());
+        assertEquals("172.17.0.5:9200", domain.getEndpoint());
         assertEquals(Integer.valueOf(9401), domain.getHostPort());
     }
 
@@ -641,6 +645,67 @@ class OpenSearchDomainManagerTest {
         verify(builder).withBind(hostRoot.resolve("opensearch")
                 .resolve("floci-aws-opensearch-000000000000-us-east-1-my-domain")
                 .toAbsolutePath().normalize().toString(), "/usr/share/opensearch/data");
+    }
+
+    @Test
+    void endpointHostAndPortStripsALegacyScheme() {
+        assertEquals("172.17.0.5:9200", Domain.endpointHostAndPort("http://172.17.0.5:9200"));
+        assertEquals("172.17.0.5:9200", Domain.endpointHostAndPort("https://172.17.0.5:9200"));
+        assertEquals("172.17.0.5:9200", Domain.endpointHostAndPort("172.17.0.5:9200"));
+        assertEquals("search-x-1.us-east-1.es.amazonaws.com",
+                Domain.endpointHostAndPort("search-x-1.us-east-1.es.amazonaws.com"));
+        assertEquals("", Domain.endpointHostAndPort(""));
+        assertEquals("", Domain.endpointHostAndPort(null));
+    }
+
+    @Test
+    void isReadyAcceptsABareEndpoint() throws Exception {
+        HttpServer backend = healthBackend("{\"status\":\"green\"}");
+        backend.start();
+        try {
+            Domain domain = domain("000000000000", "us-east-1");
+            domain.setEndpoint("127.0.0.1:" + backend.getAddress().getPort());
+            assertTrue(manager.isReady(domain));
+        } finally {
+            backend.stop(0);
+        }
+    }
+
+    @Test
+    void isReadyAcceptsALegacyEndpointWithAScheme() throws Exception {
+        HttpServer backend = healthBackend("{\"status\":\"yellow\"}");
+        backend.start();
+        try {
+            Domain domain = domain("000000000000", "us-east-1");
+            domain.setEndpoint("http://127.0.0.1:" + backend.getAddress().getPort());
+            assertTrue(manager.isReady(domain));
+        } finally {
+            backend.stop(0);
+        }
+    }
+
+    @Test
+    void isReadyRejectsANonGreenCluster() throws Exception {
+        HttpServer backend = healthBackend("{\"status\":\"red\"}");
+        backend.start();
+        try {
+            Domain domain = domain("000000000000", "us-east-1");
+            domain.setEndpoint("127.0.0.1:" + backend.getAddress().getPort());
+            assertFalse(manager.isReady(domain));
+        } finally {
+            backend.stop(0);
+        }
+    }
+
+    private HttpServer healthBackend(String body) throws IOException {
+        HttpServer backend = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        backend.createContext("/_cluster/health", exchange -> {
+            byte[] payload = body.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, payload.length);
+            exchange.getResponseBody().write(payload);
+            exchange.close();
+        });
+        return backend;
     }
 
     private Domain domain(String accountId, String region) {

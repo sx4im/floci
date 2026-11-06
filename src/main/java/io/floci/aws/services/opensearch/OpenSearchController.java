@@ -634,7 +634,7 @@ public class OpenSearchController {
         node.put("Created", !domain.isProcessing());
         node.put("Processing", domain.isProcessing());
         node.put("Deleted", domain.isDeleted());
-        String endpoint = domain.getEndpoint() != null ? domain.getEndpoint() : "";
+        String endpoint = Domain.endpointHostAndPort(domain.getEndpoint());
         if (domain.getVpcOptions() == null) {
             node.put("Endpoint", endpoint);
         } else if (!endpoint.isEmpty()) {

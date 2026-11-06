@@ -155,8 +155,9 @@ class OpenSearchTest {
                 DOMAIN_NAME, "processing to finish", 180_000_000_000L, TestFixtures.isRealAws() ? 5_000 : 250);
 
         try {
+            // AWS returns a bare host, so the client adds the scheme for the probe.
             HttpURLConnection conn = (HttpURLConnection)
-                    URI.create(domainEndpoint + "/_cluster/health").toURL().openConnection();
+                    URI.create("http://" + domainEndpoint + "/_cluster/health").toURL().openConnection();
             conn.setConnectTimeout(5000);
             conn.setReadTimeout(5000);
             int code = conn.getResponseCode();

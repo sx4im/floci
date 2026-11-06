@@ -45,7 +45,8 @@ class OpenSearchDomainEndpointIntegrationTest {
                 .post("/2021-01-01/opensearch/domain")
             .then()
                 .statusCode(200)
-                .body("DomainStatus.Endpoint", endsWith(".cn-north-1.es.amazonaws.com.cn"));
+                .body("DomainStatus.Endpoint", endsWith(".cn-north-1.es.amazonaws.com.cn"))
+                .body("DomainStatus.Endpoint", not(startsWith("http://")));
         } finally {
             given().header("Authorization",
                             "AWS4-HMAC-SHA256 Credential=AKID/20260101/cn-north-1/es/aws4_request")
@@ -65,6 +66,7 @@ class OpenSearchDomainEndpointIntegrationTest {
             .statusCode(200)
             .body("DomainStatus.Processing", is(false))
             .body("DomainStatus.Endpoint", not(emptyString()))
+            .body("DomainStatus.Endpoint", not(startsWith("http://")))
             .body("DomainStatus.Endpoint", startsWith("search-" + DOMAIN + "-"))
             .body("DomainStatus.Endpoint", endsWith(".us-east-1.es.amazonaws.com"));
 

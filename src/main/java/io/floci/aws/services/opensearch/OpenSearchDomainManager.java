@@ -186,7 +186,7 @@ public class OpenSearchDomainManager {
         domain.setHostPort(hostPort);
 
         EndpointInfo endpoint = info.getEndpoint(OPENSEARCH_PORT);
-        domain.setEndpoint("http://" + endpoint.host() + ":" + endpoint.port());
+        domain.setEndpoint(endpoint.host() + ":" + endpoint.port());
 
         LOG.infov("OpenSearch container {0} started for domain {1} at {2} (host port {3})",
                 info.containerId(), domain.getDomainName(), endpoint, String.valueOf(hostPort));
@@ -197,7 +197,9 @@ public class OpenSearchDomainManager {
         if (endpoint == null || endpoint.isBlank()) {
             return false;
         }
-        String url = endpoint + "/_cluster/health";
+        // The stored endpoint is a bare host[:port], so the scheme goes on here for the health
+        // probe. endpointHostAndPort also covers records persisted before the scheme was dropped.
+        String url = "http://" + Domain.endpointHostAndPort(endpoint) + "/_cluster/health";
         try {
             HttpURLConnection conn = (HttpURLConnection) URI.create(url).toURL().openConnection();
             conn.setConnectTimeout(2000);
