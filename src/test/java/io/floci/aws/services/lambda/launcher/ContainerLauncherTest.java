@@ -625,7 +625,8 @@ class ContainerLauncherTest {
                 "io.floci.service", "lambda",
                 "io.floci.resource-id", "standard-fn",
                 "io.floci.account", "222222222222",
-                "io.floci.region", "us-west-2"),
+                "io.floci.region", "us-west-2",
+                "io.floci.owner", "4566"),
                 spec.labels());
     }
 

@@ -3,6 +3,7 @@ package io.floci.aws.services.lambda.launcher;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.Container;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.Digests;
@@ -162,6 +163,63 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     void init() {
         volumeCleanupScheduler.scheduleAtFixedRate(this::cleanupSupersededVolumes,
                 VOLUME_CLEANUP_GRACE_MS, VOLUME_CLEANUP_GRACE_MS, TimeUnit.MILLISECONDS);
+        if (config.services().lambda().reconcileContainersOnStartup()) {
+            removeLeftoverContainers();
+        }
+    }
+
+    /**
+     * Removes the Lambda containers a previous run of this Floci left on the daemon. Warm
+     * containers are disposable: a graceful shutdown already drains and removes them, so
+     * anything carrying this deployment's owner label at startup belongs to a run that
+     * ended without one (SIGKILL, OOM, docker kill), and no record in this process refers
+     * to it. It is removed whatever state it is in: a leftover still running has lost its
+     * Runtime API connection and exits on its own shortly after, and leaving it to exit
+     * would strand it as an Exited container no later sweep ever collects. Containers
+     * created before the owner label existed carry none and are left alone.
+     *
+     * <p>A container Docker would not remove is logged and left for the next restart; no
+     * invocation is blocked on the sweep, the next call simply creates a fresh container.
+     *
+     * @return whether every leftover is gone: false when Docker could not list or remove one
+     */
+    boolean removeLeftoverContainers() {
+        String owner = ContainerStorageHelper.ownerIdentity(config);
+        ContainerStorageHelper.LabelAliases aliases = ContainerStorageHelper.CONTAINER_LABEL_ALIASES;
+        List<Container> containers;
+        try {
+            // Docker's container summary.
+            containers = aliases.listByLabels(
+                    Map.of(ContainerStorageHelper.SERVICE_LABEL, "lambda",
+                            ContainerStorageHelper.OWNER_LABEL, owner),
+                    filter -> lifecycleManager.getDockerClient()
+                            .listContainersCmd()
+                            .withShowAll(true)
+                            .withLabelFilter(filter)
+                            .exec(),
+                    Container::getId);
+        } catch (Exception e) {
+            LOG.warnv("Could not list the Lambda containers a previous run left behind: {0}", e.getMessage());
+            return false;
+        }
+        boolean allRemoved = true;
+        for (Container container : containers) {
+            Map<String, String> labels = container.getLabels();
+            if (!aliases.consistent(container.getId(), labels)
+                    || !aliases.matches(labels, ContainerStorageHelper.OWNER_LABEL, owner)) {
+                continue;
+            }
+            try {
+                lifecycleManager.removeIfExistsStrict(container.getId(), true);
+                LOG.infov("Removed Lambda container {0} ({1}) left by a previous run", container.getId(),
+                        container.getNames() == null ? "" : String.join(",", container.getNames()));
+            } catch (Exception e) {
+                allRemoved = false;
+                LOG.warnv("Could not remove Lambda container {0} left by a previous run: {1}",
+                        container.getId(), e.getMessage());
+            }
+        }
+        return allRemoved;
     }
 
     @PreDestroy
@@ -295,6 +353,12 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // Memory and swap together at the function's MemorySize, so the container cannot swap
         // and has what Lambda gives the function, whatever swap the host has.
         long memoryBytes = (long) fn.getMemorySize() * 1024 * 1024;
+        // The owner label ties the container to this Floci deployment, so the startup sweep
+        // in removeLeftoverContainers can reclaim it when a previous run ended without a
+        // graceful shutdown. mergedLabels also writes the legacy floci_owner_port alias.
+        Map<String, String> containerLabels = ContainerStorageHelper.resourceIdentityLabels(
+                "lambda", fn.getFunctionName(), lambdaAccountId, lambdaRegion);
+        containerLabels.put(ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(config));
         ContainerBuilder.Builder specBuilder = containerBuilder.newContainer(image)
                 .withName(containerName)
                 .withEnv(env)
@@ -302,8 +366,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 .withMemorySwapBytes(memoryBytes)
                 .withDockerNetwork(config.services().lambda().dockerNetwork())
                 .withLogRotation()
-                .withLabels(ContainerStorageHelper.resourceIdentityLabels(
-                        "lambda", fn.getFunctionName(), lambdaAccountId, lambdaRegion));
+                .withLabels(containerLabels);
         List<String> configuredExtraHosts = config.services().lambda().extraHosts().orElse(List.of());
         applyDockerFlags(specBuilder, dockerFlags);
 

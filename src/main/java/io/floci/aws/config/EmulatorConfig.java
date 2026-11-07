@@ -3204,6 +3204,21 @@ public interface EmulatorConfig {
         int containerDrainTimeoutSeconds();
 
         /**
+         * When true, Floci removes on startup, in Docker mode, every Lambda container a previous run
+         * of <em>this same</em> Floci left on the daemon (matched by the {@code io.floci.owner}
+         * label), before any function is invoked. A graceful shutdown already drains and removes
+         * warm containers; this covers a run that ended without one (SIGKILL, OOM, docker kill),
+         * whose containers lose their Runtime API connection, exit, and would otherwise stay on
+         * the daemon as Exited containers forever. Turn it off when two Floci instances share a
+         * daemon with the same port and no resource namespace, so one does not remove the other's
+         * containers.
+         *
+         * Env var: FLOCI_SERVICES_LAMBDA_RECONCILE_CONTAINERS_ON_STARTUP
+         */
+        @WithDefault("true")
+        boolean reconcileContainersOnStartup();
+
+        /**
          * Maximum idle (warm) containers kept per function. A container released when the
          * function already holds this many idle ones is stopped instead of pooled.
          *
