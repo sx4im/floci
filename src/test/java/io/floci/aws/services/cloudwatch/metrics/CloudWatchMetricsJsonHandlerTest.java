@@ -42,6 +42,7 @@ class CloudWatchMetricsJsonHandlerTest {
 
     private CloudWatchMetricsJsonHandler handler;
     private CloudWatchMetricsService service;
+    private CloudWatchDashboardsService dashboardsService;
 
     @BeforeEach
     void setUp() {
@@ -50,7 +51,7 @@ class CloudWatchMetricsJsonHandlerTest {
                 new InMemoryStorage<>(),
                 new RegionResolver(REGION, "000000000000")
         );
-        CloudWatchDashboardsService dashboardsService = new CloudWatchDashboardsService(
+        dashboardsService = new CloudWatchDashboardsService(
                 new InMemoryStorage<>(),
                 new RegionResolver(REGION, "000000000000")
         );
@@ -258,6 +259,40 @@ class CloudWatchMetricsJsonHandlerTest {
         List<String> names = new ArrayList<>();
         listed.get("Metrics").forEach(m -> names.add(m.get("MetricName").asText()));
         return names;
+    }
+
+    @Test
+    void listDashboardsPagesAtMaxResultsAndReturnsNextToken() {
+        dashboardsService.putDashboard("page-a", "{}", REGION);
+        dashboardsService.putDashboard("page-b", "{}", REGION);
+        dashboardsService.putDashboard("page-c", "{}", REGION);
+
+        ObjectNode firstReq = MAPPER.createObjectNode();
+        firstReq.put("MaxResults", 2);
+        ObjectNode first = (ObjectNode) handler.handle("ListDashboards", firstReq, REGION).getEntity();
+        List<String> firstNames = new ArrayList<>();
+        first.get("DashboardEntries").forEach(e -> firstNames.add(e.get("DashboardName").asText()));
+        assertEquals(List.of("page-a", "page-b"), firstNames);
+        assertTrue(first.hasNonNull("NextToken"));
+
+        ObjectNode secondReq = MAPPER.createObjectNode();
+        secondReq.put("NextToken", first.get("NextToken").asText());
+        ObjectNode second = (ObjectNode) handler.handle("ListDashboards", secondReq, REGION).getEntity();
+        List<String> secondNames = new ArrayList<>();
+        second.get("DashboardEntries").forEach(e -> secondNames.add(e.get("DashboardName").asText()));
+        assertEquals(List.of("page-c"), secondNames);
+        assertFalse(second.has("NextToken"));
+    }
+
+    @Test
+    void listDashboardsRejectsAnInvalidToken() {
+        dashboardsService.putDashboard("page-a", "{}", REGION);
+
+        ObjectNode req = MAPPER.createObjectNode();
+        req.put("NextToken", "not base64!");
+        AwsException e = assertThrows(AwsException.class,
+                () -> handler.handle("ListDashboards", req, REGION));
+        assertEquals("InvalidNextToken", e.getErrorCode());
     }
 
     @Test

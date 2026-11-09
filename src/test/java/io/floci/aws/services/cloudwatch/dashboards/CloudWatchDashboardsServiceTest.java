@@ -1,6 +1,7 @@
 package io.floci.aws.services.cloudwatch.dashboards;
 
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.services.cloudwatch.dashboards.model.Dashboard;
@@ -116,6 +117,76 @@ class CloudWatchDashboardsServiceTest {
         assertEquals(List.of("prod-api", "prod-web"),
                 filtered.stream().map(Dashboard::getDashboardName).toList());
         assertEquals(3, service.listDashboards(null, REGION).size());
+    }
+
+    private static List<String> names(PaginatedResult<Dashboard> page) {
+        return page.items().stream().map(Dashboard::getDashboardName).toList();
+    }
+
+    @Test
+    void listDashboardsPagesAtMaxResultsAndResumesWithTheToken() {
+        service.putDashboard("page-a", BODY, REGION);
+        service.putDashboard("page-b", BODY, REGION);
+        service.putDashboard("page-c", BODY, REGION);
+
+        PaginatedResult<Dashboard> first = service.listDashboards(null, 2, null, REGION);
+        assertEquals(List.of("page-a", "page-b"), names(first));
+        assertNotNull(first.nextToken());
+
+        PaginatedResult<Dashboard> second = service.listDashboards(null, 2, first.nextToken(), REGION);
+        assertEquals(List.of("page-c"), names(second));
+        assertNull(second.nextToken());
+    }
+
+    @Test
+    void listDashboardsPagesWithinTheNamePrefix() {
+        service.putDashboard("prod-a", BODY, REGION);
+        service.putDashboard("prod-b", BODY, REGION);
+        service.putDashboard("dev-a", BODY, REGION);
+
+        PaginatedResult<Dashboard> first = service.listDashboards("prod-", 1, null, REGION);
+        assertEquals(List.of("prod-a"), names(first));
+        assertNotNull(first.nextToken());
+
+        PaginatedResult<Dashboard> second = service.listDashboards("prod-", 1, first.nextToken(), REGION);
+        assertEquals(List.of("prod-b"), names(second));
+        assertNull(second.nextToken());
+    }
+
+    // AWS caps a ListDashboards page at 1,000 entries: 1,001 dashboards must come back
+    // as a full first page plus a token, not all at once.
+    @Test
+    void listDashboardsDefaultsToOneThousandEntriesPerPage() {
+        for (int i = 0; i < 1001; i++) {
+            service.putDashboard(String.format("dash-%04d", i), BODY, REGION);
+        }
+
+        PaginatedResult<Dashboard> first = service.listDashboards(null, null, null, REGION);
+        assertEquals(1000, first.items().size());
+        assertNotNull(first.nextToken());
+
+        PaginatedResult<Dashboard> second = service.listDashboards(null, null, first.nextToken(), REGION);
+        assertEquals(1, second.items().size());
+        assertNull(second.nextToken());
+    }
+
+    @Test
+    void listDashboardsRejectsAnInvalidToken() {
+        service.putDashboard("page-a", BODY, REGION);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.listDashboards(null, 2, "not base64!", REGION));
+        assertEquals("InvalidNextToken", error.getErrorCode());
+    }
+
+    @Test
+    void listDashboardsRejectsMaxResultsOutsideOneToOneThousand() {
+        service.putDashboard("page-a", BODY, REGION);
+
+        assertEquals("InvalidNextToken", assertThrows(AwsException.class,
+                () -> service.listDashboards(null, 0, null, REGION)).getErrorCode());
+        assertEquals("InvalidNextToken", assertThrows(AwsException.class,
+                () -> service.listDashboards(null, 1001, null, REGION)).getErrorCode());
     }
 
     @Test

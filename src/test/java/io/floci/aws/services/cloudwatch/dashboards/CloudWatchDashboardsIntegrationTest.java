@@ -114,6 +114,44 @@ class CloudWatchDashboardsIntegrationTest {
     }
 
     @Test
+    void listDashboardsPagesAtMaxResultsAndReturnsNextToken() {
+        putDashboard("page-a", BODY);
+        putDashboard("page-b", BODY);
+        putDashboard("page-c", BODY);
+
+        String token = given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", CW_SCOPE)
+            .formParam("Action", "ListDashboards")
+            .formParam("MaxResults", "2")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("ListDashboardsResponse.ListDashboardsResult.DashboardEntries.member.DashboardName",
+                    hasItem("page-a"))
+            .body("ListDashboardsResponse.ListDashboardsResult.DashboardEntries.member.DashboardName",
+                    hasItem("page-b"))
+            .body("ListDashboardsResponse.ListDashboardsResult.DashboardEntries.member.DashboardName",
+                    not(hasItem("page-c")))
+            .extract().path("ListDashboardsResponse.ListDashboardsResult.NextToken");
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", CW_SCOPE)
+            .formParam("Action", "ListDashboards")
+            .formParam("NextToken", token)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("ListDashboardsResponse.ListDashboardsResult.DashboardEntries.member.DashboardName",
+                    hasItem("page-c"))
+            .body("ListDashboardsResponse.ListDashboardsResult.DashboardEntries.member.DashboardName",
+                    not(hasItem("page-a")));
+    }
+
+    @Test
     void deleteDashboardsRemovesEveryNamedDashboard() {
         putDashboard("delete-a", BODY);
         putDashboard("delete-b", BODY);

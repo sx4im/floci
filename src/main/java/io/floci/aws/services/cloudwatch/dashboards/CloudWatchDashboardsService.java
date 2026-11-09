@@ -9,6 +9,8 @@ import com.fasterxml.jackson.databind.ObjectReader;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.AwsRegions;
+import io.floci.aws.core.common.PaginatedResult;
+import io.floci.aws.core.common.Pagination;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
@@ -38,6 +40,9 @@ public class CloudWatchDashboardsService {
     // leading object and the rest is silently dropped, so a document AWS rejects would be stored.
     /** AWS's documented ceiling for PutDashboard's Tags. */
     private static final int MAX_TAGS = 50;
+
+    /** AWS's documented ceiling for one ListDashboards page. */
+    private static final int MAX_PAGE = 1000;
 
     private static final ObjectReader JSON = new ObjectMapper()
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
@@ -140,6 +145,18 @@ public class CloudWatchDashboardsService {
         }
         all.sort(Comparator.comparing(Dashboard::getDashboardName));
         return all;
+    }
+
+    /**
+     * One page of the region's dashboards in name order. The token is the shared opaque
+     * cursor, so a page stays resumable when dashboards are added or removed between requests.
+     * AWS caps a ListDashboards page at 1,000 entries, which is also the page size when the
+     * caller omits MaxResults.
+     */
+    public PaginatedResult<Dashboard> listDashboards(String dashboardNamePrefix, Integer maxResults,
+                                                     String nextToken, String region) {
+        return Pagination.paginate(listDashboards(dashboardNamePrefix, region),
+                Dashboard::getDashboardName, maxResults, nextToken, MAX_PAGE, "InvalidNextToken");
     }
 
     /**
