@@ -1194,6 +1194,84 @@ class CognitoLambdaTriggersTest {
         assertEquals("refresh", claims.get("source"));
     }
 
+    @Test
+    @SuppressWarnings("unchecked")
+    void preTokenGenerationFiresForClientCredentialsGrant() throws Exception {
+        UserPool pool = createPoolWithLambdaConfig(Map.of("PreTokenGeneration", "arn:aws:lambda:::pre-token"));
+        UserPoolClient client = createClientCredentialsClient(pool);
+
+        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::pre-token"), any(byte[].class), any()))
+                .thenReturn(ok(Map.of("claimsAndScopeOverrideDetails",
+                        Map.of("accessTokenGeneration",
+                                Map.of("claimsToAddOrOverride", Map.of("marker", "yes"))))));
+
+        Map<String, Object> result = service.issueClientCredentialsToken(client.getClientId(),
+                client.getClientSecret(), "openid", null);
+        String accessToken = (String) result.get("access_token");
+
+        ArgumentCaptor<byte[]> payload = ArgumentCaptor.forClass(byte[].class);
+        verify(lambdaService).invoke(anyString(), eq("arn:aws:lambda:::pre-token"), payload.capture(), any());
+        Map<String, Object> event = MAPPER.readValue(payload.getValue(), new TypeReference<>() {});
+        assertEquals("TokenGeneration_ClientCredentials", event.get("triggerSource"));
+        assertEquals(client.getClientId(), event.get("userName"),
+                "a machine flow names the client as the principal");
+        assertEquals(List.of("openid"), ((Map<String, Object>) event.get("request")).get("scopes"));
+
+        Map<String, Object> claims = MAPPER.readValue(decodeJwtPayload(accessToken), new TypeReference<>() {});
+        assertEquals("yes", claims.get("marker"), "the trigger's claim should land in the access token");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void preTokenGenerationForClientCredentialsUsesV3ConfigForm() throws Exception {
+        UserPool pool = createPoolWithLambdaConfig(Map.of("PreTokenGenerationConfig",
+                Map.of("LambdaArn", "arn:aws:lambda:::pre-token", "LambdaVersion", "V3_0")));
+        UserPoolClient client = createClientCredentialsClient(pool);
+
+        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::pre-token"), any(byte[].class), any()))
+                .thenReturn(ok(Map.of("claimsAndScopeOverrideDetails",
+                        Map.of("accessTokenGeneration",
+                                Map.of("claimsToAddOrOverride", Map.of("marker", "yes"))))));
+
+        Map<String, Object> result = service.issueClientCredentialsToken(client.getClientId(),
+                client.getClientSecret(), "openid", null);
+
+        Map<String, Object> claims = MAPPER.readValue(
+                decodeJwtPayload((String) result.get("access_token")), new TypeReference<>() {});
+        assertEquals("yes", claims.get("marker"));
+    }
+
+    @Test
+    void preTokenGenerationLambdaErrorBlocksClientCredentialsTokenIssuance() {
+        UserPool pool = createPoolWithLambdaConfig(Map.of("PreTokenGeneration", "arn:aws:lambda:::pre-token"));
+        UserPoolClient client = createClientCredentialsClient(pool);
+
+        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::pre-token"), any(byte[].class), any()))
+                .thenReturn(lambdaError("Unhandled"));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.issueClientCredentialsToken(client.getClientId(),
+                        client.getClientSecret(), "openid", null));
+        assertEquals("UserLambdaValidationException", error.getErrorCode());
+    }
+
+    @Test
+    void clientCredentialsTokenIssuesWithoutPreTokenGenerationTrigger() {
+        UserPool pool = createPoolWithLambdaConfig(Map.of());
+        UserPoolClient client = createClientCredentialsClient(pool);
+
+        Map<String, Object> result = service.issueClientCredentialsToken(client.getClientId(),
+                client.getClientSecret(), "openid", null);
+        assertNotNull(result.get("access_token"));
+        verify(lambdaService, never()).invoke(anyString(), anyString(), any(byte[].class), any());
+    }
+
+    /** A confidential client allowed only the client_credentials flow, with one built-in scope. */
+    private UserPoolClient createClientCredentialsClient(UserPool pool) {
+        return service.createUserPoolClient(pool.getId(), "cc", true, true,
+                List.of("client_credentials"), List.of("openid"));
+    }
+
     // =========================================================================
     // PreTokenGeneration V2
     // =========================================================================

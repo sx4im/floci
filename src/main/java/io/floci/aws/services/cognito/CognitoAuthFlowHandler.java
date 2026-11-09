@@ -1919,7 +1919,8 @@ final class CognitoAuthFlowHandler {
         event.put("version", "1");
         event.put("region", regionForPool(pool));
         event.put("userPoolId", pool.getId());
-        event.put("userName", user == null ? null : user.getUsername());
+        // A machine flow has no user: the client is the principal the event names.
+        event.put("userName", user == null ? clientId : user.getUsername());
         event.put("callerContext", Map.of(
                 "awsSdkVersion", "floci",
                 "clientId", clientId));
@@ -1935,6 +1936,9 @@ final class CognitoAuthFlowHandler {
                 userAttributes.put("cognito:user_status", user.getUserStatus());
             }
             req.put("userAttributes", userAttributes);
+        } else {
+            // A machine flow still carries the key, with nothing in it.
+            req.put("userAttributes", Map.of());
         }
         event.put("request", req);
         Map<String, Object> response = new HashMap<>();
@@ -2286,7 +2290,9 @@ final class CognitoAuthFlowHandler {
 
     private static Map<String, Object> buildGroupConfiguration(CognitoUser user) {
         Map<String, Object> cfg = new HashMap<>();
-        cfg.put("groupsToOverride", user.getGroupNames() == null ? List.of() : new ArrayList<>(user.getGroupNames()));
+        // A machine flow has no user, so there are no groups to override.
+        cfg.put("groupsToOverride",
+                user == null || user.getGroupNames() == null ? List.of() : new ArrayList<>(user.getGroupNames()));
         cfg.put("iamRolesToOverride", List.of());
         cfg.put("preferredRole", null);
         return cfg;
@@ -2634,6 +2640,18 @@ final class CognitoAuthFlowHandler {
     CognitoService.ClaimsOverride preTokenGenerationForHostedAuth(UserPool pool, UserPoolClient client,
                                                                   CognitoUser user, List<String> scopes) {
         return firePreTokenGeneration(pool, client, user, Map.of(), "TokenGeneration_HostedAuth", scopes);
+    }
+
+    /**
+     * Fires PreTokenGeneration for a client credentials grant. There is no user, so the
+     * trigger event names the client as the principal and carries an empty group
+     * configuration. AWS names this trigger source {@code TokenGeneration_ClientCredentials}.
+     * {@code scopes} are the scopes the token request was granted, which a V2 lambda may
+     * branch on.
+     */
+    CognitoService.ClaimsOverride preTokenGenerationForClientCredentials(UserPool pool, UserPoolClient client,
+                                                                         List<String> scopes) {
+        return firePreTokenGeneration(pool, client, null, Map.of(), "TokenGeneration_ClientCredentials", scopes);
     }
 
     private static String resolveTriggerArn(UserPool pool, String triggerKey) {
