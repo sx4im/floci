@@ -2,6 +2,7 @@ package io.floci.aws.services.appconfig;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
@@ -489,6 +490,50 @@ class AppConfigServiceTest {
         List<DeploymentSummary> items = service.listDeployments("app", "env", null, null).items();
         assertEquals(1, items.size());
         return items.get(0);
+    }
+
+    @Test
+    void listApplicationsHonorsMaxResultsAndNextToken() {
+        Application first = new Application();
+        first.setId("app-a");
+        first.setName("pagination-a");
+        Application second = new Application();
+        second.setId("app-b");
+        second.setName("pagination-b");
+        when(applicationStore.keys()).thenReturn(Set.of("us-east-1/app-a", "us-east-1/app-b"));
+        when(applicationStore.get("us-east-1/app-a")).thenReturn(Optional.of(first));
+        when(applicationStore.get("us-east-1/app-b")).thenReturn(Optional.of(second));
+
+        PaginatedResult<Application> firstPage = service.listApplications(1, null);
+        assertEquals(List.of(first), firstPage.items());
+        assertNotNull(firstPage.nextToken());
+
+        PaginatedResult<Application> secondPage = service.listApplications(1, firstPage.nextToken());
+        assertEquals(List.of(second), secondPage.items());
+        assertNull(secondPage.nextToken());
+
+        PaginatedResult<Application> all = service.listApplications(null, null);
+        assertEquals(List.of(first, second), all.items());
+        assertNull(all.nextToken());
+    }
+
+    @Test
+    void listApplicationsRejectsOutOfRangeMaxResults() {
+        AwsException tooSmall = assertThrows(AwsException.class, () -> service.listApplications(0, null));
+        assertEquals("BadRequestException", tooSmall.getErrorCode());
+        assertEquals(400, tooSmall.getHttpStatus());
+        AwsException tooLarge = assertThrows(AwsException.class, () -> service.listApplications(101, null));
+        assertEquals("BadRequestException", tooLarge.getErrorCode());
+        assertEquals(400, tooLarge.getHttpStatus());
+    }
+
+    @Test
+    void listApplicationsRejectsInvalidNextToken() {
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.listApplications(null, "!!!"));
+        assertEquals("BadRequestException", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+        assertEquals("Invalid nextToken.", error.getMessage());
     }
 
     private static Deployment deployment(String applicationId, String environmentId, int number) {
