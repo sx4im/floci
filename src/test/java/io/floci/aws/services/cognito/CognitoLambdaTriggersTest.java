@@ -10,6 +10,7 @@ import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.services.acm.AcmService;
 import io.floci.aws.services.cognito.model.CognitoUser;
+import io.floci.aws.services.cognito.model.ResourceServerScope;
 import io.floci.aws.services.cognito.model.UserPool;
 import io.floci.aws.services.cognito.model.UserPoolClient;
 import io.floci.aws.services.cognito.verification.CognitoMessageDispatcher;
@@ -1192,6 +1193,51 @@ class CognitoLambdaTriggersTest {
             throw new RuntimeException(e);
         }
         assertEquals("refresh", claims.get("source"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void preTokenGenerationFiresForClientCredentialsGrant() throws Exception {
+        UserPool pool = createPoolWithLambdaConfig(Map.of("PreTokenGeneration", "arn:aws:lambda:::pre-token"));
+        ResourceServerScope scope = new ResourceServerScope();
+        scope.setScopeName("read");
+        scope.setScopeDescription("read notes");
+        service.createResourceServer(pool.getId(), "notes", "Notes", List.of(scope));
+        UserPoolClient client = service.createUserPoolClient(pool.getId(), "m2m", true, true,
+                List.of("client_credentials"), List.of("notes/read"));
+
+        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::pre-token"), any(byte[].class), any()))
+                .thenReturn(ok(Map.of("claimsOverrideDetails",
+                        Map.of("claimsToAddOrOverride", Map.of("marker", "yes")))));
+
+        Map<String, Object> result = service.issueClientCredentialsToken(
+                client.getClientId(), client.getClientSecret(), "notes/read", pool.getId());
+        String accessToken = (String) result.get("access_token");
+        assertNotNull(accessToken);
+
+        ArgumentCaptor<byte[]> payload = ArgumentCaptor.forClass(byte[].class);
+        verify(lambdaService).invoke(anyString(), eq("arn:aws:lambda:::pre-token"), payload.capture(), any());
+        Map<String, Object> event = MAPPER.readValue(payload.getValue(), new TypeReference<>() {});
+        assertEquals("TokenGeneration_ClientCredentials", event.get("triggerSource"));
+
+        Map<String, Object> claims = MAPPER.readValue(decodeJwtPayload(accessToken), new TypeReference<>() {});
+        assertEquals("yes", claims.get("marker"));
+    }
+
+    @Test
+    void clientCredentialsTokenIssuesWithoutPreTokenGenerationTrigger() {
+        UserPool pool = createPoolWithLambdaConfig(Map.of());
+        ResourceServerScope scope = new ResourceServerScope();
+        scope.setScopeName("read");
+        scope.setScopeDescription("read notes");
+        service.createResourceServer(pool.getId(), "notes", "Notes", List.of(scope));
+        UserPoolClient client = service.createUserPoolClient(pool.getId(), "m2m", true, true,
+                List.of("client_credentials"), List.of("notes/read"));
+
+        Map<String, Object> result = service.issueClientCredentialsToken(
+                client.getClientId(), client.getClientSecret(), "notes/read", pool.getId());
+        assertNotNull(result.get("access_token"));
+        verify(lambdaService, never()).invoke(anyString(), anyString(), any(byte[].class), any());
     }
 
     // =========================================================================
