@@ -93,6 +93,8 @@ public class AthenaService {
     private static final Pattern RESULT_STATEMENT_PATTERN = Pattern.compile(
             "^(?:SELECT|WITH|SHOW|DESCRIBE|DESC|EXPLAIN|VALUES)\\b",
             Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern DECIMAL_TYPE_PATTERN = Pattern.compile(
+            "^decimal\\((\\d+)\\s*,\\s*(\\d+)\\)$");
 
     private final StorageBackend<String, QueryExecution> queryStore;
     private final StorageBackend<String, WorkGroup> workGroupStore;
@@ -542,7 +544,7 @@ public class AthenaService {
             return new ResultSet(List.of(), new ResultSet.ResultSetMetadata(List.of()));
         }
 
-        return readResultsFromS3(execution.getResultConfiguration().getOutputLocation(), id);
+        return readResultsFromS3(execution.getResultConfiguration().getOutputLocation(), id, execution);
     }
 
     // ── private helpers ───────────────────────────────────────────────────────
@@ -1091,7 +1093,7 @@ public class AthenaService {
         }
     }
 
-    private ResultSet readResultsFromS3(String outputLocation, String queryId) {
+    private ResultSet readResultsFromS3(String outputLocation, String queryId, QueryExecution execution) {
         try {
             String bucket = extractBucket(outputLocation);
             String prefix = extractKey(outputLocation);
@@ -1109,14 +1111,14 @@ public class AthenaService {
                 return emptyResultSet();
             }
 
-            return parseCsv(csv.get().getData());
+            return parseCsv(csv.get().getData(), describeColumnTypes(execution));
         } catch (Exception e) {
             LOG.warnv("Could not read query results for {0}: {1}", queryId, e.getMessage());
             return emptyResultSet();
         }
     }
 
-    private ResultSet parseCsv(byte[] data) {
+    private ResultSet parseCsv(byte[] data, List<String> columnTypes) {
         List<ResultSet.Row> rows = new ArrayList<>();
         List<ResultSet.ColumnInfo> columns = new ArrayList<>();
 
@@ -1129,8 +1131,10 @@ public class AthenaService {
             }
 
             String[] headers = CsvParser.parseLine(headerLine).toArray(String[]::new);
-            for (String h : headers) {
-                columns.add(new ResultSet.ColumnInfo(DEFAULT_CATALOG, "", "", h, "varchar"));
+            for (int i = 0; i < headers.length; i++) {
+                String type = columnTypes != null && i < columnTypes.size()
+                        ? columnTypes.get(i) : "varchar";
+                columns.add(new ResultSet.ColumnInfo(DEFAULT_CATALOG, "", "", headers[i], type));
             }
 
             // Header row is included in GetQueryResults per AWS spec
@@ -1145,6 +1149,84 @@ public class AthenaService {
         }
 
         return new ResultSet(rows, new ResultSet.ResultSetMetadata(columns));
+    }
+
+    /**
+     * Asks DuckDB for the result column types of a finished query so GetQueryResults can
+     * report them instead of "varchar" for every column. The types are known on the DuckDB
+     * side when the query runs, but the result CSV written to S3 carries only names and
+     * values, so the schema is recovered here with DESCRIBE, which plans the query
+     * without executing it. Best effort: any failure (the sidecar is down, the query no
+     * longer plans, the statement is not a SELECT) returns null and the caller falls
+     * back to "varchar", the previous behavior.
+     */
+    private List<String> describeColumnTypes(QueryExecution execution) {
+        try {
+            String database = execution.getQueryExecutionContext() != null
+                    ? execution.getQueryExecutionContext().getDatabase() : null;
+            List<Map<String, Object>> rows = duckClient.query(
+                    "DESCRIBE " + statementText(execution.getQuery()), ddlBuilder.build(database));
+            List<String> types = new ArrayList<>();
+            for (Map<String, Object> row : rows) {
+                types.add(duckTypeToAthena(stringValue(row, "column_type")));
+            }
+            return types;
+        } catch (Exception e) {
+            LOG.debugv("Could not describe query columns for {0}: {1}",
+                    execution.getQueryExecutionId(), e.getMessage());
+            return null;
+        }
+    }
+
+    private static String stringValue(Map<String, Object> row, String key) {
+        for (Map.Entry<String, Object> entry : row.entrySet()) {
+            if (key.equalsIgnoreCase(entry.getKey()) && entry.getValue() != null) {
+                return entry.getValue().toString();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Maps a DuckDB type name to the Athena type name GetQueryResults reports. Scalar
+     * types map one to one; complex types (struct, array, map) and types Athena has no
+     * equivalent for fall back to "varchar", matching glueTypeToAthena.
+     */
+    private static String duckTypeToAthena(String duckType) {
+        if (duckType == null || duckType.isBlank()) {
+            return "varchar";
+        }
+        String normalized = duckType.strip().toLowerCase(Locale.ROOT);
+        if (normalized.equals("timestamptz") || normalized.startsWith("timestamp with time zone")) {
+            return "timestamp with time zone";
+        }
+        if (normalized.startsWith("timestamp")) {
+            return "timestamp";
+        }
+        Matcher decimal = DECIMAL_TYPE_PATTERN.matcher(normalized);
+        if (decimal.matches()) {
+            return "decimal(" + decimal.group(1) + "," + decimal.group(2) + ")";
+        }
+        int paren = normalized.indexOf('(');
+        String base = paren >= 0 ? normalized.substring(0, paren) : normalized;
+        if (base.endsWith("[]") || base.contains("<") || base.contains("[")) {
+            return "varchar";
+        }
+        return switch (base) {
+            case "boolean", "bool" -> "boolean";
+            case "tinyint", "utinyint" -> "tinyint";
+            case "smallint", "usmallint" -> "smallint";
+            case "integer", "uinteger", "int" -> "integer";
+            case "bigint", "ubigint", "hugeint" -> "bigint";
+            case "float" -> "float";
+            case "double" -> "double";
+            case "decimal" -> "decimal";
+            case "varchar" -> "varchar";
+            case "char" -> "char";
+            case "blob" -> "varbinary";
+            case "date" -> "date";
+            default -> "varchar";
+        };
     }
 
     private Map<String, Object> tableMetadata(String catalog, String database, Table table) {
