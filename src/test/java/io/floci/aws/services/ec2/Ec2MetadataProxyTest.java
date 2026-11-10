@@ -36,11 +36,17 @@ class Ec2MetadataProxyTest {
         assertEquals("-c", command[1]);
 
         String script = command[2];
-        assertTrue(script.contains("command -v ip >/dev/null 2>&1 && command -v socat >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then exit 0; fi"));
+        assertTrue(script.contains("command -v ip >/dev/null 2>&1 && command -v socat >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && command -v nft >/dev/null 2>&1; then exit 0; fi"));
         assertTrue(script.contains("apt-get install -y --no-install-recommends iproute2 socat curl ca-certificates"));
         assertTrue(script.contains("dnf install -y --allowerasing iproute socat curl ca-certificates"));
         assertTrue(script.contains("yum install -y iproute socat curl ca-certificates"));
         assertTrue(script.contains("apk add --no-cache iproute2 socat curl ca-certificates"));
+        // nftables is best effort: the relay falls back to binding port 80 directly when nft
+        // is unavailable, so a failed nftables install must not fail the whole install.
+        assertTrue(script.contains("apt-get install -y nftables"));
+        assertTrue(script.contains("dnf install -y nftables"));
+        assertTrue(script.contains("yum install -y nftables"));
+        assertTrue(script.contains("apk add --no-cache nftables"));
     }
 
     @Test
@@ -53,11 +59,17 @@ class Ec2MetadataProxyTest {
         String script = command[2];
         // Attaches address if missing
         assertTrue(script.contains("ip addr show dev lo | grep -q '169.254.169.254/32' || ip addr add 169.254.169.254/32 dev lo"));
+        // The relay listens on a high port and nft forwards port 80 to it, so a guest server
+        // can bind 0.0.0.0:80. The liveness check looks for the relay listener, not port 80.
+        assertTrue(script.contains("dnat to :18080"));
+        assertTrue(script.contains("nft add rule ip floci_imds nat_output ip daddr 169.254.169.254 tcp dport 80 dnat to :18080"));
         // Idempotent when pid file exists and process is alive
         assertTrue(script.contains("if [ -f /tmp/floci-imds-proxy.pid ] && pid=\"$(cat /tmp/floci-imds-proxy.pid)\" && [ \"$(cat \"/proc/$pid/comm\" 2>/dev/null)\" = socat ]"
-                + " && tr '\\0' ' ' 2>/dev/null <\"/proc/$pid/cmdline\" | grep -q 'TCP-LISTEN:80,bind=169.254.169.254,'; then\n  exit 0\nfi"));
+                + " && tr '\\0' ' ' 2>/dev/null <\"/proc/$pid/cmdline\" | grep -q 'TCP-LISTEN:$listen_port,bind=169.254.169.254,'; then\n  exit 0\nfi"));
         // Targets configured Floci host and IMDS port
-        assertTrue(script.contains("nohup socat TCP-LISTEN:80,bind=169.254.169.254,fork,reuseaddr TCP:10.0.0.1:9169 >/tmp/floci-imds-proxy.log 2>&1 &"));
+        assertTrue(script.contains("nohup socat TCP-LISTEN:$listen_port,bind=169.254.169.254,fork,reuseaddr TCP:10.0.0.1:9169 >/tmp/floci-imds-proxy.log 2>&1 &"));
+        // Without nft the relay binds port 80 directly, as before.
+        assertTrue(script.contains("  listen_port=80\nfi"));
         // Verifies through an IMDSv2 token even when tokenless access is refused.
         assertTrue(script.contains("-X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60'"));
         assertTrue(script.contains("http://169.254.169.254/latest/api/token"));
@@ -73,9 +85,11 @@ class Ec2MetadataProxyTest {
 
         String script = command[2];
         assertTrue(script.contains("ip addr show dev lo | grep -q '169.254.170.23/32' || ip addr add 169.254.170.23/32 dev lo"));
+        assertTrue(script.contains("dnat to :18081"));
+        assertTrue(script.contains("nft add rule ip floci_pod_identity nat_output ip daddr 169.254.170.23 tcp dport 80 dnat to :18081"));
         assertTrue(script.contains("if [ -f /tmp/floci-pod-identity-proxy.pid ] && pid=\"$(cat /tmp/floci-pod-identity-proxy.pid)\" && [ \"$(cat \"/proc/$pid/comm\" 2>/dev/null)\" = socat ]"
-                + " && tr '\\0' ' ' 2>/dev/null <\"/proc/$pid/cmdline\" | grep -q 'TCP-LISTEN:80,bind=169.254.170.23,'; then\n  exit 0\nfi"));
-        assertTrue(script.contains("nohup socat TCP-LISTEN:80,bind=169.254.170.23,fork,reuseaddr TCP:10.0.0.1:4566 >/tmp/floci-pod-identity-proxy.log 2>&1 &"));
+                + " && tr '\\0' ' ' 2>/dev/null <\"/proc/$pid/cmdline\" | grep -q 'TCP-LISTEN:$listen_port,bind=169.254.170.23,'; then\n  exit 0\nfi"));
+        assertTrue(script.contains("nohup socat TCP-LISTEN:$listen_port,bind=169.254.170.23,fork,reuseaddr TCP:10.0.0.1:4566 >/tmp/floci-pod-identity-proxy.log 2>&1 &"));
         assertTrue(script.contains("http://169.254.170.23/v1/credentials"));
     }
 
@@ -114,15 +128,16 @@ class Ec2MetadataProxyTest {
         Path record = directory.resolve("tools");
         Path arguments = directory.resolve("arguments");
         HelperShellFixture.writeTool(bin, "dnf", HelperShellFixture.checkedToolEnvironment()
-                + "printf '%s\\n' \"$*\" > \"$TEST_ARGUMENTS\"\n");
+                + "printf '%s\\n' \"$*\" >> \"$TEST_ARGUMENTS\"\n");
 
         assertEquals(0, HelperShellFixture.run(Ec2MetadataProxy.installCommand(), directory,
                 HelperShellFixture.applicationEnvironment(Map.of("PATH", bin.toString(),
                         "TEST_RECORD", record.toString(), "TEST_ARGUMENTS", arguments.toString()))),
                 HelperShellFixture.output(directory));
 
-        assertEquals("dnf\n", Files.readString(record));
-        assertEquals("install -y --allowerasing iproute socat curl ca-certificates\n",
+        assertEquals("dnf\ndnf\n", Files.readString(record));
+        assertEquals("install -y --allowerasing iproute socat curl ca-certificates\n"
+                        + "install -y nftables\n",
                 Files.readString(arguments));
     }
 
@@ -132,10 +147,12 @@ class Ec2MetadataProxyTest {
         Path bin = Files.createDirectory(directory.resolve("bin"));
         Path record = directory.resolve("tools");
         Path proxyReady = directory.resolve("proxy-ready");
+        Path nftCalls = directory.resolve("nft-calls");
         HelperShellFixture.writeTool(bin, "ip", HelperShellFixture.checkedToolEnvironment()
                 + "printf '127.0.0.1/32\\n'\n");
         HelperShellFixture.writeTool(bin, "socat", HelperShellFixture.checkedToolEnvironment()
                 + ": > \"$TEST_PROXY_READY\"\n");
+        writeFakeNft(bin, nftCalls);
         HelperShellFixture.writeTool(bin, "curl", HelperShellFixture.checkedToolEnvironment()
                 + "for attempt in 1 2 3 4 5 6 7 8 9 10; do\n"
                 + "  [ -f \"$TEST_PROXY_READY\" ] && exit 0\n"
@@ -144,15 +161,101 @@ class Ec2MetadataProxyTest {
         String name = "unit-" + UUID.randomUUID();
         try {
             String[] command = Ec2MetadataProxy.startCommand(
-                    name, "127.0.0.1", 80, "127.0.0.1", 9169, "curl fixture && exit 0");
+                    name, "127.0.0.1", 80, 18080, "127.0.0.1", 9169, "curl fixture && exit 0");
             assertEquals(0, HelperShellFixture.run(command, directory,
                     HelperShellFixture.applicationEnvironment(Map.of("PATH", bin + ":" + System.getenv("PATH"),
-                            "TEST_RECORD", record.toString(), "TEST_PROXY_READY", proxyReady.toString()))),
+                            "TEST_RECORD", record.toString(), "TEST_PROXY_READY", proxyReady.toString(),
+                            "TEST_NFT_CALLS", nftCalls.toString()))),
                     HelperShellFixture.output(directory));
-            assertEquals(Set.of("ip", "socat", "curl"), Set.copyOf(Files.readAllLines(record)));
+            assertEquals(Set.of("ip", "nft", "socat", "curl"), Set.copyOf(Files.readAllLines(record)));
         } finally {
             deleteProxyFiles(name);
         }
+    }
+
+    /**
+     * The relay listens on a high port and nft forwards port 80 to it, so a guest server can
+     * bind 0.0.0.0:80 while the metadata endpoint keeps answering on port 80.
+     */
+    @Test
+    void startScriptRedirectsPort80ToTheRelayWhenNftIsAvailable(@TempDir Path directory)
+            throws Exception {
+        Path bin = Files.createDirectory(directory.resolve("bin"));
+        Path proxyReady = directory.resolve("proxy-ready");
+        Path nftCalls = directory.resolve("nft-calls");
+        Path socatArguments = directory.resolve("socat-arguments");
+        HelperShellFixture.writeTool(bin, "ip", "printf '127.0.0.1/32\\n'\n");
+        HelperShellFixture.writeTool(bin, "socat", "printf '%s\\n' \"$*\" >> \"$TEST_SOCAT_ARGUMENTS\"\n"
+                + ": > \"$TEST_PROXY_READY\"\n");
+        writeFakeNft(bin, nftCalls);
+        String name = "unit-" + UUID.randomUUID();
+        try {
+            String[] command = Ec2MetadataProxy.startCommand(
+                    name, "127.0.0.1", 80, 18080, "127.0.0.1", 9169,
+                    "[ -f \"$TEST_PROXY_READY\" ] && exit 0");
+            assertEquals(0, HelperShellFixture.run(command, directory,
+                    HelperShellFixture.applicationEnvironment(Map.of("PATH", bin + ":" + System.getenv("PATH"),
+                            "TEST_PROXY_READY", proxyReady.toString(),
+                            "TEST_NFT_CALLS", nftCalls.toString(),
+                            "TEST_SOCAT_ARGUMENTS", socatArguments.toString()))),
+                    HelperShellFixture.output(directory));
+            assertTrue(Files.readString(socatArguments).contains("TCP-LISTEN:18080,bind=127.0.0.1,"),
+                    HelperShellFixture.output(directory));
+            String calls = Files.readString(nftCalls);
+            assertTrue(calls.contains("add table ip floci_" + name.replace('-', '_')), calls);
+            assertTrue(calls.contains("add chain ip floci_" + name.replace('-', '_')
+                    + " nat_output"), calls);
+            assertTrue(calls.contains("add rule ip floci_" + name.replace('-', '_')
+                    + " nat_output ip daddr 127.0.0.1 tcp dport 80 dnat to :18080"), calls);
+        } finally {
+            deleteProxyFiles(name);
+        }
+    }
+
+    /**
+     * On an image without nftables the relay binds port 80 directly, as before, so the
+     * metadata endpoint still comes up instead of failing the whole setup. PATH is curated
+     * to the fake bin plus /usr/bin:/bin so no real nft on the host can leak in.
+     */
+    @Test
+    void startScriptBindsPort80DirectlyWhenNftIsMissing(@TempDir Path directory)
+            throws Exception {
+        Path bin = Files.createDirectory(directory.resolve("bin"));
+        Path proxyReady = directory.resolve("proxy-ready");
+        Path socatArguments = directory.resolve("socat-arguments");
+        HelperShellFixture.writeTool(bin, "ip", "printf '127.0.0.1/32\\n'\n");
+        HelperShellFixture.writeTool(bin, "socat", "printf '%s\\n' \"$*\" >> \"$TEST_SOCAT_ARGUMENTS\"\n"
+                + ": > \"$TEST_PROXY_READY\"\n");
+        String name = "unit-" + UUID.randomUUID();
+        try {
+            String[] command = Ec2MetadataProxy.startCommand(
+                    name, "127.0.0.1", 80, 18080, "127.0.0.1", 9169,
+                    "[ -f \"$TEST_PROXY_READY\" ] && exit 0");
+            assertEquals(0, HelperShellFixture.run(command, directory,
+                    Map.of("PATH", bin + ":/usr/bin:/bin",
+                            "TEST_PROXY_READY", proxyReady.toString(),
+                            "TEST_SOCAT_ARGUMENTS", socatArguments.toString())),
+                    HelperShellFixture.output(directory));
+            assertTrue(Files.readString(socatArguments).contains("TCP-LISTEN:80,bind=127.0.0.1,"),
+                    HelperShellFixture.output(directory));
+        } finally {
+            deleteProxyFiles(name);
+        }
+    }
+
+    /**
+     * A fake nft that reports the Floci table and chain as missing and accepts the adds,
+     * recording every invocation. The real nft on the test host must never run: it would
+     * mutate the host's tables.
+     */
+    private static void writeFakeNft(Path bin, Path calls) throws Exception {
+        HelperShellFixture.writeTool(bin, "nft", ": \"${TEST_RECORD:=/dev/null}\"\n"
+                + HelperShellFixture.checkedToolEnvironment()
+                + "printf '%s\\n' \"$*\" >> \"" + calls + "\"\n"
+                + "case \"$*\" in\n"
+                + "  \"list table ip \"*|\"list chain ip \"*) exit 1;;\n"
+                + "esac\n"
+                + "exit 0\n");
     }
 
     @Test
@@ -253,15 +356,18 @@ class Ec2MetadataProxyTest {
         Path bin = Files.createDirectory(directory.resolve("bin"));
         HelperShellFixture.writeTool(bin, "ip", "printf '127.0.0.1/32\\n'\n");
         HelperShellFixture.writeTool(bin, "socat", "exit 0\n");
+        Path nftCalls = directory.resolve("nft-calls");
+        writeFakeNft(bin, nftCalls);
         List<String> requests = new CopyOnWriteArrayList<>();
         HttpServer server = metadataStandIn(requests, attempt -> attempt == 1 ? 403 : 200, "fixture-token");
         String name = "unit-" + UUID.randomUUID();
         try {
-            String[] command = Ec2MetadataProxy.startCommand(name, "127.0.0.1", 80, "127.0.0.1", 9169,
+            String[] command = Ec2MetadataProxy.startCommand(name, "127.0.0.1", 80, 18080, "127.0.0.1", 9169,
                     Ec2MetadataProxy.imdsProbeCommand("http://127.0.0.1:" + server.getAddress().getPort()));
 
             int result = HelperShellFixture.run(command, directory,
-                    Map.of("PATH", bin + ":" + System.getenv("PATH")));
+                    HelperShellFixture.applicationEnvironment(Map.of("PATH", bin + ":" + System.getenv("PATH"),
+                            "TEST_NFT_CALLS", nftCalls.toString())));
 
             assertEquals(0, result, HelperShellFixture.output(directory));
             assertEquals(List.of("PUT token 60", "PUT token 60", "GET metadata fixture-token"), requests,
@@ -284,14 +390,18 @@ class Ec2MetadataProxyTest {
         Path proxyStarted = directory.resolve("proxy-started");
         HelperShellFixture.writeTool(bin, "ip", "printf '127.0.0.1/32\\n'\n");
         HelperShellFixture.writeTool(bin, "socat", ": > '" + proxyStarted + "'\n");
+        Path nftCalls = directory.resolve("nft-calls");
+        writeFakeNft(bin, nftCalls);
         String name = "unit-" + UUID.randomUUID();
         try {
             // This JVM is alive, and it is not the proxy.
             Files.writeString(Path.of("/tmp/floci-" + name + "-proxy.pid"), ProcessHandle.current().pid() + "\n");
-            String[] command = Ec2MetadataProxy.startCommand(name, "127.0.0.1", 80, "127.0.0.1", 9169,
+            String[] command = Ec2MetadataProxy.startCommand(name, "127.0.0.1", 80, 18080, "127.0.0.1", 9169,
                     "[ -f '" + proxyStarted + "' ] && exit 0");
 
-            int result = HelperShellFixture.run(command, directory, Map.of("PATH", bin + ":" + System.getenv("PATH")));
+            int result = HelperShellFixture.run(command, directory,
+                    HelperShellFixture.applicationEnvironment(Map.of("PATH", bin + ":" + System.getenv("PATH"),
+                            "TEST_NFT_CALLS", nftCalls.toString())));
 
             assertEquals(0, result, HelperShellFixture.output(directory));
             assertTrue(Files.exists(proxyStarted), "socat was never started: " + HelperShellFixture.output(directory));
@@ -313,15 +423,19 @@ class Ec2MetadataProxyTest {
         Path proxyStarted = directory.resolve("proxy-started");
         HelperShellFixture.writeTool(bin, "ip", "printf '127.0.0.1/32\\n'\n");
         HelperShellFixture.writeTool(bin, "socat", ": > '" + proxyStarted + "'\n");
+        Path nftCalls = directory.resolve("nft-calls");
+        writeFakeNft(bin, nftCalls);
         String name = "unit-" + UUID.randomUUID();
         String pidFile = "/tmp/floci-" + name + "-proxy.pid";
         try {
-            String[] command = Ec2MetadataProxy.startCommand(name, "127.0.0.1", 80, "127.0.0.1", 9169,
+            String[] command = Ec2MetadataProxy.startCommand(name, "127.0.0.1", 80, 18080, "127.0.0.1", 9169,
                     "[ -f '" + proxyStarted + "' ] && exit 0");
             // The script's own shell takes the recorded pid, as a reused pid would after a restart.
             command[2] = command[2].replaceFirst("set -eu\n", "set -eu\necho \\$\\$ > " + pidFile + "\n");
 
-            int result = HelperShellFixture.run(command, directory, Map.of("PATH", bin + ":" + System.getenv("PATH")));
+            int result = HelperShellFixture.run(command, directory,
+                    HelperShellFixture.applicationEnvironment(Map.of("PATH", bin + ":" + System.getenv("PATH"),
+                            "TEST_NFT_CALLS", nftCalls.toString())));
 
             assertEquals(0, result, HelperShellFixture.output(directory));
             assertTrue(Files.exists(proxyStarted), "socat was never started: " + HelperShellFixture.output(directory));

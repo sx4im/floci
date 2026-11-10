@@ -222,7 +222,9 @@ An `AWS::EC2::Instance` that declares no `IamInstanceProfile` launches with the 
 Floci runs an IMDS-compatible HTTP server on port `9169` of the host. Each launched container receives the environment variable `AWS_EC2_METADATA_SERVICE_ENDPOINT` pointing to this server.
 
 Inside each launched container, the link-local address `169.254.169.254` is a proxy to this
-server. The helper shells that install and start the proxy clear `LD_LIBRARY_PATH`,
+server. The relay listens on a high port inside the container and an nftables rule forwards
+`169.254.169.254:80` to it, so port 80 stays free for applications in the guest, as on real
+AWS. On an image without nftables the relay binds port 80 directly, as before. The helper shells that install and start the proxy clear `LD_LIBRARY_PATH`,
 `PYTHONPATH` and `PYTHONHOME` before running system tools, so an application's library search
 path and Python installation do not reach the package manager, `socat` and `curl`. The
 container's configured environment and the application's processes keep these variables. The

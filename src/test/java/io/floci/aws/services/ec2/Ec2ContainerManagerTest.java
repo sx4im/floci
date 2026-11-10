@@ -1669,7 +1669,10 @@ class Ec2ContainerManagerTest {
 
         assertEquals("sh", command[0]);
         assertTrue(command[2].contains("169.254.169.254/32"));
-        assertTrue(command[2].contains("TCP-LISTEN:80,bind=169.254.169.254"));
+        // The relay listens on a high port and nft forwards port 80 to it, so a guest
+        // server can bind 0.0.0.0:80 while the endpoint keeps answering on port 80.
+        assertTrue(command[2].contains("dnat to :18080"));
+        assertTrue(command[2].contains("TCP-LISTEN:$listen_port,bind=169.254.169.254"));
         assertTrue(command[2].contains("TCP:floci:9169"));
         assertTrue(command[2].contains("http://169.254.169.254/latest/meta-data/instance-id"));
     }

@@ -20,13 +20,21 @@ public final class Ec2MetadataProxy {
      */
     static final String CLEAR_APPLICATION_PATHS = "unset LD_LIBRARY_PATH PYTHONPATH PYTHONHOME";
 
+    /**
+     * Relay ports the proxies listen on inside the guest. Port 80 itself stays free for the
+     * guest's own servers: an nftables rule forwards {@code <bindIp>:80} to the relay port, so
+     * the metadata endpoint keeps answering on port 80 without occupying it.
+     */
+    static final int IMDS_RELAY_PORT = 18080;
+    static final int POD_IDENTITY_RELAY_PORT = 18081;
+
     private Ec2MetadataProxy() {}
 
     public static String[] installCommand() {
         return new String[]{"sh", "-c", String.join("\n",
                 "set -eu",
                 CLEAR_APPLICATION_PATHS,
-                "if command -v ip >/dev/null 2>&1 && command -v socat >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then exit 0; fi",
+                "if command -v ip >/dev/null 2>&1 && command -v socat >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && command -v nft >/dev/null 2>&1; then exit 0; fi",
                 "if command -v apt-get >/dev/null 2>&1; then",
                 "  apt-get update -qq >/dev/null",
                 "  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iproute2 socat curl ca-certificates >/dev/null",
@@ -48,11 +56,25 @@ public final class Ec2MetadataProxy {
                 "else",
                 "  echo 'No supported package manager found for IMDS proxy dependencies' >&2",
                 "  exit 1",
+                "fi",
+                // nftables is best effort: without nft the relay binds port 80 directly, as
+                // before, so a failed nftables install must not fail the whole install and
+                // leave the instance without a metadata endpoint.
+                "if ! command -v nft >/dev/null 2>&1; then",
+                "  if command -v apt-get >/dev/null 2>&1; then",
+                "    DEBIAN_FRONTEND=noninteractive apt-get install -y nftables >/dev/null 2>&1 || true",
+                "  elif command -v dnf >/dev/null 2>&1; then",
+                "    dnf install -y nftables >/dev/null 2>&1 || true",
+                "  elif command -v yum >/dev/null 2>&1; then",
+                "    yum install -y nftables >/dev/null 2>&1 || true",
+                "  elif command -v apk >/dev/null 2>&1; then",
+                "    apk add --no-cache nftables >/dev/null 2>&1 || true",
+                "  fi",
                 "fi")};
     }
 
     public static String[] startCommand(String flociHost, int imdsPort) {
-        return startCommand("imds", "169.254.169.254", 80, flociHost, imdsPort,
+        return startCommand("imds", "169.254.169.254", 80, IMDS_RELAY_PORT, flociHost, imdsPort,
                 imdsProbeCommand("http://169.254.169.254"));
     }
 
@@ -71,7 +93,7 @@ public final class Ec2MetadataProxy {
     }
 
     public static String[] podIdentityStartCommand(String flociHost, int flociPort) {
-        return startCommand("pod-identity", "169.254.170.23", 80, flociHost, flociPort,
+        return startCommand("pod-identity", "169.254.170.23", 80, POD_IDENTITY_RELAY_PORT, flociHost, flociPort,
                 podIdentityProbeCommand("http://169.254.170.23"));
     }
 
@@ -85,14 +107,32 @@ public final class Ec2MetadataProxy {
                 + "/v1/credentials)\" != \"000\" ] && exit 0";
     }
 
-    public static String[] startCommand(String name, String bindIp, int bindPort,
+    public static String[] startCommand(String name, String bindIp, int bindPort, int relayPort,
                                         String targetHost, int targetPort, String probeCommand) {
         String pidFile = "/tmp/floci-" + name + "-proxy.pid";
         String logFile = "/tmp/floci-" + name + "-proxy.log";
+        String table = "floci_" + name.replace('-', '_');
         return new String[]{"sh", "-c", String.join("\n",
                 "set -eu",
                 CLEAR_APPLICATION_PATHS,
                 "ip addr show dev lo | grep -q '" + bindIp + "/32' || ip addr add " + bindIp + "/32 dev lo",
+                // Port 80 belongs to the guest's own servers: an application binding 0.0.0.0:80
+                // fails while anything listens on the link-local address on port 80. socat therefore
+                // relay port and nft forwards <bindIp>:80 to it, so the endpoint keeps
+                // answering on port 80 without occupying it. Without nft the relay binds port
+                // 80 directly, as before, so the endpoint still comes up on images without
+                // nftables. The probe still hits port 80, so it exercises the forwarding path.
+                "if command -v nft >/dev/null 2>&1; then",
+                "  listen_port=" + relayPort,
+                "  nft list table ip " + table + " >/dev/null 2>&1 || nft add table ip " + table,
+                "  nft list chain ip " + table + " nat_output >/dev/null 2>&1 || nft add chain ip " + table
+                        + " nat_output '{ type nat hook output priority 0; }'",
+                "  nft list chain ip " + table + " nat_output 2>/dev/null | grep -q 'dnat to :" + relayPort + "'"
+                        + " || nft add rule ip " + table + " nat_output ip daddr " + bindIp
+                        + " tcp dport " + bindPort + " dnat to :" + relayPort,
+                "else",
+                "  listen_port=" + bindPort,
+                "fi",
                 // The pid file is on the container's writable layer, so it outlives a restart while
                 // the PID namespace does not: only a pid that is still this socat listener counts.
                 // The command name matters as well as the arguments: the shell running this script
@@ -100,10 +140,10 @@ public final class Ec2MetadataProxy {
                 "if [ -f " + pidFile + " ] && pid=\"$(cat " + pidFile + ")\""
                         + " && [ \"$(cat \"/proc/$pid/comm\" 2>/dev/null)\" = socat ]"
                         + " && tr '\\0' ' ' 2>/dev/null <\"/proc/$pid/cmdline\""
-                        + " | grep -q 'TCP-LISTEN:" + bindPort + ",bind=" + bindIp + ",'; then",
+                        + " | grep -q 'TCP-LISTEN:$listen_port,bind=" + bindIp + ",'; then",
                 "  exit 0",
                 "fi",
-                "nohup socat TCP-LISTEN:" + bindPort + ",bind=" + bindIp + ",fork,reuseaddr TCP:"
+                "nohup socat TCP-LISTEN:$listen_port,bind=" + bindIp + ",fork,reuseaddr TCP:"
                         + targetHost + ":" + targetPort + " >" + logFile + " 2>&1 &",
                 "echo $! > " + pidFile,
                 "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do",
