@@ -13,6 +13,7 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
@@ -44,6 +45,7 @@ class MySqlProtocolHandlerTest {
     private static final int CLIENT_SECURE_CONNECTION = 0x8000;
     private static final int CLIENT_SSL = 0x0800;
     private static final int CLIENT_PLUGIN_AUTH = 0x0008_0000;
+    private static final int CLIENT_COMPRESS = 0x0020;
     private static final String MYSQL_NATIVE_PASSWORD = "mysql_native_password";
     private static final String MYSQL_CLEAR_PASSWORD = "mysql_clear_password";
     private static final int CLIENT_CONNECT_WITH_DB = 0x0008;
@@ -128,6 +130,188 @@ class MySqlProtocolHandlerTest {
 
         assertEquals((byte) 1, backendResponseSeq.get(), "sequence must be unchanged when no TLS upgrade occurs");
         assertEquals("admin", extractUsername(backendResponsePayload.get()));
+    }
+
+    @Test
+    void compressedComQueryReachesBackendAfterLogin() throws Exception {
+        byte[] nonce = fixedNonce();
+        AtomicReference<byte[]> backendQuery = new AtomicReference<>();
+        byte[] queryPayload = new byte[1 + "select 1".length()];
+        queryPayload[0] = 0x03;
+        System.arraycopy("select 1".getBytes(StandardCharsets.UTF_8), 0, queryPayload, 1, 8);
+        byte[] query = wrapCompressedPacket(0, wrapPacket(0, queryPayload));
+
+        try (ServerSocket backendServer = new ServerSocket(0);
+             ServerSocket clientServer = new ServerSocket(0)) {
+
+            Thread backendThread = Thread.ofVirtual().start(() -> {
+                try (Socket socket = backendServer.accept()) {
+                    InputStream in = socket.getInputStream();
+                    OutputStream out = socket.getOutputStream();
+
+                    out.write(buildHandshakeV10(nonce, null, CLIENT_COMPRESS));
+                    out.flush();
+
+                    assertNotNull(readMysqlPacketRaw(in));
+
+                    // The backend enables compression once the client asked for it, so its OK
+                    // and every later packet are compressed packets (outer sequence 0, then 1).
+                    out.write(wrapCompressedPacket(0, wrapPacket(2, OK_PAYLOAD)));
+                    out.flush();
+
+                    backendQuery.set(readCompressedPacketRaw(in));
+
+                    out.write(wrapCompressedPacket(1, wrapPacket(1, OK_PAYLOAD)));
+                    out.flush();
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+            try (Socket ourClient = new Socket("localhost", clientServer.getLocalPort())) {
+                Socket proxyClient = clientServer.accept();
+                Socket backend = new Socket("localhost", backendServer.getLocalPort());
+
+                Thread authThread = Thread.ofVirtual().start(() -> {
+                    try {
+                        MySqlProtocolHandler.handleAuth(
+                                proxyClient, backend, NO_RECONNECT, "admin", "secret",
+                                false, testSigV4Validator(), testTlsCertificates(),
+                                (user, pass) -> PasswordValidator.AuthResult.MASTER_EQUIVALENT, 5000,
+                                username -> true, testBinding());
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+
+                InputStream clientIn = ourClient.getInputStream();
+                OutputStream clientOut = ourClient.getOutputStream();
+
+                byte[] serverHandshake = readMysqlPacketRaw(clientIn);
+                assertNotNull(serverHandshake);
+                // The proxy keeps the compression offer: a conformant client only asks for
+                // compression when the server advertised it, and the proxy must relay the
+                // compressed packets that follow instead of framing them as classic packets.
+                assertTrue((capabilityFlagsLower(serverHandshake) & CLIENT_COMPRESS) != 0);
+
+                byte[] scramble = scrambleNativePassword("secret", nonce);
+                byte[] response = buildHandshakeResponse41("admin", scramble, (byte) 1,
+                        CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_COMPRESS);
+                clientOut.write(response);
+                clientOut.flush();
+
+                assertNotNull(readCompressedPacketRaw(clientIn));
+
+                clientOut.write(query);
+                clientOut.flush();
+
+                assertNotNull(readCompressedPacketRaw(clientIn));
+
+                ourClient.close();
+                proxyClient.close();
+                authThread.join(5_000);
+                backendThread.join(5_000);
+                assertEquals(false, authThread.isAlive(), "authThread did not terminate");
+                assertEquals(false, backendThread.isAlive(), "backendThread did not terminate");
+            }
+        }
+
+        // Before the fix the proxy read the compressed COM_QUERY with the classic 4-byte
+        // header, 3 bytes short, and the connection hung with the backend authenticated
+        // and idle. Now the whole compressed packet must arrive byte-identical.
+        assertNotNull(backendQuery.get(), "backend never received the compressed COM_QUERY");
+        assertArrayEquals(query, backendQuery.get());
+    }
+
+    @Test
+    void compressedPacketRoundTrip() throws Exception {
+        byte[] inner = wrapPacket(0, new byte[]{0x03, 's', 'e', 'l', 'e', 'c', 't', ' ', '1'});
+        byte[] raw = MySqlProtocolHandler.buildCompressedPacket(inner, 5);
+        assertEquals(5, raw[3] & 0xFF);
+        assertArrayEquals(inner, MySqlProtocolHandler.innerClassicPacket(raw, true));
+        assertEquals(0, MySqlProtocolHandler.packetSequence(raw, true));
+        assertEquals(0x03, MySqlProtocolHandler.packetMarker(raw, true));
+        ByteArrayInputStream in = new ByteArrayInputStream(raw);
+        assertArrayEquals(raw, MySqlProtocolHandler.readMysqlPacketRaw(in, true));
+        assertNull(MySqlProtocolHandler.readMysqlPacketRaw(in, true));
+    }
+
+    @Test
+    void compressedPacketWithZlibPayloadRoundTrip() throws Exception {
+        // A long, repetitive COM_QUERY deflates well below its original size, so the packet
+        // carries a real zlib stream instead of the stored form.
+        StringBuilder sql = new StringBuilder("select '");
+        for (int i = 0; i < 40; i++) {
+            sql.append("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        }
+        sql.append("'");
+        byte[] payload = new byte[1 + sql.length()];
+        payload[0] = 0x03;
+        System.arraycopy(sql.toString().getBytes(StandardCharsets.UTF_8), 0, payload, 1, sql.length());
+        byte[] inner = wrapPacket(0, payload);
+        byte[] raw = MySqlProtocolHandler.buildCompressedPacket(inner, 7);
+        int uncompressedLength = (raw[4] & 0xFF) | ((raw[5] & 0xFF) << 8) | ((raw[6] & 0xFF) << 16);
+        assertEquals(inner.length, uncompressedLength);
+        assertTrue(raw.length < 7 + inner.length);
+        assertArrayEquals(inner, MySqlProtocolHandler.innerClassicPacket(raw, true));
+        assertEquals(0, MySqlProtocolHandler.packetSequence(raw, true));
+        ByteArrayInputStream in = new ByteArrayInputStream(raw);
+        assertArrayEquals(raw, MySqlProtocolHandler.readMysqlPacketRaw(in, true));
+    }
+
+    @Test
+    void renumberCompressedPacketShiftsOnlyTheInnerSequence() throws Exception {
+        byte[] inner = wrapPacket(2, OK_PAYLOAD);
+        byte[] raw = MySqlProtocolHandler.buildCompressedPacket(inner, 5);
+        byte[] renumbered = MySqlProtocolHandler.renumberPacket(raw, true, 1);
+        assertEquals(5, renumbered[3] & 0xFF, "the outer sequence id is untouched");
+        assertEquals(3, MySqlProtocolHandler.packetSequence(renumbered, true));
+
+        // The same holds when the payload is a zlib stream: the inner header sits inside
+        // the compressed data, so the packet is rebuilt rather than patched in place.
+        StringBuilder sql = new StringBuilder("select '");
+        for (int i = 0; i < 40; i++) {
+            sql.append("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        }
+        sql.append("'");
+        byte[] payload = new byte[1 + sql.length()];
+        payload[0] = 0x03;
+        System.arraycopy(sql.toString().getBytes(StandardCharsets.UTF_8), 0, payload, 1, sql.length());
+        byte[] zlibRaw = MySqlProtocolHandler.buildCompressedPacket(wrapPacket(2, payload), 5);
+        byte[] zlibRenumbered = MySqlProtocolHandler.renumberPacket(zlibRaw, true, 1);
+        assertEquals(5, zlibRenumbered[3] & 0xFF, "the outer sequence id is untouched");
+        assertEquals(3, MySqlProtocolHandler.packetSequence(zlibRenumbered, true));
+        assertArrayEquals(wrapPacket(3, payload),
+                MySqlProtocolHandler.innerClassicPacket(zlibRenumbered, true));
+    }
+
+    @Test
+    void compressedComQueryRewritePreservesIamPluginHandling() throws Exception {
+        String sql = "CREATE USER 'app'@'%' IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS';";
+        byte[] payload = new byte[1 + sql.length()];
+        payload[0] = 0x03;
+        System.arraycopy(sql.getBytes(StandardCharsets.UTF_8), 0, payload, 1, sql.length());
+        byte[] raw = MySqlProtocolHandler.buildCompressedPacket(wrapPacket(0, payload), 0);
+        byte[] rewritten = MySqlProtocolHandler.maybeRewriteCompressedQuery(raw);
+        byte[] inner = MySqlProtocolHandler.innerClassicPacket(rewritten, true);
+        String text = new String(inner, 4, inner.length - 4, StandardCharsets.UTF_8);
+        assertTrue(text.contains(
+                "IDENTIFIED WITH mysql_native_password AS '*0000000000000000000000000000000000000000'"));
+        assertFalse(text.contains("AWSAuthenticationPlugin"));
+
+        // A plain query is forwarded untouched.
+        byte[] plain = MySqlProtocolHandler.buildCompressedPacket(
+                wrapPacket(0, new byte[]{0x03, 's', 'e', 'l', 'e', 'c', 't', ' ', '1'}), 0);
+        assertArrayEquals(plain, MySqlProtocolHandler.maybeRewriteCompressedQuery(plain));
+
+        // Two classic packets bundled into one compressed packet are forwarded untouched.
+        byte[] first = wrapPacket(0, new byte[]{0x03, 's', 'e', 'l', 'e', 'c', 't', ' ', '1'});
+        byte[] second = wrapPacket(1, new byte[]{0x03, 's', 'e', 'l', 'e', 'c', 't', ' ', '2'});
+        byte[] bundled = new byte[first.length + second.length];
+        System.arraycopy(first, 0, bundled, 0, first.length);
+        System.arraycopy(second, 0, bundled, first.length, second.length);
+        byte[] bundledRaw = MySqlProtocolHandler.buildCompressedPacket(bundled, 0);
+        assertArrayEquals(bundledRaw, MySqlProtocolHandler.maybeRewriteCompressedQuery(bundledRaw));
     }
 
     @Test
@@ -797,11 +981,18 @@ class MySqlProtocolHandlerTest {
     private static void mockMySqlBackend(ServerSocket server, byte[] nonce, String authPlugin,
                                          AtomicReference<Byte> responseSeq,
                                          AtomicReference<byte[]> responsePayload) throws IOException {
+        mockMySqlBackend(server, nonce, authPlugin, 0, responseSeq, responsePayload);
+    }
+
+    private static void mockMySqlBackend(ServerSocket server, byte[] nonce, String authPlugin,
+                                         int extraCapabilities,
+                                         AtomicReference<Byte> responseSeq,
+                                         AtomicReference<byte[]> responsePayload) throws IOException {
         try (Socket socket = server.accept()) {
             OutputStream out = socket.getOutputStream();
             InputStream in = socket.getInputStream();
 
-            out.write(buildHandshakeV10(nonce, authPlugin));
+            out.write(buildHandshakeV10(nonce, authPlugin, extraCapabilities));
             out.flush();
 
             byte[] responseRaw = readMysqlPacketRaw(in);
@@ -822,6 +1013,11 @@ class MySqlProtocolHandlerTest {
     }
 
     private static byte[] buildHandshakeV10(byte[] nonce, String authPlugin) throws IOException {
+        return buildHandshakeV10(nonce, authPlugin, 0);
+    }
+
+    private static byte[] buildHandshakeV10(byte[] nonce, String authPlugin, int extraCapabilities)
+            throws IOException {
         ByteArrayOutputStream payload = new ByteArrayOutputStream();
         payload.write(10); // protocol version
         payload.write("8.0.34".getBytes(StandardCharsets.UTF_8));
@@ -829,7 +1025,7 @@ class MySqlProtocolHandlerTest {
         writeInt32LE(payload, 1); // connection id
         payload.write(nonce, 0, 8); // auth-plugin-data part 1
         payload.write(0); // filler
-        int capabilities = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION;
+        int capabilities = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | extraCapabilities;
         if (authPlugin != null) {
             capabilities |= CLIENT_PLUGIN_AUTH;
         }
@@ -1003,6 +1199,56 @@ class MySqlProtocolHandlerTest {
 
     private static void writeMysqlPacket(OutputStream out, int sequence, byte[] payload) throws IOException {
         out.write(wrapPacket(sequence, payload));
+    }
+
+    /**
+     * Frames a classic packet as a compressed packet in stored form (uncompressed length 0),
+     * the shape a real server emits for small packets.
+     */
+    private static byte[] wrapCompressedPacket(int sequence, byte[] innerClassicPacket)
+            throws IOException {
+        ByteArrayOutputStream raw = new ByteArrayOutputStream();
+        int length = innerClassicPacket.length;
+        raw.write(length & 0xFF);
+        raw.write((length >> 8) & 0xFF);
+        raw.write((length >> 16) & 0xFF);
+        raw.write(sequence);
+        raw.write(0); // uncompressed length 0: stored
+        raw.write(0);
+        raw.write(0);
+        raw.write(innerClassicPacket);
+        return raw.toByteArray();
+    }
+
+    private static byte[] readCompressedPacketRaw(InputStream in) throws IOException {
+        int c0 = in.read();
+        int c1 = in.read();
+        int c2 = in.read();
+        int seq = in.read();
+        int u0 = in.read();
+        int u1 = in.read();
+        int u2 = in.read();
+        if ((c0 | c1 | c2 | seq | u0 | u1 | u2) < 0) {
+            return null;
+        }
+        int length = c0 | (c1 << 8) | (c2 << 16);
+        byte[] raw = new byte[7 + length];
+        raw[0] = (byte) c0;
+        raw[1] = (byte) c1;
+        raw[2] = (byte) c2;
+        raw[3] = (byte) seq;
+        raw[4] = (byte) u0;
+        raw[5] = (byte) u1;
+        raw[6] = (byte) u2;
+        int offset = 7;
+        while (offset < raw.length) {
+            int n = in.read(raw, offset, raw.length - offset);
+            if (n < 0) {
+                throw new EOFException("Connection closed while reading MySQL compressed packet");
+            }
+            offset += n;
+        }
+        return raw;
     }
 
     private static byte[] readMysqlPacketRaw(InputStream in) throws IOException {

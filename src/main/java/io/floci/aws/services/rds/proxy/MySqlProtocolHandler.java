@@ -15,6 +15,9 @@ import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.zip.DataFormatException;
+import java.util.zip.Deflater;
+import java.util.zip.Inflater;
 
 /**
  * Handles the MySQL wire protocol auth intercept using a transparent relay.
@@ -52,6 +55,7 @@ public class MySqlProtocolHandler {
     private static final Logger LOG = Logger.getLogger(MySqlProtocolHandler.class);
 
     private static final int CLIENT_SSL = 0x0800;
+    private static final int CLIENT_COMPRESS = 0x0020;
     private static final int CLIENT_PLUGIN_AUTH = 0x0008_0000;
     private static final int CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA = 0x200000;
     private static final int CLIENT_SECURE_CONNECTION = 0x8000;
@@ -78,6 +82,13 @@ public class MySqlProtocolHandler {
 
     private static final int COM_QUERY = 0x03;
     private static final int MAX_PACKET_PAYLOAD = 0xFFFFFF;
+
+    // A compressed packet carries a 7-byte header (3-byte compressed length, 1-byte sequence
+    // id, 3-byte uncompressed length). Its payload is the classic packet either stored
+    // verbatim (uncompressed length 0, used when compression would not shrink it) or as a
+    // zlib stream of that packet. The outer sequence id runs on its own counter,
+    // independent of the inner (logical) sequence id in the classic packet it carries.
+    private static final int COMPRESSED_PACKET_HEADER_LENGTH = 7;
 
     private static final Pattern IAM_AUTH_PLUGIN = Pattern.compile(
             "IDENTIFIED\\s+WITH\\s+`?AWSAuthenticationPlugin`?"
@@ -191,6 +202,10 @@ public class MySqlProtocolHandler {
         ParsedHandshakeResponse parsed = parseHandshakeResponse(
                 Arrays.copyOfRange(clientResponseRaw, 4, clientResponseRaw.length));
         String clientUsername = parsed.username();
+        // A client that asked for compression frames every packet after its handshake response
+        // with the 7-byte compressed header, so the proxy must frame them the same way instead
+        // of reading them as classic 4-byte-header packets.
+        boolean compressed = (parsed.capabilities() & CLIENT_COMPRESS) != 0;
         boolean masterUser = masterUsername.equals(clientUsername);
         boolean tlsEstablished = client instanceof SSLSocket ssl && ssl.getSession().isValid();
         boolean iamLogin = iamEnabled && tlsEstablished && MYSQL_CLEAR_PASSWORD.equals(parsed.authPlugin())
@@ -243,19 +258,21 @@ public class MySqlProtocolHandler {
         boolean mayBeIamUser = iamEnabled && !masterUser && !iamLogin;
         if (sequenceOffset != 0 || mayBeIamUser) {
             byte[] verdict = relayConnectionPhase(
-                    clientIn, clientOut, backendIn, backendOut, sequenceOffset);
+                    clientIn, clientOut, backendIn, backendOut, sequenceOffset, compressed);
             if (verdict == null) {
                 closeQuietly(client);
                 closeQuietly(backend);
                 return;
             }
-            if (mayBeIamUser && isAccessDenied(verdict)
+            if (mayBeIamUser && isAccessDenied(verdict, compressed)
                     && tlsEstablished && iamUserChecker.isIamUser(clientUsername)) {
                 closeQuietly(backend);
                 authenticateIamUserAfterAuthSwitch(
-                        client, clientIn, clientOut, verdict[3] & 0xFF, clientResponseRaw, parsed,
+                        client, clientIn, clientOut, packetSequence(verdict, compressed),
+                        clientResponseRaw, parsed,
                         backendNonce, backendConnector, masterUsername, masterPassword, sigV4,
-                        handshakeTimeoutMillis, binding);
+                        handshakeTimeoutMillis, binding, compressed,
+                        compressed ? (verdict[3] & 0xFF) + 1 : 0);
                 return;
             }
             clientOut.write(verdict);
@@ -265,7 +282,7 @@ public class MySqlProtocolHandler {
         // Authenticated: clear the handshake deadline so a long-lived idle session is never killed.
         client.setSoTimeout(0);
         backend.setSoTimeout(0);
-        bridge(client, backend);
+        bridge(client, backend, compressed);
     }
 
     /**
@@ -281,23 +298,26 @@ public class MySqlProtocolHandler {
      */
     private static byte[] relayConnectionPhase(InputStream clientIn, OutputStream clientOut,
                                                InputStream backendIn, OutputStream backendOut,
-                                               int offset) throws IOException {
+                                               int offset, boolean compressed) throws IOException {
         while (true) {
-            byte[] backendRaw = readMysqlPacketRaw(backendIn);
+            byte[] backendRaw = readMysqlPacketRaw(backendIn, compressed);
             if (backendRaw == null || backendRaw.length < 5) {
                 return null;
             }
-            backendRaw[3] = (byte) (backendRaw[3] + offset);
+            backendRaw = renumberPacket(backendRaw, compressed, offset);
 
-            int marker = backendRaw[4] & 0xFF;
+            int marker = packetMarker(backendRaw, compressed);
+            if (marker < 0) {
+                return null;
+            }
             if (marker == OK_PACKET_MARKER || marker == ERR_PACKET_MARKER) {
                 return backendRaw;
             }
             clientOut.write(backendRaw);
             clientOut.flush();
 
-            if (marker == AUTH_MORE_DATA_MARKER && backendRaw.length > 5
-                    && (backendRaw[5] & 0xFF) == CACHING_SHA2_FAST_AUTH_SUCCESS) {
+            if (marker == AUTH_MORE_DATA_MARKER
+                    && packetPayloadByte(backendRaw, compressed, 1) == CACHING_SHA2_FAST_AUTH_SUCCESS) {
                 // caching_sha2_password fast-auth success: the client sends nothing back — the
                 // backend's very next packet is the terminal OK. Reading from the client here would
                 // block forever.
@@ -306,11 +326,11 @@ public class MySqlProtocolHandler {
 
             // AuthSwitchRequest, or AuthMoreData requesting full authentication: the client replies
             // once more before the backend issues its next verdict.
-            byte[] clientRaw = readMysqlPacketRaw(clientIn);
+            byte[] clientRaw = readMysqlPacketRaw(clientIn, compressed);
             if (clientRaw == null || clientRaw.length < 4) {
                 return null;
             }
-            clientRaw[3] = (byte) (clientRaw[3] - offset);
+            clientRaw = renumberPacket(clientRaw, compressed, -offset);
             backendOut.write(clientRaw);
             backendOut.flush();
         }
@@ -328,27 +348,32 @@ public class MySqlProtocolHandler {
      * connection, since the backend drops the one whose login failed.
      *
      * @param switchSequence the sequence number the client expects the server's next packet at
+     * @param switchOuterSequence the compressed sequence id the AuthSwitchRequest carries when the
+     *     connection negotiated compression (the verdict's outer id plus one); unused otherwise
      */
     private static void authenticateIamUserAfterAuthSwitch(
             Socket client, InputStream clientIn, OutputStream clientOut, int switchSequence,
             byte[] clientResponseRaw, ParsedHandshakeResponse parsed, byte[] nonce,
             PostgresProtocolHandler.BackendConnector backendConnector,
             String masterUsername, String masterPassword, RdsSigV4Validator sigV4,
-            int handshakeTimeoutMillis, RdsProxyBinding binding) throws IOException {
+            int handshakeTimeoutMillis, RdsProxyBinding binding, boolean compressed,
+            int switchOuterSequence) throws IOException {
         if (!(client instanceof SSLSocket ssl) || !ssl.getSession().isValid()) {
             closeQuietly(client);
             return;
         }
-        writeMysqlPacket(clientOut, switchSequence, buildAuthSwitchRequest(MYSQL_CLEAR_PASSWORD, nonce));
+        writeServerPacket(clientOut, switchOuterSequence, switchSequence,
+                buildAuthSwitchRequest(MYSQL_CLEAR_PASSWORD, nonce), compressed);
         clientOut.flush();
 
-        byte[] reply = readMysqlPacketRaw(clientIn);
+        byte[] reply = readMysqlPacketRaw(clientIn, compressed);
         if (reply == null) {
             closeQuietly(client);
             return;
         }
-        int nextSequence = (reply[3] & 0xFF) + 1;
-        String token = clearPassword(Arrays.copyOfRange(reply, 4, reply.length));
+        int nextSequence = packetSequence(reply, compressed) + 1;
+        byte[] replyInner = compressed ? innerClassicPacket(reply, true) : reply;
+        String token = clearPassword(Arrays.copyOfRange(replyInner, 4, replyInner.length));
         boolean valid;
         try {
             valid = isIamToken(token) && sigV4.validate(token, parsed.username(), binding);
@@ -359,7 +384,7 @@ public class MySqlProtocolHandler {
         if (!valid) {
             byte[] err = buildErrorPacket(ER_ACCESS_DENIED_ERROR, "Access denied for user '"
                     + parsed.username() + "'@'localhost' (using password: YES)");
-            writeMysqlPacket(clientOut, nextSequence, err);
+            writeServerPacket(clientOut, switchOuterSequence + 1, nextSequence, err, compressed);
             clientOut.flush();
             closeQuietly(client);
             return;
@@ -389,7 +414,7 @@ public class MySqlProtocolHandler {
             backendOut.flush();
 
             byte[] verdict = relayConnectionPhase(
-                    clientIn, clientOut, backendIn, backendOut, nextSequence - 2);
+                    clientIn, clientOut, backendIn, backendOut, nextSequence - 2, compressed);
             if (verdict == null) {
                 closeQuietly(client);
                 closeQuietly(backend);
@@ -405,7 +430,7 @@ public class MySqlProtocolHandler {
             closeQuietly(backend);
             return;
         }
-        bridge(client, backend);
+        bridge(client, backend, compressed);
     }
 
     /** mysql_clear_password sends the password NUL-terminated. */
@@ -421,9 +446,10 @@ public class MySqlProtocolHandler {
         return password.contains("X-Amz-Signature");
     }
 
-    private static boolean isAccessDenied(byte[] raw) {
-        return raw.length >= 7 && (raw[4] & 0xFF) == ERR_PACKET_MARKER
-                && ((raw[5] & 0xFF) | ((raw[6] & 0xFF) << 8)) == ER_ACCESS_DENIED_ERROR;
+    private static boolean isAccessDenied(byte[] raw, boolean compressed) throws IOException {
+        byte[] packet = compressed ? innerClassicPacket(raw, true) : raw;
+        return packet.length >= 7 && (packet[4] & 0xFF) == ERR_PACKET_MARKER
+                && ((packet[5] & 0xFF) | ((packet[6] & 0xFF) << 8)) == ER_ACCESS_DENIED_ERROR;
     }
 
     /** AuthSwitchRequest: marker, NUL-terminated plugin name, then the plugin's challenge data. */
@@ -848,6 +874,240 @@ public class MySqlProtocolHandler {
         out.write(payload);
     }
 
+    // ── MySQL protocol compression ────────────────────────────────────────────
+
+    /**
+     * Reads one MySQL packet, framing it with the 7-byte compressed header when the client
+     * negotiated {@code CLIENT_COMPRESS} and with the classic 4-byte header otherwise.
+     * Returns {@code null} at a clean end of stream and throws on a truncated packet.
+     */
+    static byte[] readMysqlPacketRaw(InputStream in, boolean compressed) throws IOException {
+        if (!compressed) {
+            return readMysqlPacketRaw(in);
+        }
+        int c0 = in.read();
+        int c1 = in.read();
+        int c2 = in.read();
+        int seq = in.read();
+        int u0 = in.read();
+        int u1 = in.read();
+        int u2 = in.read();
+        if ((c0 | c1 | c2 | seq | u0 | u1 | u2) < 0) {
+            return null;
+        }
+        int length = c0 | (c1 << 8) | (c2 << 16);
+        if (length > MAX_PACKET_PAYLOAD) {
+            throw new IOException("MySQL compressed packet exceeds protocol limit");
+        }
+        byte[] raw = new byte[COMPRESSED_PACKET_HEADER_LENGTH + length];
+        raw[0] = (byte) c0;
+        raw[1] = (byte) c1;
+        raw[2] = (byte) c2;
+        raw[3] = (byte) seq;
+        raw[4] = (byte) u0;
+        raw[5] = (byte) u1;
+        raw[6] = (byte) u2;
+        int offset = COMPRESSED_PACKET_HEADER_LENGTH;
+        while (offset < raw.length) {
+            int n = in.read(raw, offset, raw.length - offset);
+            if (n < 0) {
+                throw new EOFException("Connection closed while reading MySQL compressed packet");
+            }
+            offset += n;
+        }
+        return raw;
+    }
+
+    /**
+     * The classic packet carried inside a raw packet: the packet itself when uncompressed, or
+     * the payload inflated from its zlib stream (stored verbatim when its uncompressed length
+     * is 0) when compressed.
+     */
+    static byte[] innerClassicPacket(byte[] raw, boolean compressed) throws IOException {
+        if (!compressed) {
+            return Arrays.copyOfRange(raw, 4, raw.length);
+        }
+        int uncompressedLength = compressedUncompressedLength(raw);
+        if (uncompressedLength == 0) {
+            return Arrays.copyOfRange(raw, COMPRESSED_PACKET_HEADER_LENGTH, raw.length);
+        }
+        Inflater inflater = new Inflater();
+        inflater.setInput(raw, COMPRESSED_PACKET_HEADER_LENGTH,
+                raw.length - COMPRESSED_PACKET_HEADER_LENGTH);
+        byte[] inner = new byte[uncompressedLength];
+        try {
+            int inflated = inflater.inflate(inner);
+            if (inflated != uncompressedLength || !inflater.finished()
+                    || inflater.getRemaining() != 0) {
+                throw new IOException("MySQL compressed packet did not inflate to its declared length");
+            }
+        } catch (DataFormatException e) {
+            throw new IOException("MySQL compressed packet is not valid zlib data", e);
+        } finally {
+            inflater.end();
+        }
+        return inner;
+    }
+
+    private static int compressedUncompressedLength(byte[] raw) {
+        return (raw[4] & 0xFF) | ((raw[5] & 0xFF) << 8) | ((raw[6] & 0xFF) << 16);
+    }
+
+    /**
+     * The logical sequence id of a raw packet: the classic header's sequence byte, or the
+     * inner classic packet's sequence byte for a compressed packet. The outer (compressed)
+     * sequence id runs on its own counter and is not the logical one.
+     */
+    static int packetSequence(byte[] raw, boolean compressed) throws IOException {
+        if (!compressed) {
+            return raw[3] & 0xFF;
+        }
+        if (compressedUncompressedLength(raw) == 0) {
+            int at = COMPRESSED_PACKET_HEADER_LENGTH + 3;
+            return at < raw.length ? raw[at] & 0xFF : -1;
+        }
+        byte[] inner = innerClassicPacket(raw, true);
+        return inner.length >= 4 ? inner[3] & 0xFF : -1;
+    }
+
+    /** First payload byte of the classic packet inside a raw packet, or -1 when absent. */
+    static int packetMarker(byte[] raw, boolean compressed) throws IOException {
+        return packetPayloadByte(raw, compressed, 0);
+    }
+
+    /**
+     * Payload byte {@code index} of the classic packet inside a raw packet, or -1 when the
+     * packet is too short to hold it.
+     */
+    static int packetPayloadByte(byte[] raw, boolean compressed, int index) throws IOException {
+        if (!compressed) {
+            int at = 4 + index;
+            return at < raw.length ? raw[at] & 0xFF : -1;
+        }
+        if (compressedUncompressedLength(raw) == 0) {
+            int at = COMPRESSED_PACKET_HEADER_LENGTH + 4 + index;
+            return at < raw.length ? raw[at] & 0xFF : -1;
+        }
+        byte[] inner = innerClassicPacket(raw, true);
+        int at = 4 + index;
+        return at < inner.length ? inner[at] & 0xFF : -1;
+    }
+
+    /**
+     * Shifts a packet's logical sequence id by {@code offset}. A classic packet carries only
+     * its own sequence id; a compressed packet's outer sequence id runs on a separate counter
+     * the handshake packets the backend never saw did not touch, so only the inner classic
+     * packet's sequence id moves (rebuilding the compressed packet when its payload is a zlib
+     * stream, since the inner header sits inside it).
+     */
+    static byte[] renumberPacket(byte[] raw, boolean compressed, int offset) throws IOException {
+        if (offset == 0) {
+            return raw;
+        }
+        if (!compressed) {
+            raw[3] = (byte) (raw[3] + offset);
+            return raw;
+        }
+        if (compressedUncompressedLength(raw) == 0) {
+            int at = COMPRESSED_PACKET_HEADER_LENGTH + 3;
+            if (at < raw.length) {
+                raw[at] = (byte) (raw[at] + offset);
+            }
+            return raw;
+        }
+        byte[] inner = innerClassicPacket(raw, true);
+        inner[3] = (byte) (inner[3] + offset);
+        return buildCompressedPacket(inner, raw[3] & 0xFF);
+    }
+
+    /**
+     * Frames a classic packet as a compressed packet, deflating its bytes when that shrinks
+     * them and storing them verbatim otherwise, as a MySQL server does.
+     */
+    static byte[] buildCompressedPacket(byte[] inner, int sequence) throws IOException {
+        Deflater deflater = new Deflater();
+        deflater.setInput(inner);
+        deflater.finish();
+        ByteArrayOutputStream compressed = new ByteArrayOutputStream(inner.length);
+        byte[] buffer = new byte[4096];
+        while (!deflater.finished()) {
+            int n = deflater.deflate(buffer);
+            compressed.write(buffer, 0, n);
+        }
+        deflater.end();
+        byte[] deflated = compressed.toByteArray();
+        boolean store = deflated.length >= inner.length;
+        byte[] payload = store ? inner : deflated;
+        int uncompressedLength = store ? 0 : inner.length;
+        byte[] raw = new byte[COMPRESSED_PACKET_HEADER_LENGTH + payload.length];
+        int length = payload.length;
+        raw[0] = (byte) (length & 0xFF);
+        raw[1] = (byte) ((length >> 8) & 0xFF);
+        raw[2] = (byte) ((length >> 16) & 0xFF);
+        raw[3] = (byte) sequence;
+        raw[4] = (byte) (uncompressedLength & 0xFF);
+        raw[5] = (byte) ((uncompressedLength >> 8) & 0xFF);
+        raw[6] = (byte) ((uncompressedLength >> 16) & 0xFF);
+        System.arraycopy(payload, 0, raw, COMPRESSED_PACKET_HEADER_LENGTH, payload.length);
+        return raw;
+    }
+
+    /**
+     * Writes a classic packet payload as a compressed packet: the payload framed with the
+     * inner (logical) sequence id, then wrapped in the 7-byte compressed header carrying the
+     * outer sequence id.
+     */
+    static void writeCompressedPacket(OutputStream out, int outerSequence, int innerSequence,
+            byte[] payload) throws IOException {
+        byte[] inner = new byte[4 + payload.length];
+        int length = payload.length;
+        inner[0] = (byte) (length & 0xFF);
+        inner[1] = (byte) ((length >> 8) & 0xFF);
+        inner[2] = (byte) ((length >> 16) & 0xFF);
+        inner[3] = (byte) innerSequence;
+        System.arraycopy(payload, 0, inner, 4, payload.length);
+        out.write(buildCompressedPacket(inner, outerSequence));
+    }
+
+    /**
+     * Writes a server-originated packet (an AuthSwitchRequest or an ERR) to the client,
+     * framing it as a compressed packet when the connection negotiated compression.
+     */
+    private static void writeServerPacket(OutputStream out, int outerSequence, int innerSequence,
+            byte[] payload, boolean compressed) throws IOException {
+        if (compressed) {
+            writeCompressedPacket(out, outerSequence, innerSequence, payload);
+        } else {
+            writeMysqlPacket(out, innerSequence, payload);
+        }
+    }
+
+    /**
+     * Rewrites a compressed COM_QUERY for the IAM auth plugin, as {@link #relayClientCommands}
+     * does for classic packets: inflate the payload, and when it holds exactly one COM_QUERY
+     * packet, rewrite it and recompress. Anything else (several packets bundled into one
+     * compressed packet, a fragment of a large command) is forwarded untouched.
+     */
+    static byte[] maybeRewriteCompressedQuery(byte[] raw) throws IOException {
+        byte[] inner = innerClassicPacket(raw, true);
+        int innerLength = (inner[0] & 0xFF) | ((inner[1] & 0xFF) << 8) | ((inner[2] & 0xFF) << 16);
+        if (inner.length < 5 || inner.length != 4 + innerLength
+                || (inner[4] & 0xFF) != COM_QUERY) {
+            return raw;
+        }
+        byte[] rewritten = rewriteIamAuthPlugin(Arrays.copyOfRange(inner, 4, inner.length));
+        if (rewritten == null) {
+            return raw;
+        }
+        byte[] newInner = new byte[4 + rewritten.length];
+        newInner[0] = (byte) (rewritten.length & 0xFF);
+        newInner[1] = (byte) ((rewritten.length >> 8) & 0xFF);
+        newInner[2] = (byte) ((rewritten.length >> 16) & 0xFF);
+        newInner[3] = inner[3];
+        System.arraycopy(rewritten, 0, newInner, 4, rewritten.length);
+        return buildCompressedPacket(newInner, raw[3] & 0xFF);
+    }
+
     @FunctionalInterface
     public interface IamUserChecker {
         boolean isIamUser(String username);
@@ -866,7 +1126,7 @@ public class MySqlProtocolHandler {
 
     // ── Bridge ────────────────────────────────────────────────────────────────
 
-    private static void bridge(Socket client, Socket backend) {
+    private static void bridge(Socket client, Socket backend, boolean compressed) {
         InputStream clientIn, backendIn;
         OutputStream clientOut, backendOut;
         try {
@@ -891,7 +1151,7 @@ public class MySqlProtocolHandler {
         };
         Thread t1 = RelayThreads.start("rds-mysql-c2b", () -> {
             try {
-                relayClientCommands(clientIn, backendOut);
+                relayClientCommands(clientIn, backendOut, compressed);
             } finally {
                 closeBoth.run();
             }
@@ -914,19 +1174,23 @@ public class MySqlProtocolHandler {
         }
     }
 
-    private static void relayClientCommands(InputStream from, OutputStream to) {
+    private static void relayClientCommands(InputStream from, OutputStream to, boolean compressed) {
         try {
             byte[] raw;
-            while ((raw = readMysqlPacketRaw(from)) != null) {
-                int length = (raw[0] & 0xFF) | ((raw[1] & 0xFF) << 8) | ((raw[2] & 0xFF) << 16);
-                byte[] rewritten = length == MAX_PACKET_PAYLOAD || raw.length < 5
-                        || (raw[4] & 0xFF) != COM_QUERY
-                        ? null
-                        : rewriteIamAuthPlugin(Arrays.copyOfRange(raw, 4, raw.length));
-                if (rewritten == null) {
-                    to.write(raw);
+            while ((raw = readMysqlPacketRaw(from, compressed)) != null) {
+                if (compressed) {
+                    to.write(maybeRewriteCompressedQuery(raw));
                 } else {
-                    writeMysqlPacket(to, raw[3] & 0xFF, rewritten);
+                    int length = (raw[0] & 0xFF) | ((raw[1] & 0xFF) << 8) | ((raw[2] & 0xFF) << 16);
+                    byte[] rewritten = length == MAX_PACKET_PAYLOAD || raw.length < 5
+                            || (raw[4] & 0xFF) != COM_QUERY
+                            ? null
+                            : rewriteIamAuthPlugin(Arrays.copyOfRange(raw, 4, raw.length));
+                    if (rewritten == null) {
+                        to.write(raw);
+                    } else {
+                        writeMysqlPacket(to, raw[3] & 0xFF, rewritten);
+                    }
                 }
                 to.flush();
             }
