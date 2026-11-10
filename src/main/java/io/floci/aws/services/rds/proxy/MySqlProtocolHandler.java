@@ -41,6 +41,11 @@ import java.util.regex.Pattern;
  * is relayed through {@link #relayConnectionPhase} to keep both sides in sync before handing off
  * to the plain byte-for-byte {@link #bridge}.
  *
+ * <p>Protocol compression ({@code CLIENT_COMPRESS} and {@code CLIENT_ZSTD_COMPRESSION_ALGORITHM})
+ * is never offered to the client, and a response that requests it anyway has the bit stripped
+ * before it reaches the backend: the proxy relays packets opaquely and cannot parse compressed
+ * frames, so a compressed connection would hang in {@link #relayConnectionPhase} (floci #7938).
+ *
  * <p>With IAM database authentication enabled, an IAM token offered in cleartext
  * ({@code mysql_clear_password}) is validated by the proxy, which then authenticates the session to
  * the backend as the master user. Clients normally reveal the token only after the server asks them
@@ -52,6 +57,8 @@ public class MySqlProtocolHandler {
     private static final Logger LOG = Logger.getLogger(MySqlProtocolHandler.class);
 
     private static final int CLIENT_SSL = 0x0800;
+    private static final int CLIENT_COMPRESS = 0x0020;
+    private static final int CLIENT_ZSTD_COMPRESSION_ALGORITHM = 0x0400_0000;
     private static final int CLIENT_PLUGIN_AUTH = 0x0008_0000;
     private static final int CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA = 0x200000;
     private static final int CLIENT_SECURE_CONNECTION = 0x8000;
@@ -121,8 +128,10 @@ public class MySqlProtocolHandler {
         String backendAuthPlugin = extractMysqlAuthPlugin(backendHandshakeRaw);
 
         // The proxy terminates TLS itself, so advertise CLIENT_SSL to the client even if the
-        // (plaintext) backend didn't.
+        // (plaintext) backend didn't. It never advertises protocol compression: the proxy relays
+        // packets opaquely and cannot parse compressed frames (see hideCompressionCapabilities).
         forceClientSslCapability(backendHandshakeRaw);
+        hideCompressionCapabilities(backendHandshakeRaw);
 
         InputStream clientIn = client.getInputStream();
         OutputStream clientOut = client.getOutputStream();
@@ -237,6 +246,9 @@ public class MySqlProtocolHandler {
         // before handing off to the plain byte-for-byte bridge. With IAM auth enabled, a non-master
         // login may be an IAM user whose client only sends its token after an auth switch, so the
         // backend's verdict is inspected before it reaches the client.
+        // A client that requested compression anyway (the server never advertised it) must not
+        // reach the backend compressed either: the relay cannot parse compressed frames.
+        clearCompressionCapability(clientResponseRaw);
         backendOut.write(clientResponseRaw);
         backendOut.flush();
 
@@ -477,6 +489,18 @@ public class MySqlProtocolHandler {
     }
 
     /**
+     * Clears the {@code CLIENT_COMPRESS} bit in a raw HandshakeResponse41 packet's capability
+     * flags. The client capabilities are the first 4 payload bytes, little-endian; {@code
+     * CLIENT_COMPRESS} (0x0020) lives in the first byte. A client only sets this bit for a
+     * capability the server advertised, so after {@link #hideCompressionCapabilities} it should
+     * never be set; clearing it here as well keeps a non-conforming client from negotiating a
+     * compression the relay cannot carry.
+     */
+    private static void clearCompressionCapability(byte[] raw) {
+        raw[4] &= (byte) ~CLIENT_COMPRESS;
+    }
+
+    /**
      * Sets the {@code CLIENT_SSL} bit in a raw Handshake V10 packet's capability flags, so the
      * client is offered TLS even when the (plaintext) backend didn't advertise it. Walks the same
      * fields as {@link #extractMysqlNonce(byte[])} up to the low 2 bytes of the capability flags.
@@ -497,6 +521,46 @@ public class MySqlProtocolHandler {
         // byte of this field.
         if (i + 1 < raw.length) {
             raw[i + 1] |= (byte) (CLIENT_SSL >> 8);
+        }
+    }
+
+    /**
+     * Clears the protocol compression capability bits in a raw Handshake V10 packet's capability
+     * flags, so the client never negotiates compression with the proxy. The proxy relays packets
+     * opaquely: {@link #relayConnectionPhase} reads the first payload byte of each backend packet
+     * as the OK/ERR/AuthSwitch marker to know when the connection phase ends, but a compressed
+     * packet starts with the low byte of its uncompressed length instead, so the relay forwards it
+     * and then blocks reading from a client that is waiting for the rest of its result set while
+     * the backend sits idle (floci #7938). A client only requests compression the server
+     * advertised, so hiding the bits here makes every client connect uncompressed, for every
+     * algorithm (zlib and zstd alike). Walks the same fields as {@link #forceClientSslCapability}.
+     */
+    private static void hideCompressionCapabilities(byte[] raw) {
+        int i = 4 + 1; // skip 4-byte header + protocol version byte
+
+        while (i < raw.length && raw[i] != 0) {
+            i++;
+        }
+        i++; // skip null-terminated server version
+
+        i += 4; // connection id
+        i += 8; // auth-plugin-data part 1
+        i++; // filler byte
+
+        // Capability flags lower 2 bytes, little-endian: CLIENT_COMPRESS (0x0020) lives in the
+        // low byte of this field.
+        if (i + 1 < raw.length) {
+            raw[i] &= (byte) ~CLIENT_COMPRESS;
+        }
+
+        i += 2; // lower capability flags
+        i++; // charset
+        i += 2; // status flags
+
+        // Capability flags upper 2 bytes, little-endian: CLIENT_ZSTD_COMPRESSION_ALGORITHM
+        // (0x04000000) lives in the high byte of this field.
+        if (i + 1 < raw.length) {
+            raw[i + 1] &= (byte) ~(CLIENT_ZSTD_COMPRESSION_ALGORITHM >> 24);
         }
     }
 

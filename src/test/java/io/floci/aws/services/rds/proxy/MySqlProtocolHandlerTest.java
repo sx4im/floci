@@ -43,6 +43,7 @@ class MySqlProtocolHandlerTest {
     private static final int CLIENT_PROTOCOL_41 = 0x0200;
     private static final int CLIENT_SECURE_CONNECTION = 0x8000;
     private static final int CLIENT_SSL = 0x0800;
+    private static final int CLIENT_COMPRESS = 0x0020;
     private static final int CLIENT_PLUGIN_AUTH = 0x0008_0000;
     private static final String MYSQL_NATIVE_PASSWORD = "mysql_native_password";
     private static final String MYSQL_CLEAR_PASSWORD = "mysql_clear_password";
@@ -128,6 +129,84 @@ class MySqlProtocolHandlerTest {
 
         assertEquals((byte) 1, backendResponseSeq.get(), "sequence must be unchanged when no TLS upgrade occurs");
         assertEquals("admin", extractUsername(backendResponsePayload.get()));
+    }
+
+    @Test
+    void hidesCompressionCapabilitiesWhenBackendAdvertisesThem() throws Exception {
+        byte[] nonce = fixedNonce();
+        AtomicReference<Byte> backendResponseSeq = new AtomicReference<>();
+        AtomicReference<byte[]> backendResponsePayload = new AtomicReference<>();
+        int backendCapabilities = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION
+                | CLIENT_COMPRESS | CLIENT_ZSTD_COMPRESSION_ALGORITHM;
+
+        try (ServerSocket backendServer = new ServerSocket(0);
+             ServerSocket clientServer = new ServerSocket(0)) {
+
+            Thread backendThread = Thread.ofVirtual().start(() -> {
+                try {
+                    mockMySqlBackend(backendServer, nonce, null, backendCapabilities,
+                            backendResponseSeq, backendResponsePayload);
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+            try (Socket ourClient = new Socket("localhost", clientServer.getLocalPort())) {
+                Socket proxyClient = clientServer.accept();
+                Socket backend = new Socket("localhost", backendServer.getLocalPort());
+
+                Thread authThread = Thread.ofVirtual().start(() -> {
+                    try {
+                        MySqlProtocolHandler.handleAuth(
+                                proxyClient, backend, NO_RECONNECT, "admin", "secret",
+                                false, testSigV4Validator(), testTlsCertificates(),
+                                (user, pass) -> PasswordValidator.AuthResult.MASTER_EQUIVALENT, 5000,
+                                username -> true, testBinding());
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+
+                InputStream clientIn = ourClient.getInputStream();
+                OutputStream clientOut = ourClient.getOutputStream();
+
+                byte[] serverHandshake = readMysqlPacketRaw(clientIn);
+                assertNotNull(serverHandshake);
+                // The proxy still forces CLIENT_SSL even though the mock backend didn't
+                // advertise it.
+                assertTrue((capabilityFlagsLower(serverHandshake) & CLIENT_SSL) != 0);
+                // But compression is never advertised: the proxy relays packets opaquely and
+                // cannot parse compressed frames, so a client that negotiated compression would
+                // hang the connection (floci #7938).
+                assertEquals(0, capabilityFlagsLower(serverHandshake) & CLIENT_COMPRESS,
+                        "CLIENT_COMPRESS must not be advertised to the client");
+                assertEquals(0, capabilityFlags(serverHandshake) & CLIENT_ZSTD_COMPRESSION_ALGORITHM,
+                        "CLIENT_ZSTD_COMPRESSION_ALGORITHM must not be advertised to the client");
+
+                // A client that requests compression anyway (the server never advertised it)
+                // must not reach the backend compressed either.
+                byte[] scramble = scrambleNativePassword("secret", nonce);
+                byte[] response = buildHandshakeResponse41("admin", scramble, (byte) 1,
+                        CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_COMPRESS);
+                clientOut.write(response);
+                clientOut.flush();
+
+                // The plain login completes and the backend's OK comes back through the bridge.
+                assertNotNull(readMysqlPacketRaw(clientIn));
+
+                ourClient.close();
+                proxyClient.close();
+                authThread.join(5_000);
+                backendThread.join(5_000);
+                assertEquals(false, authThread.isAlive(), "authThread did not terminate");
+                assertEquals(false, backendThread.isAlive(), "backendThread did not terminate");
+            }
+        }
+
+        assertEquals((byte) 1, backendResponseSeq.get(), "sequence must be unchanged when no TLS upgrade occurs");
+        assertEquals("admin", extractUsername(backendResponsePayload.get()));
+        assertEquals(0, responseCapabilities(backendResponsePayload.get()) & CLIENT_COMPRESS,
+                "the backend must not receive a compression request");
     }
 
     @Test
@@ -797,11 +876,21 @@ class MySqlProtocolHandlerTest {
     private static void mockMySqlBackend(ServerSocket server, byte[] nonce, String authPlugin,
                                          AtomicReference<Byte> responseSeq,
                                          AtomicReference<byte[]> responsePayload) throws IOException {
+        mockMySqlBackend(server, nonce, authPlugin,
+                CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION
+                        | (authPlugin != null ? CLIENT_PLUGIN_AUTH : 0),
+                responseSeq, responsePayload);
+    }
+
+    private static void mockMySqlBackend(ServerSocket server, byte[] nonce, String authPlugin,
+                                         int capabilities,
+                                         AtomicReference<Byte> responseSeq,
+                                         AtomicReference<byte[]> responsePayload) throws IOException {
         try (Socket socket = server.accept()) {
             OutputStream out = socket.getOutputStream();
             InputStream in = socket.getInputStream();
 
-            out.write(buildHandshakeV10(nonce, authPlugin));
+            out.write(buildHandshakeV10(nonce, authPlugin, capabilities));
             out.flush();
 
             byte[] responseRaw = readMysqlPacketRaw(in);
@@ -822,6 +911,15 @@ class MySqlProtocolHandlerTest {
     }
 
     private static byte[] buildHandshakeV10(byte[] nonce, String authPlugin) throws IOException {
+        int capabilities = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION;
+        if (authPlugin != null) {
+            capabilities |= CLIENT_PLUGIN_AUTH;
+        }
+        return buildHandshakeV10(nonce, authPlugin, capabilities);
+    }
+
+    private static byte[] buildHandshakeV10(byte[] nonce, String authPlugin, int capabilities)
+            throws IOException {
         ByteArrayOutputStream payload = new ByteArrayOutputStream();
         payload.write(10); // protocol version
         payload.write("8.0.34".getBytes(StandardCharsets.UTF_8));
@@ -829,10 +927,6 @@ class MySqlProtocolHandlerTest {
         writeInt32LE(payload, 1); // connection id
         payload.write(nonce, 0, 8); // auth-plugin-data part 1
         payload.write(0); // filler
-        int capabilities = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION;
-        if (authPlugin != null) {
-            capabilities |= CLIENT_PLUGIN_AUTH;
-        }
         int capsLower = capabilities & 0xFFFF; // no CLIENT_SSL
         writeInt16LE(payload, capsLower);
         payload.write(0x21); // charset
@@ -961,6 +1055,28 @@ class MySqlProtocolHandlerTest {
         i += 8; // auth-plugin-data part 1
         i++; // filler
         return (handshakeRaw[i] & 0xFF) | ((handshakeRaw[i + 1] & 0xFF) << 8);
+    }
+
+    private static int capabilityFlags(byte[] handshakeRaw) {
+        int i = 4 + 1; // header + protocol version
+        while (i < handshakeRaw.length && handshakeRaw[i] != 0) {
+            i++;
+        }
+        i++; // null terminator
+        i += 4; // connection id
+        i += 8; // auth-plugin-data part 1
+        i++; // filler
+        int lower = (handshakeRaw[i] & 0xFF) | ((handshakeRaw[i + 1] & 0xFF) << 8);
+        i += 2; // lower capability flags
+        i++; // charset
+        i += 2; // status flags
+        int upper = (handshakeRaw[i] & 0xFF) | ((handshakeRaw[i + 1] & 0xFF) << 8);
+        return lower | (upper << 16);
+    }
+
+    private static int responseCapabilities(byte[] payload) {
+        return (payload[0] & 0xFF) | ((payload[1] & 0xFF) << 8)
+                | ((payload[2] & 0xFF) << 16) | ((payload[3] & 0xFF) << 24);
     }
 
     private static byte[] fixedNonce() {
