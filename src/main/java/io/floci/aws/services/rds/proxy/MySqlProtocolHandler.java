@@ -52,6 +52,8 @@ public class MySqlProtocolHandler {
     private static final Logger LOG = Logger.getLogger(MySqlProtocolHandler.class);
 
     private static final int CLIENT_SSL = 0x0800;
+    private static final int CLIENT_COMPRESS = 0x0020;
+    private static final int CLIENT_ZSTD_COMPRESSION_ALGORITHM = 0x0400_0000;
     private static final int CLIENT_PLUGIN_AUTH = 0x0008_0000;
     private static final int CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA = 0x200000;
     private static final int CLIENT_SECURE_CONNECTION = 0x8000;
@@ -123,6 +125,12 @@ public class MySqlProtocolHandler {
         // The proxy terminates TLS itself, so advertise CLIENT_SSL to the client even if the
         // (plaintext) backend didn't.
         forceClientSslCapability(backendHandshakeRaw);
+        // The proxy relays the connection phase and commands by parsing uncompressed packet framing,
+        // so it cannot pass compressed packets through: a client that negotiates compression sends
+        // compressed packets the relay mis-frames, and the connection hangs with both sides waiting
+        // (see #7938). Decline compression at the handshake instead; clients fall back to the
+        // uncompressed protocol.
+        clearCompressionCapabilities(backendHandshakeRaw);
 
         InputStream clientIn = client.getInputStream();
         OutputStream clientOut = client.getOutputStream();
@@ -474,6 +482,36 @@ public class MySqlProtocolHandler {
      */
     private static void clearClientSslCapability(byte[] raw) {
         raw[5] &= (byte) ~(CLIENT_SSL >> 8);
+    }
+
+    /**
+     * Clears the compression capability flags from a raw Handshake V10 packet, so the client never
+     * negotiates a compressed connection. Walks the same fields as
+     * {@link #forceClientSslCapability(byte[])} up to the capability flags: {@code CLIENT_COMPRESS}
+     * lives in the lower 2 bytes and {@code CLIENT_ZSTD_COMPRESSION_ALGORITHM} in the upper 2
+     * (past the charset and status flags). Packets too short to carry the flags are left untouched.
+     */
+    static void clearCompressionCapabilities(byte[] raw) {
+        int i = 4 + 1; // skip 4-byte header + protocol version byte
+
+        while (i < raw.length && raw[i] != 0) {
+            i++;
+        }
+        i++; // skip null-terminated server version
+
+        i += 4; // connection id
+        i += 8; // auth-plugin-data part 1
+        i++; // filler byte
+
+        // Capability flags lower 2 bytes, little-endian: CLIENT_COMPRESS (0x0020) is the low byte.
+        if (i + 1 < raw.length) {
+            raw[i] &= (byte) ~CLIENT_COMPRESS;
+        }
+        // Capability flags upper 2 bytes sit past the charset (1) and status flags (2):
+        // CLIENT_ZSTD_COMPRESSION_ALGORITHM (0x04000000) is bit 0x04 of their high byte.
+        if (i + 6 < raw.length) {
+            raw[i + 6] &= (byte) ~0x04;
+        }
     }
 
     /**
