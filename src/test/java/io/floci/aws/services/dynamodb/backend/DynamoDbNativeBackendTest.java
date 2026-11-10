@@ -25,6 +25,7 @@ import io.floci.aws.services.dynamodb.backend.DynamoDbOperations.Scope;
 import io.floci.aws.services.dynamodb.backend.DynamoDbTableAccess.TimeToLive;
 import io.floci.aws.services.dynamodb.model.AttributeDefinition;
 import io.floci.aws.services.dynamodb.model.KeySchemaElement;
+import io.floci.aws.services.dynamodb.model.TableDefinition;
 import io.floci.aws.services.kinesis.KinesisService;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.BeforeEach;
@@ -201,6 +202,52 @@ class DynamoDbNativeBackendTest {
         assertEquals(new TimeToLive(false, null), backend.timeToLive(owner, TABLE));
         JsonNode disabled = backend.execute(new Call(owner, Api.DYNAMODB, "DescribeTimeToLive", describe)).body();
         assertEquals("DISABLED", disabled.path("TimeToLiveDescription").path("TimeToLiveStatus").asText());
+    }
+
+    /** Switching a table to on-demand zeroes its throughput and persists the change. */
+    @Test
+    void updateBillingModeToPayPerRequestZeroesThroughput() throws Exception {
+        backend.createTable(SCOPE, TABLE, List.of(new KeySchemaElement("id", "HASH")),
+                List.of(new AttributeDefinition("id", "S")), 5L, 5L, List.of(), List.of());
+
+        TableDefinition updated = backend.updateBillingMode(SCOPE, TABLE, "PAY_PER_REQUEST", null, null);
+
+        assertEquals("PAY_PER_REQUEST", updated.getBillingMode());
+        assertEquals(0L, updated.getProvisionedThroughput().getReadCapacityUnits());
+        assertEquals(0L, updated.getProvisionedThroughput().getWriteCapacityUnits());
+        TableDefinition described = backend.describeTable(SCOPE, TABLE);
+        assertEquals("PAY_PER_REQUEST", described.getBillingMode());
+        assertEquals(0L, described.getProvisionedThroughput().getReadCapacityUnits());
+    }
+
+    /** Switching back to provisioned applies the capacities the caller passes. */
+    @Test
+    void updateBillingModeToProvisionedAppliesTheGivenCapacities() throws Exception {
+        backend.createTable(SCOPE, TABLE, List.of(new KeySchemaElement("id", "HASH")),
+                List.of(new AttributeDefinition("id", "S")), 5L, 5L, List.of(), List.of());
+        backend.updateBillingMode(SCOPE, TABLE, "PAY_PER_REQUEST", null, null);
+
+        TableDefinition updated = backend.updateBillingMode(SCOPE, TABLE, "PROVISIONED", 10L, 20L);
+
+        assertEquals("PROVISIONED", updated.getBillingMode());
+        assertEquals(10L, updated.getProvisionedThroughput().getReadCapacityUnits());
+        assertEquals(20L, updated.getProvisionedThroughput().getWriteCapacityUnits());
+        TableDefinition described = backend.describeTable(SCOPE, TABLE);
+        assertEquals("PROVISIONED", described.getBillingMode());
+        assertEquals(10L, described.getProvisionedThroughput().getReadCapacityUnits());
+    }
+
+    /** Switching to provisioned without capacities leaves the throughput as it is. */
+    @Test
+    void updateBillingModeToProvisionedWithoutCapacitiesKeepsThroughput() throws Exception {
+        backend.createTable(SCOPE, TABLE, List.of(new KeySchemaElement("id", "HASH")),
+                List.of(new AttributeDefinition("id", "S")), 5L, 5L, List.of(), List.of());
+
+        TableDefinition updated = backend.updateBillingMode(SCOPE, TABLE, "PROVISIONED", null, null);
+
+        assertEquals("PROVISIONED", updated.getBillingMode());
+        assertEquals(5L, updated.getProvisionedThroughput().getReadCapacityUnits());
+        assertEquals(5L, updated.getProvisionedThroughput().getWriteCapacityUnits());
     }
 
     @Test

@@ -19,6 +19,7 @@ import io.floci.aws.services.dynamodb.model.GlobalSecondaryIndex;
 import io.floci.aws.services.dynamodb.model.KeySchemaElement;
 import io.floci.aws.services.dynamodb.model.KinesisStreamingDestination;
 import io.floci.aws.services.dynamodb.model.LocalSecondaryIndex;
+import io.floci.aws.services.dynamodb.model.ProvisionedThroughput;
 import io.floci.aws.services.dynamodb.model.TableDefinition;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -49,9 +50,12 @@ import java.util.Set;
  * <p>A table's {@code TimeToLiveSpecification} is reconciled against what DescribeTimeToLive
  * reports, so UpdateTimeToLive is called only when the setting differs. Its
  * {@code KinesisStreamSpecification} is reconciled against the table's active Kinesis streaming
- * destinations the same way. An in-place update of an {@code AWS::DynamoDB::Table} keeps the tags,
- * stream, TTL setting and Kinesis streaming destinations it replaces, so a failed stack update can
- * put all four back.
+ * destinations the same way, and its {@code BillingMode} and {@code ProvisionedThroughput} are
+ * reconciled against the table's billing state the same way: the create call leaves every table
+ * provisioned 5/5, so a template that declares PAY_PER_REQUEST switches it after the table exists.
+ * An in-place update of an {@code AWS::DynamoDB::Table} keeps the tags, stream, TTL setting,
+ * Kinesis streaming destinations and billing mode it replaces, so a failed stack update can put
+ * all five back.
  */
 @ApplicationScoped
 public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
@@ -75,6 +79,14 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
 
     /** One Kinesis streaming destination a table should forward to, with its timestamp precision. */
     private record KinesisDestinationSpec(String streamArn, String precision) {
+    }
+
+    /** A template's declared billing mode with the capacities of its ProvisionedThroughput block. */
+    private record BillingSpec(String mode, Integer readCapacityUnits, Integer writeCapacityUnits) {
+    }
+
+    /** A table's billing state, with the create default for a table that never had a mode set. */
+    private record BillingState(String mode, long readCapacityUnits, long writeCapacityUnits) {
     }
 
     private final DynamoDbFacade dynamoDb;
@@ -156,6 +168,12 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
         List<KinesisDestinationSpec> desiredKinesis = kinesisDeclared
                 ? List.of(declaredKinesisDestination(kinesisSpec, engine))
                 : List.of();
+        BillingSpec billing = declaredBilling(props, ctx);
+        // A stack that never declared a billing mode leaves it alone, as AWS does, so a mode set
+        // outside the stack survives an update; removing a mode the previous template declared
+        // puts the table back on provisioned billing.
+        boolean billingManaged = billing.mode() != null || ctx.previouslyDeclared("BillingMode");
+        String desiredBillingMode = billing.mode() != null ? billing.mode() : "PROVISIONED";
 
         List<KeySchemaElement> keySchema = new ArrayList<>();
         List<AttributeDefinition> attrDefs = new ArrayList<>();
@@ -277,6 +295,14 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
                 table = dynamoDb.tables().enableStream(scope, tableName, viewType);
             } else if (table.isStreamEnabled()) {
                 table = dynamoDb.tables().disableStream(scope, tableName);
+            }
+
+            // BillingMode is reconciled like the stream: the create call leaves every table
+            // provisioned 5/5, so a template that declares PAY_PER_REQUEST switches it after the
+            // table exists, and an update that changes the mode converges the same way.
+            if (billingManaged) {
+                table = reconcileBillingMode(scope, tableName, table, desiredBillingMode,
+                        billing.readCapacityUnits(), billing.writeCapacityUnits());
             }
 
             // TimeToLiveSpecification is reconciled like the stream: declaring it enabled turns TTL on
@@ -409,6 +435,81 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
     }
 
     /**
+     * Runs before the table is created, as AWS validates the template before any resource exists.
+     * The API refuses throughput with PAY_PER_REQUEST and requires both capacities when the block
+     * is present, so those failures carry the error code and message AWS reports for them.
+     */
+    private static BillingSpec declaredBilling(JsonNode props, ProvisionContext ctx) {
+        CloudFormationTemplateEngine engine = ctx.engine();
+        JsonNode modeNode = props != null ? engine.resolveNode(props.get("BillingMode")) : null;
+        String mode = modeNode != null && !modeNode.isNull() ? engine.resolve(modeNode) : null;
+        if (mode != null && !"PROVISIONED".equals(mode) && !"PAY_PER_REQUEST".equals(mode)) {
+            throw new AwsException("InvalidRequest", "Model validation failed (#/BillingMode:"
+                    + " failed validation constraint for keyword [enum])", 400);
+        }
+        JsonNode throughputNode = props != null ? engine.resolveNode(props.get("ProvisionedThroughput")) : null;
+        boolean throughputDeclared = throughputNode != null && !throughputNode.isNull();
+        if (throughputDeclared) {
+            CfnPropertyTypes.requireType("ProvisionedThroughput", throughputNode, JsonNodeType.OBJECT);
+        }
+        Integer read = throughputDeclared ? ctx.resolveOptionalInt(throughputNode, "ReadCapacityUnits") : null;
+        Integer write = throughputDeclared ? ctx.resolveOptionalInt(throughputNode, "WriteCapacityUnits") : null;
+        if (throughputDeclared && read == null) {
+            throw new AwsException("InvalidRequest", "Model validation failed (#/ProvisionedThroughput:"
+                    + " required key [ReadCapacityUnits] not found)", 400);
+        }
+        if (throughputDeclared && write == null) {
+            throw new AwsException("InvalidRequest", "Model validation failed (#/ProvisionedThroughput:"
+                    + " required key [WriteCapacityUnits] not found)", 400);
+        }
+        if (read != null && read <= 0) {
+            throw new AwsException("ValidationException",
+                    "The parameter 'ProvisionedThroughput.ReadCapacityUnits' must be greater than 0", 400);
+        }
+        if (write != null && write <= 0) {
+            throw new AwsException("ValidationException",
+                    "The parameter 'ProvisionedThroughput.WriteCapacityUnits' must be greater than 0", 400);
+        }
+        if ("PAY_PER_REQUEST".equals(mode) && throughputDeclared) {
+            throw new AwsException("ValidationException",
+                    "One or more parameter values were invalid: Neither ReadCapacityUnits nor WriteCapacityUnits"
+                            + " can be specified when BillingMode is PAY_PER_REQUEST", 400);
+        }
+        return new BillingSpec(mode, read, write);
+    }
+
+    private static BillingState billingState(TableDefinition table) {
+        ProvisionedThroughput throughput = table.getProvisionedThroughput();
+        return new BillingState(table.getBillingMode() == null ? "PROVISIONED" : table.getBillingMode(),
+                throughput == null ? 5 : throughput.getReadCapacityUnits(),
+                throughput == null ? 5 : throughput.getWriteCapacityUnits());
+    }
+
+    /**
+     * Calls UpdateBillingMode only when the table's mode or throughput differs. A provisioned
+     * table that ran on demand carries zero throughput, so switching it back without declared
+     * capacities takes the 5/5 provisioned default Floci creates tables with.
+     */
+    private TableDefinition reconcileBillingMode(Scope scope, String tableName, TableDefinition table,
+                                                 String desiredMode, Integer declaredRead, Integer declaredWrite) {
+        BillingState current = billingState(table);
+        Long desiredRead = declaredRead == null ? null : declaredRead.longValue();
+        Long desiredWrite = declaredWrite == null ? null : declaredWrite.longValue();
+        if ("PROVISIONED".equals(desiredMode) && desiredRead == null) {
+            desiredRead = current.readCapacityUnits() == 0 ? 5L : current.readCapacityUnits();
+            desiredWrite = current.writeCapacityUnits() == 0 ? 5L : current.writeCapacityUnits();
+        }
+        boolean modeDiffers = !desiredMode.equals(current.mode());
+        boolean throughputDiffers = "PAY_PER_REQUEST".equals(desiredMode)
+                ? current.readCapacityUnits() != 0 || current.writeCapacityUnits() != 0
+                : desiredRead != current.readCapacityUnits() || desiredWrite != current.writeCapacityUnits();
+        if (!modeDiffers && !throughputDiffers) {
+            return table;
+        }
+        return dynamoDb.tables().updateBillingMode(scope, tableName, desiredMode, desiredRead, desiredWrite);
+    }
+
+    /**
      * Runs before the table is created, as AWS validates the template before any resource exists. An
      * empty {@code StreamArn} is present, so it passes here and fails the API's length check later.
      */
@@ -525,9 +626,9 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
     }
 
     /**
-     * Keeps the tags, stream setting, TTL setting and active Kinesis streaming destinations the table
-     * has before an in-place update changes them, with the account and region that address it, so
-     * {@link #rollbackUpdate} can put all four back.
+     * Keeps the tags, stream setting, TTL setting, active Kinesis streaming destinations and
+     * billing mode the table has before an in-place update changes them, with the account and
+     * region that address it, so {@link #rollbackUpdate} can put all five back.
      */
     private static void snapshotBeforeUpdate(StackResource r, Scope scope, String tableName, TableDefinition table,
                                              Map<String, String> tags, TimeToLive ttl, boolean kinesisManaged) {
@@ -541,6 +642,10 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
         snapshot.put("streamViewType", table.getStreamViewType());
         snapshot.put("ttlEnabled", ttl.enabled());
         snapshot.put("ttlAttributeName", ttl.attributeName());
+        BillingState billing = billingState(table);
+        snapshot.put("billingMode", billing.mode());
+        snapshot.put("readCapacityUnits", billing.readCapacityUnits());
+        snapshot.put("writeCapacityUnits", billing.writeCapacityUnits());
         if (kinesisManaged) {
             ArrayNode destinations = snapshot.putArray("kinesisDestinations");
             for (KinesisDestinationSpec destination : activeKinesisDestinations(table)) {
@@ -574,10 +679,11 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
     }
 
     /**
-     * Puts back the tags, stream setting, TTL setting and Kinesis streaming destinations an in-place
-     * table update changed. All four go back or none is claimed: restoring one alone would report a
-     * rollback while the others stayed changed. A snapshot without destinations leaves them as they
-     * are. Only an in-place {@code AWS::DynamoDB::Table} update takes the
+     * Puts back the tags, stream setting, TTL setting, Kinesis streaming destinations and billing
+     * mode an in-place table update changed. All five go back or none is claimed: restoring one
+     * alone would report a rollback while the others stayed changed. A snapshot without
+     * destinations leaves them as they are, and one without a billing mode leaves the mode as it
+     * is. Only an in-place {@code AWS::DynamoDB::Table} update takes the
      * snapshot, so a global table or a replacing update still reports that rollback is not
      * implemented. The snapshot is spent only once the restore succeeded: a restore that throws
      * leaves it in place for the next attempt.
@@ -615,6 +721,20 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
         TimeToLive currentTtl = dynamoDb.tables().timeToLive(scope, tableName);
         requireTimeToLiveChangeAllowed(currentTtl, priorTtl);
         reconcileTimeToLive(scope, tableName, currentTtl, priorTtl);
+
+        if (snapshot.hasNonNull("billingMode")) {
+            String priorMode = snapshot.path("billingMode").asText();
+            long priorRead = snapshot.path("readCapacityUnits").asLong(5);
+            long priorWrite = snapshot.path("writeCapacityUnits").asLong(5);
+            BillingState current = billingState(table);
+            boolean modeDiffers = !priorMode.equals(current.mode());
+            boolean throughputDiffers = "PAY_PER_REQUEST".equals(priorMode)
+                    ? current.readCapacityUnits() != 0 || current.writeCapacityUnits() != 0
+                    : priorRead != current.readCapacityUnits() || priorWrite != current.writeCapacityUnits();
+            if (modeDiffers || throughputDiffers) {
+                table = dynamoDb.tables().updateBillingMode(scope, tableName, priorMode, priorRead, priorWrite);
+            }
+        }
 
         if (snapshot.has("kinesisDestinations")) {
             List<KinesisDestinationSpec> priorDestinations = new ArrayList<>();

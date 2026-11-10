@@ -145,6 +145,12 @@ public final class RecordingDynamoDbBackend implements DynamoDbItemAccess, Dynam
     }
 
     @Override
+    public TableDefinition updateBillingMode(Scope scope, String tableName, String billingMode,
+                                             Long readCapacity, Long writeCapacity) {
+        return record("updateBillingMode", scope);
+    }
+
+    @Override
     public Map<String, String> listTagsOfResource(Scope scope, String resourceArn) {
         record("listTagsOfResource", scope);
         return Map.of();

@@ -238,6 +238,24 @@ public class NativeDynamoDbBackend implements DynamoDbBackend {
     }
 
     @Override
+    public TableDefinition updateBillingMode(Scope scope, String tableName, String billingMode,
+                                             Long readCapacity, Long writeCapacity) {
+        return RequestScopes.callAs(scope.accountId(), () -> {
+            TableDefinition table = dynamoDbService.describeTable(tableName, scope.region());
+            table.setBillingMode(billingMode);
+            if ("PAY_PER_REQUEST".equals(billingMode)) {
+                table.getProvisionedThroughput().setReadCapacityUnits(0L);
+                table.getProvisionedThroughput().setWriteCapacityUnits(0L);
+            } else if (readCapacity != null && writeCapacity != null) {
+                table.getProvisionedThroughput().setReadCapacityUnits(readCapacity);
+                table.getProvisionedThroughput().setWriteCapacityUnits(writeCapacity);
+            }
+            dynamoDbService.persistTable(tableName, table, scope.region());
+            return table;
+        });
+    }
+
+    @Override
     public Map<String, String> listTagsOfResource(Scope scope, String resourceArn) {
         return RequestScopes.callAs(scope.accountId(),
                 () -> dynamoDbService.listTagsOfResource(resourceArn, scope.region()));

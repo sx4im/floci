@@ -497,6 +497,23 @@ public class DynamoDbLocalBackend implements DynamoDbBackend {
         call(scope, "UpdateTimeToLive", body);
     }
 
+    @Override
+    public TableDefinition updateBillingMode(Scope scope, String tableName, String billingMode,
+                                             Long readCapacity, Long writeCapacity) {
+        ObjectNode body = body(tableName);
+        body.put("BillingMode", billingMode);
+        if ("PROVISIONED".equals(billingMode) && readCapacity != null && writeCapacity != null) {
+            body.putObject("ProvisionedThroughput")
+                    .put("ReadCapacityUnits", readCapacity)
+                    .put("WriteCapacityUnits", writeCapacity);
+        }
+        TableDefinition table = table(call(scope, "UpdateTable", body).path("TableDescription"));
+        // The wire shape reports the mode as BillingModeSummary, which the table model does not
+        // map, so the mode the call just set is recorded from the request itself.
+        table.setBillingMode(billingMode);
+        return table;
+    }
+
     private TableDefinition table(JsonNode description) {
         TableDefinition table = aws.convertValue(description, TableDefinition.class);
         JsonNode spec = description.path("StreamSpecification");

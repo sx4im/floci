@@ -9,8 +9,10 @@ import io.floci.aws.services.cloudformation.model.StackResource;
 import io.floci.aws.services.dynamodb.DynamoDbFacade;
 import io.floci.aws.services.dynamodb.DynamoDbService;
 import io.floci.aws.services.dynamodb.backend.NativeDynamoDbBackend;
+import io.floci.aws.services.dynamodb.model.ProvisionedThroughput;
 import io.floci.aws.services.dynamodb.model.TableDefinition;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -89,6 +91,181 @@ class DynamoDbCfnProvisionerTest {
         r.setResourceType(type);
         r.setAttributes(new HashMap<>());
         return r;
+    }
+
+    private TableDefinition withBilling(TableDefinition table, String billingMode, long read, long write) {
+        table.setBillingMode(billingMode);
+        table.setProvisionedThroughput(new ProvisionedThroughput(read, write));
+        return table;
+    }
+
+    /** A table that declares PAY_PER_REQUEST is reconciled to it: the create path leaves it provisioned 5/5. */
+    @Test
+    void createWithPayPerRequestReconcilesBillingModeToZeroThroughput() throws Exception {
+        TableDefinition created = withBilling(table(false), null, 5, 5);
+        when(dynamoDb.createTable(anyString(), anyList(), anyList(), any(), any(), anyList(), anyList(), anyString()))
+                .thenReturn(created);
+        when(dynamoDb.describeTable(TABLE_NAME, "us-east-1")).thenReturn(created);
+        StackResource r = resource("AWS::DynamoDB::Table", "Orders");
+
+        provisioner.provision(r, props("{\"TableName\":\"orders\",\"BillingMode\":\"PAY_PER_REQUEST\"}"), ctx());
+
+        ArgumentCaptor<TableDefinition> persisted = ArgumentCaptor.forClass(TableDefinition.class);
+        verify(dynamoDb).persistTable(eq(TABLE_NAME), persisted.capture(), eq("us-east-1"));
+        assertEquals("PAY_PER_REQUEST", persisted.getValue().getBillingMode());
+        assertEquals(0, persisted.getValue().getProvisionedThroughput().getReadCapacityUnits());
+        assertEquals(0, persisted.getValue().getProvisionedThroughput().getWriteCapacityUnits());
+        assertEquals(TABLE_NAME, r.getPhysicalId());
+    }
+
+    /** A provisioned table takes the capacities the template declares, not the 5/5 create default. */
+    @Test
+    void createWithProvisionedThroughputAppliesTheDeclaredCapacities() throws Exception {
+        TableDefinition created = withBilling(table(false), null, 5, 5);
+        when(dynamoDb.createTable(anyString(), anyList(), anyList(), any(), any(), anyList(), anyList(), anyString()))
+                .thenReturn(created);
+        when(dynamoDb.describeTable(TABLE_NAME, "us-east-1")).thenReturn(created);
+        StackResource r = resource("AWS::DynamoDB::Table", "Orders");
+
+        provisioner.provision(r, props("{\"TableName\":\"orders\",\"BillingMode\":\"PROVISIONED\","
+                + "\"ProvisionedThroughput\":{\"ReadCapacityUnits\":10,\"WriteCapacityUnits\":20}}"), ctx());
+
+        ArgumentCaptor<TableDefinition> persisted = ArgumentCaptor.forClass(TableDefinition.class);
+        verify(dynamoDb).persistTable(eq(TABLE_NAME), persisted.capture(), eq("us-east-1"));
+        assertEquals("PROVISIONED", persisted.getValue().getBillingMode());
+        assertEquals(10, persisted.getValue().getProvisionedThroughput().getReadCapacityUnits());
+        assertEquals(20, persisted.getValue().getProvisionedThroughput().getWriteCapacityUnits());
+    }
+
+    /** A template that never mentions billing leaves the table exactly as created. */
+    @Test
+    void createWithoutBillingModeLeavesTheTableAlone() throws Exception {
+        when(dynamoDb.createTable(anyString(), anyList(), anyList(), any(), any(), anyList(), anyList(), anyString()))
+                .thenReturn(withBilling(table(false), null, 5, 5));
+        StackResource r = resource("AWS::DynamoDB::Table", "Orders");
+
+        provisioner.provision(r, props("{\"TableName\":\"orders\"}"), ctx());
+
+        verify(dynamoDb, never()).persistTable(anyString(), any(), anyString());
+    }
+
+    /** The API rejects throughput with PAY_PER_REQUEST, so the template fails before the table exists. */
+    @Test
+    void payPerRequestWithThroughputFailsModelValidationBeforeTheTableIsCreated() throws Exception {
+        StackResource r = resource("AWS::DynamoDB::Table", "Orders");
+        JsonNode props = props("{\"TableName\":\"orders\",\"BillingMode\":\"PAY_PER_REQUEST\","
+                + "\"ProvisionedThroughput\":{\"ReadCapacityUnits\":5,\"WriteCapacityUnits\":5}}");
+
+        AwsException e = assertThrows(AwsException.class, () -> provisioner.provision(r, props, ctx()));
+
+        assertEquals("ValidationException", e.getErrorCode());
+        assertEquals("One or more parameter values were invalid: Neither ReadCapacityUnits nor WriteCapacityUnits"
+                + " can be specified when BillingMode is PAY_PER_REQUEST", e.getMessage());
+        verifyNoInteractions(dynamoDb);
+    }
+
+    @Test
+    void anUnknownBillingModeFailsModelValidationBeforeTheTableIsCreated() throws Exception {
+        StackResource r = resource("AWS::DynamoDB::Table", "Orders");
+        JsonNode props = props("{\"TableName\":\"orders\",\"BillingMode\":\"ON_DEMAND\"}");
+
+        AwsException e = assertThrows(AwsException.class, () -> provisioner.provision(r, props, ctx()));
+
+        assertEquals("InvalidRequest", e.getErrorCode());
+        assertEquals("Model validation failed (#/BillingMode: failed validation constraint for keyword [enum])",
+                e.getMessage());
+        verifyNoInteractions(dynamoDb);
+    }
+
+    /** An update that switches the billing mode converges the table to the new template. */
+    @Test
+    void updateFromPayPerRequestToProvisionedReconcilesBillingMode() throws Exception {
+        TableDefinition current = withBilling(table(false), "PAY_PER_REQUEST", 0, 0);
+        existingTable(current);
+        StackResource r = resource("AWS::DynamoDB::Table", "Orders");
+        r.setPhysicalId(TABLE_NAME);
+
+        provisioner.provision(r, props("{\"TableName\":\"orders\",\"BillingMode\":\"PROVISIONED\","
+                + "\"ProvisionedThroughput\":{\"ReadCapacityUnits\":10,\"WriteCapacityUnits\":10}}"),
+                updateCtx(TABLE_NAME, "{\"TableName\":\"orders\",\"BillingMode\":\"PAY_PER_REQUEST\"}"));
+
+        ArgumentCaptor<TableDefinition> persisted = ArgumentCaptor.forClass(TableDefinition.class);
+        verify(dynamoDb).persistTable(eq(TABLE_NAME), persisted.capture(), eq("us-east-1"));
+        assertEquals("PROVISIONED", persisted.getValue().getBillingMode());
+        assertEquals(10, persisted.getValue().getProvisionedThroughput().getReadCapacityUnits());
+        assertEquals(10, persisted.getValue().getProvisionedThroughput().getWriteCapacityUnits());
+    }
+
+    /** An update that keeps PAY_PER_REQUEST makes no billing call at all. */
+    @Test
+    void updateWithUnchangedPayPerRequestMakesNoBillingCall() throws Exception {
+        TableDefinition current = withBilling(table(false), "PAY_PER_REQUEST", 0, 0);
+        existingTable(current);
+        StackResource r = resource("AWS::DynamoDB::Table", "Orders");
+        r.setPhysicalId(TABLE_NAME);
+
+        provisioner.provision(r, props("{\"TableName\":\"orders\",\"BillingMode\":\"PAY_PER_REQUEST\"}"),
+                updateCtx(TABLE_NAME, "{\"TableName\":\"orders\",\"BillingMode\":\"PAY_PER_REQUEST\"}"));
+
+        verify(dynamoDb, never()).persistTable(anyString(), any(), anyString());
+    }
+
+    /**
+     * Removing BillingMode from the template is the inverse request: the table goes back to
+     * provisioned, and a table that ran on demand takes the 5/5 provisioned default since a
+     * provisioned table cannot carry zero throughput.
+     */
+    @Test
+    void updateThatDropsBillingModeRestoresProvisionedWithTheDefaultThroughput() throws Exception {
+        TableDefinition current = withBilling(table(false), "PAY_PER_REQUEST", 0, 0);
+        existingTable(current);
+        StackResource r = resource("AWS::DynamoDB::Table", "Orders");
+        r.setPhysicalId(TABLE_NAME);
+
+        provisioner.provision(r, props("{\"TableName\":\"orders\"}"),
+                updateCtx(TABLE_NAME, "{\"TableName\":\"orders\",\"BillingMode\":\"PAY_PER_REQUEST\"}"));
+
+        ArgumentCaptor<TableDefinition> persisted = ArgumentCaptor.forClass(TableDefinition.class);
+        verify(dynamoDb).persistTable(eq(TABLE_NAME), persisted.capture(), eq("us-east-1"));
+        assertEquals("PROVISIONED", persisted.getValue().getBillingMode());
+        assertEquals(5, persisted.getValue().getProvisionedThroughput().getReadCapacityUnits());
+        assertEquals(5, persisted.getValue().getProvisionedThroughput().getWriteCapacityUnits());
+    }
+
+    /**
+     * The billing mode is part of the update snapshot: an update that fails after switching the
+     * mode puts the prior mode back, the way the tags, stream and TTL already do.
+     */
+    @Test
+    void inPlaceUpdateThatFailsAfterBillingChangedRollsBillingModeBack() throws Exception {
+        TableDefinition current = withBilling(table(false), "PAY_PER_REQUEST", 0, 0);
+        existingTable(current);
+        when(dynamoDb.listTagsOfResource(TABLE_ARN, "us-east-1")).thenReturn(Map.of());
+        doThrow(new AwsException("InternalServerError", "boom", 500))
+                .when(dynamoDb).updateTimeToLive(TABLE_NAME, "expiresAt", true, "us-east-1");
+        StackResource r = resource("AWS::DynamoDB::Table", "Orders");
+        r.setPhysicalId(TABLE_NAME);
+        r.getAttributes().put("Arn", TABLE_ARN);
+        JsonNode props = props("{\"TableName\":\"orders\",\"BillingMode\":\"PROVISIONED\","
+                + "\"ProvisionedThroughput\":{\"ReadCapacityUnits\":10,\"WriteCapacityUnits\":10},"
+                + "\"TimeToLiveSpecification\":{\"AttributeName\":\"expiresAt\",\"Enabled\":true}}");
+        ProvisionContext ctx = updateCtx(TABLE_NAME);
+
+        assertThrows(AwsException.class, () -> provisioner.provision(r, props, ctx));
+
+        assertTrue(provisioner.retainsFailedUpdateState(r));
+        // The failed update already switched the table to provisioned 10/10.
+        when(dynamoDb.describeTable(TABLE_NAME, "us-east-1"))
+                .thenReturn(withBilling(table(false), "PROVISIONED", 10, 10));
+
+        assertTrue(provisioner.rollbackUpdate(r));
+        ArgumentCaptor<TableDefinition> persisted = ArgumentCaptor.forClass(TableDefinition.class);
+        verify(dynamoDb, atLeastOnce()).persistTable(eq(TABLE_NAME), persisted.capture(), eq("us-east-1"));
+        TableDefinition restored = persisted.getAllValues().get(persisted.getAllValues().size() - 1);
+        assertEquals("PAY_PER_REQUEST", restored.getBillingMode());
+        assertEquals(0, restored.getProvisionedThroughput().getReadCapacityUnits());
+        assertEquals(0, restored.getProvisionedThroughput().getWriteCapacityUnits());
+        assertFalse(provisioner.retainsFailedUpdateState(r));
     }
 
     private TableDefinition table(boolean streamed) {

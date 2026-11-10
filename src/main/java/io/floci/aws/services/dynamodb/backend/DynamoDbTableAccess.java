@@ -50,6 +50,16 @@ public interface DynamoDbTableAccess {
 
     void updateTimeToLive(Scope scope, String tableName, String attributeName, boolean enabled);
 
+    /**
+     * Sets a table's billing mode, the way the DynamoDB UpdateTable API does: PAY_PER_REQUEST
+     * zeroes the provisioned throughput, PROVISIONED applies the given capacities when both are
+     * present and leaves the throughput alone otherwise. The CloudFormation provisioner
+     * reconciles a template's BillingMode through this rather than at create time, so an
+     * UpdateStack that changes the mode converges too.
+     */
+    TableDefinition updateBillingMode(Scope scope, String tableName, String billingMode,
+                                      Long readCapacity, Long writeCapacity);
+
     Map<String, String> listTagsOfResource(Scope scope, String resourceArn);
 
     void tagResource(Scope scope, String resourceArn, Map<String, String> tags);

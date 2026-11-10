@@ -654,6 +654,36 @@ class DynamoDbLocalBackendTest {
         assertEquals("KEYS_ONLY", table.getStreamViewType());
     }
 
+    /** Switching a local table to on-demand sends BillingMode with no throughput block. */
+    @Test
+    void updateBillingModeToPayPerRequestSendsBillingModeWithoutThroughput() throws Exception {
+        answer("UpdateTable", 200, "{\"TableDescription\":{\"TableName\":\"orders\","
+                + "\"ProvisionedThroughput\":{\"ReadCapacityUnits\":0,\"WriteCapacityUnits\":0}}}");
+
+        TableDefinition table = backend.updateBillingMode(SCOPE, "orders", "PAY_PER_REQUEST", null, null);
+
+        assertEquals(json("{\"TableName\":\"orders\",\"BillingMode\":\"PAY_PER_REQUEST\"}"), sent("UpdateTable"));
+        assertEquals("PAY_PER_REQUEST", table.getBillingMode());
+        assertEquals(0L, table.getProvisionedThroughput().getReadCapacityUnits());
+        assertEquals(0L, table.getProvisionedThroughput().getWriteCapacityUnits());
+    }
+
+    /** Switching a local table to provisioned sends the capacities with the mode. */
+    @Test
+    void updateBillingModeToProvisionedSendsThroughputWithTheMode() throws Exception {
+        answer("UpdateTable", 200, "{\"TableDescription\":{\"TableName\":\"orders\","
+                + "\"ProvisionedThroughput\":{\"ReadCapacityUnits\":10,\"WriteCapacityUnits\":20}}}");
+
+        TableDefinition table = backend.updateBillingMode(SCOPE, "orders", "PROVISIONED", 10L, 20L);
+
+        assertEquals(json("{\"TableName\":\"orders\",\"BillingMode\":\"PROVISIONED\","
+                + "\"ProvisionedThroughput\":{\"ReadCapacityUnits\":10,\"WriteCapacityUnits\":20}}"),
+                sent("UpdateTable"));
+        assertEquals("PROVISIONED", table.getBillingMode());
+        assertEquals(10L, table.getProvisionedThroughput().getReadCapacityUnits());
+        assertEquals(20L, table.getProvisionedThroughput().getWriteCapacityUnits());
+    }
+
     @Test
     void disableStreamIdempotent() throws Exception {
         answerOrdersTable();
