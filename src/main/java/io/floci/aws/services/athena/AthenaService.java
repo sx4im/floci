@@ -93,6 +93,12 @@ public class AthenaService {
     private static final Pattern RESULT_STATEMENT_PATTERN = Pattern.compile(
             "^(?:SELECT|WITH|SHOW|DESCRIBE|DESC|EXPLAIN|VALUES)\\b",
             Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    // Statements DESCRIBE can wrap to report result column types. SHOW,
+    // DESCRIBE and EXPLAIN also return rows, but DESCRIBE cannot wrap them
+    // and their columns are strings, so they keep the varchar fallback.
+    private static final Pattern DESCRIBABLE_STATEMENT_PATTERN = Pattern.compile(
+            "^(?:SELECT|WITH|VALUES)\\b",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
 
     private final StorageBackend<String, QueryExecution> queryStore;
     private final StorageBackend<String, WorkGroup> workGroupStore;
@@ -542,7 +548,7 @@ public class AthenaService {
             return new ResultSet(List.of(), new ResultSet.ResultSetMetadata(List.of()));
         }
 
-        return readResultsFromS3(execution.getResultConfiguration().getOutputLocation(), id);
+        return readResultsFromS3(execution.getResultConfiguration().getOutputLocation(), execution);
     }
 
     // ── private helpers ───────────────────────────────────────────────────────
@@ -1091,7 +1097,7 @@ public class AthenaService {
         }
     }
 
-    private ResultSet readResultsFromS3(String outputLocation, String queryId) {
+    private ResultSet readResultsFromS3(String outputLocation, QueryExecution execution) {
         try {
             String bucket = extractBucket(outputLocation);
             String prefix = extractKey(outputLocation);
@@ -1109,14 +1115,60 @@ public class AthenaService {
                 return emptyResultSet();
             }
 
-            return parseCsv(csv.get().getData());
+            return parseCsv(csv.get().getData(), resolveColumnTypes(execution));
         } catch (Exception e) {
-            LOG.warnv("Could not read query results for {0}: {1}", queryId, e.getMessage());
+            LOG.warnv("Could not read query results for {0}: {1}",
+                    execution.getQueryExecutionId(), e.getMessage());
             return emptyResultSet();
         }
     }
 
-    private ResultSet parseCsv(byte[] data) {
+    /**
+     * Resolves the Athena type of each result column by describing the
+     * executed statement against DuckDB. The CSV the sidecar writes carries
+     * no type information, so without this every column reports varchar.
+     * Returns null when the types cannot be resolved, in which case parseCsv
+     * falls back to varchar for every column. Never throws.
+     */
+    private List<String> resolveColumnTypes(QueryExecution execution) {
+        String statement = statementText(execution.getQuery());
+        if (!DESCRIBABLE_STATEMENT_PATTERN.matcher(statement).find()) {
+            return null;
+        }
+        try {
+            String database = execution.getQueryExecutionContext() != null
+                    ? execution.getQueryExecutionContext().getDatabase() : null;
+            List<Map<String, Object>> described = duckClient.query(
+                    "DESCRIBE " + statement, ddlBuilder.build(database));
+            if (described == null || described.isEmpty()) {
+                return null;
+            }
+            List<String> types = new ArrayList<>();
+            for (Map<String, Object> row : described) {
+                Object type = columnTypeOf(row);
+                if (type == null) {
+                    return null;
+                }
+                types.add(DuckDbTypeMapper.toAthenaType(type.toString()));
+            }
+            return types;
+        } catch (Exception e) {
+            LOG.debugv("Could not resolve Athena result column types for {0}: {1}",
+                    execution.getQueryExecutionId(), e.getMessage());
+            return null;
+        }
+    }
+
+    private static Object columnTypeOf(Map<String, Object> row) {
+        for (Map.Entry<String, Object> entry : row.entrySet()) {
+            if ("column_type".equalsIgnoreCase(entry.getKey())) {
+                return entry.getValue();
+            }
+        }
+        return null;
+    }
+
+    private ResultSet parseCsv(byte[] data, List<String> columnTypes) {
         List<ResultSet.Row> rows = new ArrayList<>();
         List<ResultSet.ColumnInfo> columns = new ArrayList<>();
 
@@ -1129,8 +1181,9 @@ public class AthenaService {
             }
 
             String[] headers = CsvParser.parseLine(headerLine).toArray(String[]::new);
-            for (String h : headers) {
-                columns.add(new ResultSet.ColumnInfo(DEFAULT_CATALOG, "", "", h, "varchar"));
+            for (int i = 0; i < headers.length; i++) {
+                String type = columnTypes != null && i < columnTypes.size() ? columnTypes.get(i) : "varchar";
+                columns.add(new ResultSet.ColumnInfo(DEFAULT_CATALOG, "", "", headers[i], type));
             }
 
             // Header row is included in GetQueryResults per AWS spec
