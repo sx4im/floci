@@ -198,6 +198,12 @@ public class NativeDynamoDbBackend implements DynamoDbBackend {
     }
 
     @Override
+    public TableDefinition applyBillingMode(Scope scope, String tableName, String billingMode) {
+        return RequestScopes.callAs(scope.accountId(),
+                () -> dynamoDbService.applyBillingMode(tableName, billingMode, scope.region()));
+    }
+
+    @Override
     public TableDefinition enableKinesisStreamingDestination(Scope scope, String tableName, String streamArn,
                                                              String precision) {
         return RequestScopes.callAs(scope.accountId(), () -> {

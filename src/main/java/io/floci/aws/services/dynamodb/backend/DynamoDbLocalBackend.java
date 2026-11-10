@@ -474,6 +474,25 @@ public class DynamoDbLocalBackend implements DynamoDbBackend {
         return updateStream(scope, tableName, false, null);
     }
 
+    /**
+     * Switches the billing mode through Local's UpdateTable, which zeroes the throughput of an
+     * on-demand table itself. A switch back to provisioned keeps the table's current throughput,
+     * as the native path does: Local has no stored capacity to restore once a table went
+     * on-demand, so the caller passes the capacity it wants through the provisioned create.
+     */
+    @Override
+    public TableDefinition applyBillingMode(Scope scope, String tableName, String billingMode) {
+        TableDefinition current = describeTable(scope, tableName);
+        ObjectNode body = body(tableName, "BillingMode", billingMode);
+        if ("PROVISIONED".equals(billingMode) && current.getProvisionedThroughput() != null) {
+            body.set("ProvisionedThroughput", aws.createObjectNode()
+                    .put("ReadCapacityUnits", current.getProvisionedThroughput().getReadCapacityUnits())
+                    .put("WriteCapacityUnits", current.getProvisionedThroughput().getWriteCapacityUnits()));
+        }
+        call(scope, "UpdateTable", body);
+        return describeTable(scope, tableName);
+    }
+
     private TableDefinition updateStream(Scope scope, String tableName, boolean enabled, String viewType) {
         ObjectNode body = body(tableName);
         ObjectNode spec = body.putObject("StreamSpecification").put("StreamEnabled", enabled);

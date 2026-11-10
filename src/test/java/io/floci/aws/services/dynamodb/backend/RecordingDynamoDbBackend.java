@@ -117,6 +117,11 @@ public final class RecordingDynamoDbBackend implements DynamoDbItemAccess, Dynam
     }
 
     @Override
+    public TableDefinition applyBillingMode(Scope scope, String tableName, String billingMode) {
+        return record("applyBillingMode", scope);
+    }
+
+    @Override
     public TableDefinition enableKinesisStreamingDestination(Scope scope, String tableName, String streamArn,
                                                              String precision) {
         return record("enableKinesisStreamingDestination", scope);

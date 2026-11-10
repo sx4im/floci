@@ -58,6 +58,16 @@ class DynamoDbStreamSpecificationCfnProvisionerTest {
         created.setTableArn(TABLE_ARN);
         when(dynamoDbService.createTable(anyString(), anyList(), anyList(), any(), any(),
                 anyList(), anyList(), anyString())).thenReturn(created);
+        // The provisioner reconciles a declared BillingMode after the create: the mock
+        // answers with the table carrying the requested mode, as the real service does.
+        when(dynamoDbService.applyBillingMode(anyString(), anyString(), anyString()))
+                .thenAnswer(invocation -> {
+                    TableDefinition table = new TableDefinition();
+                    table.setTableName(TABLE);
+                    table.setTableArn(TABLE_ARN);
+                    table.setBillingMode(invocation.getArgument(1));
+                    return table;
+                });
     }
 
     /** Make provisioning take the update path: the table already exists, with a live stream. */

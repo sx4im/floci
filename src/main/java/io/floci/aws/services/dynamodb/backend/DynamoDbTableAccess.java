@@ -38,6 +38,13 @@ public interface DynamoDbTableAccess {
 
     TableDefinition disableStream(Scope scope, String tableName);
 
+    /**
+     * Applies the billing mode to the table and persists it, so a table created outside the
+     * DynamoDB API reports the mode its template declared. A {@code PAY_PER_REQUEST} table gets
+     * zeroed throughput, as the API path does; a {@code PROVISIONED} table keeps its throughput.
+     */
+    TableDefinition applyBillingMode(Scope scope, String tableName, String billingMode);
+
     TableDefinition enableKinesisStreamingDestination(Scope scope, String tableName, String streamArn,
                                                       String precision);
 

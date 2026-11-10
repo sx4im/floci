@@ -157,6 +157,25 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
                 ? List.of(declaredKinesisDestination(kinesisSpec, engine))
                 : List.of();
 
+        // BillingMode defaults to PROVISIONED, as in AWS. The mode and the table throughput are
+        // validated before the table is created, as AWS validates the template before any resource
+        // exists: an on-demand table takes no throughput, and an unknown mode is not silently
+        // treated as provisioned.
+        String declaredBillingMode = ctx.resolveOptional(props, "BillingMode");
+        String desiredBillingMode = declaredBillingMode != null ? declaredBillingMode : "PROVISIONED";
+        if (!"PROVISIONED".equals(desiredBillingMode) && !"PAY_PER_REQUEST".equals(desiredBillingMode)) {
+            throw new AwsException("InvalidRequest", "Model validation failed (#/BillingMode:"
+                    + " failed validation constraint for keyword [enum])", 400);
+        }
+        JsonNode throughputNode = props != null ? engine.resolveNode(props.get("ProvisionedThroughput")) : null;
+        Long readCapacity = declaredThroughput(throughputNode, "ReadCapacityUnits");
+        Long writeCapacity = declaredThroughput(throughputNode, "WriteCapacityUnits");
+        if ("PAY_PER_REQUEST".equals(desiredBillingMode) && (readCapacity != null || writeCapacity != null)) {
+            throw new AwsException("ValidationException",
+                    "One or more parameter values were invalid: Neither ReadCapacityUnits nor WriteCapacityUnits "
+                    + "can be specified when BillingMode is PAY_PER_REQUEST", 400);
+        }
+
         List<KeySchemaElement> keySchema = new ArrayList<>();
         List<AttributeDefinition> attrDefs = new ArrayList<>();
         List<GlobalSecondaryIndex> gsis = new ArrayList<>();
@@ -233,7 +252,8 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
         TableDefinition table;
         boolean created = false;
         try {
-            table = dynamoDb.tables().createTable(scope, tableName, keySchema, attrDefs, null, null, gsis, lsis);
+            table = dynamoDb.tables().createTable(scope, tableName, keySchema, attrDefs, readCapacity,
+                    writeCapacity, gsis, lsis);
             created = true;
         } catch (AwsException e) {
             if (!"ResourceInUseException".equals(e.getErrorCode())) {
@@ -243,6 +263,14 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
         }
 
         try {
+            // BillingMode is reconciled like the stream and TTL: declaring it IS the request, so
+            // a declared mode is applied when the table reports anything else, and a template that
+            // never declares it leaves the table's mode alone. A fresh table reports no mode, so
+            // the create always applies the declared one.
+            if (declaredBillingMode != null && !desiredBillingMode.equals(table.getBillingMode())) {
+                table = dynamoDb.tables().applyBillingMode(scope, tableName, desiredBillingMode);
+            }
+
             // TTL is read when the template declares it, and on an in-place update for the rollback
             // snapshot, so UpdateTimeToLive is called only when something differs. A rename of an
             // enabled TTL attribute fails here, and the snapshot is taken here, before anything changes.
@@ -384,6 +412,26 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
                     + " TimeToLiveSpecification is required when TTL status is enabled or when enabling TTL.", 400);
         }
         return new TimeToLive(enabled, attributeName);
+    }
+
+    /**
+     * A declared throughput member, or null when the template leaves it out. A non-number
+     * is a template error, reported the way the model validation reports one.
+     */
+    private static Long declaredThroughput(JsonNode throughput, String member) {
+        if (throughput == null || throughput.isNull()) {
+            return null;
+        }
+        JsonNode node = throughput.get(member);
+        if (node == null || node.isNull()) {
+            return null;
+        }
+        if (!node.isNumber()) {
+            throw new AwsException("InvalidRequest",
+                    "Model validation failed (#/ProvisionedThroughput/" + member + ": expected type: Integer,"
+                    + " found: " + node.getNodeType() + ")", 400);
+        }
+        return node.asLong();
     }
 
     /**

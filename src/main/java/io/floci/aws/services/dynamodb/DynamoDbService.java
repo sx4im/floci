@@ -991,6 +991,29 @@ public class DynamoDbService {
         return table;
     }
 
+    /**
+     * Applies the billing mode to the table and persists the result, so DescribeTable reports
+     * {@code BillingModeSummary} for an on-demand table and zeroed throughput.
+     *
+     * <p>Callers that reach DynamoDB through this service directly, notably CloudFormation
+     * provisioning, need this: {@link NativeDynamoDbTableService} sets the mode inline on
+     * CreateTable/UpdateTable, and without an equivalent entry point a table created by any other
+     * path keeps the provisioned default. A {@code PAY_PER_REQUEST} table gets zeroed throughput,
+     * as the API path does; a {@code PROVISIONED} table keeps the throughput it already has.
+     *
+     * @return the updated table.
+     */
+    public TableDefinition applyBillingMode(String tableName, String billingMode, String region) {
+        TableDefinition table = describeTable(tableName, region);
+        table.setBillingMode(billingMode);
+        if ("PAY_PER_REQUEST".equals(billingMode)) {
+            table.getProvisionedThroughput().setReadCapacityUnits(0L);
+            table.getProvisionedThroughput().setWriteCapacityUnits(0L);
+        }
+        persistTable(tableName, table, region);
+        return table;
+    }
+
     public void deleteTable(String tableName, String region) {
         String canonicalTableName = canonicalTableName(region, tableName);
         String storageKey = regionKey(region, canonicalTableName);
