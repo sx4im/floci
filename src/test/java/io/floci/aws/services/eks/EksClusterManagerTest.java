@@ -1862,10 +1862,10 @@ class EksClusterManagerTest {
             // imds=true, imdsPodNetwork=false (default): 2 commands (install probe, start proxy)
             assertEquals(2, capturedCmds.size());
             // First command: install probe
-            assertTrue(capturedCmds.get(0)[2].contains("command -v socat"));
+            assertTrue(capturedCmds.get(0)[2].contains("command -v iptables"));
             // Second command: start command with 169.254.169.254
             assertTrue(capturedCmds.get(1)[2].contains("169.254.169.254"));
-            assertTrue(capturedCmds.get(1)[2].contains("TCP:floci-host:9169"));
+            assertTrue(capturedCmds.get(1)[2].contains("iptables -t nat -A floci-imds -j DNAT --to-destination floci-host:9169"));
 
             assertNotNull(manager.getRegisteredClusterNodeInstance(cluster));
         }
@@ -1882,10 +1882,10 @@ class EksClusterManagerTest {
             verify(metadataServer).reconcileClusterNodeAddresses(any(), any());
             assertEquals(3, capturedCmds.size());
             // First command: install probe
-            assertTrue(capturedCmds.get(0)[2].contains("command -v socat"));
+            assertTrue(capturedCmds.get(0)[2].contains("command -v iptables"));
             // Second command: start command with 169.254.169.254
             assertTrue(capturedCmds.get(1)[2].contains("169.254.169.254"));
-            assertTrue(capturedCmds.get(1)[2].contains("TCP:floci-host:9169"));
+            assertTrue(capturedCmds.get(1)[2].contains("iptables -t nat -A floci-imds -j DNAT --to-destination floci-host:9169"));
             // Third command: pod network routing with iptables
             assertTrue(capturedCmds.get(2)[2].contains("FLOCI-LINK-LOCAL"));
             assertTrue(capturedCmds.get(2)[2].contains("10.42.0.0/16"));
@@ -2256,10 +2256,10 @@ class EksClusterManagerTest {
             manager.configurePodIdentityRelay(cluster, "cid-1");
 
             assertEquals(3, capturedCmds.size());
-            assertTrue(capturedCmds.get(0)[2].contains("command -v socat"));
+            assertTrue(capturedCmds.get(0)[2].contains("command -v iptables"));
             assertTrue(capturedCmds.get(1)[2].contains("169.254.170.23"));
-            assertTrue(capturedCmds.get(1)[2].contains("TCP:floci-host:4566"));
-            assertTrue(capturedCmds.get(1)[2].contains("floci-pod-identity-proxy.pid"));
+            assertTrue(capturedCmds.get(1)[2].contains("iptables -t nat -A floci-pod-identity -j DNAT --to-destination floci-host:4566"));
+            assertTrue(capturedCmds.get(1)[2].contains("iptables -t nat -N floci-pod-identity"));
             assertTrue(capturedCmds.get(2)[2].contains("FLOCI-LINK-LOCAL"));
             assertTrue(capturedCmds.get(2)[2].contains("169.254.170.23"));
             assertFalse(capturedCmds.get(2)[2].contains("169.254.169.254"),
