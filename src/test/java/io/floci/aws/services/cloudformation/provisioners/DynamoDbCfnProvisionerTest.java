@@ -9,8 +9,11 @@ import io.floci.aws.services.cloudformation.model.StackResource;
 import io.floci.aws.services.dynamodb.DynamoDbFacade;
 import io.floci.aws.services.dynamodb.DynamoDbService;
 import io.floci.aws.services.dynamodb.backend.NativeDynamoDbBackend;
+import io.floci.aws.services.dynamodb.model.GlobalSecondaryIndex;
+import io.floci.aws.services.dynamodb.model.ProvisionedThroughput;
 import io.floci.aws.services.dynamodb.model.TableDefinition;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -96,6 +99,8 @@ class DynamoDbCfnProvisionerTest {
         table.setTableName(TABLE_NAME);
         table.setTableArn(TABLE_ARN);
         table.setTableId(TABLE_ID);
+        // The service builds real tables with the 5/5 default; the mock returns the same.
+        table.setProvisionedThroughput(new ProvisionedThroughput(5, 5));
         if (streamed) {
             table.setStreamEnabled(true);
             table.setStreamArn(STREAM_ARN);
@@ -769,5 +774,165 @@ class DynamoDbCfnProvisionerTest {
 
         assertFalse(r.getAttributes().containsKey(CfnRollback.DYNAMODB_TABLE_UPDATE_SNAPSHOT_ATTR));
         assertFalse(provisioner.rollbackUpdate(r));
+    }
+
+    /** The table the service persisted after a create: billing mode and throughput as stored. */
+    private TableDefinition persistedTable() {
+        ArgumentCaptor<TableDefinition> captor = ArgumentCaptor.forClass(TableDefinition.class);
+        verify(dynamoDb).persistTable(eq(TABLE_NAME), captor.capture(), eq("us-east-1"));
+        return captor.getValue();
+    }
+
+    private void stubCreateReturningTable() {
+        when(dynamoDb.createTable(anyString(), anyList(), anyList(), any(), any(), anyList(), anyList(), anyString()))
+                .thenReturn(table(false));
+    }
+
+    @Test
+    void payPerRequestTableIsPersistedWithNoThroughput() throws Exception {
+        stubCreateReturningTable();
+        StackResource r = resource("AWS::DynamoDB::Table", "Orders");
+
+        provisioner.provision(r,
+                props("{\"TableName\":\"orders\",\"BillingMode\":\"PAY_PER_REQUEST\"}"), ctx());
+
+        verify(dynamoDb).createTable(eq(TABLE_NAME), anyList(), anyList(), eq(null), eq(null), anyList(),
+                anyList(), eq("us-east-1"));
+        TableDefinition persisted = persistedTable();
+        assertEquals("PAY_PER_REQUEST", persisted.getBillingMode());
+        assertEquals(0L, persisted.getProvisionedThroughput().getReadCapacityUnits());
+        assertEquals(0L, persisted.getProvisionedThroughput().getWriteCapacityUnits());
+        assertEquals(TABLE_ARN, r.getAttributes().get("Arn"));
+    }
+
+    @Test
+    void provisionedTableWithThroughputIsPersistedAsProvisioned() throws Exception {
+        stubCreateReturningTable();
+        StackResource r = resource("AWS::DynamoDB::Table", "Orders");
+
+        provisioner.provision(r, props("{\"TableName\":\"orders\",\"BillingMode\":\"PROVISIONED\","
+                + "\"ProvisionedThroughput\":{\"ReadCapacityUnits\":10,\"WriteCapacityUnits\":20}}"), ctx());
+
+        verify(dynamoDb).createTable(eq(TABLE_NAME), anyList(), anyList(), eq(10L), eq(20L), anyList(),
+                anyList(), eq("us-east-1"));
+        TableDefinition persisted = persistedTable();
+        assertEquals("PROVISIONED", persisted.getBillingMode());
+        assertEquals(10L, persisted.getProvisionedThroughput().getReadCapacityUnits());
+        assertEquals(20L, persisted.getProvisionedThroughput().getWriteCapacityUnits());
+    }
+
+    @Test
+    void tableWithoutBillingModeDefaultsToProvisionedFiveAndFive() throws Exception {
+        stubCreateReturningTable();
+        StackResource r = resource("AWS::DynamoDB::Table", "Orders");
+
+        provisioner.provision(r, props("{\"TableName\":\"orders\"}"), ctx());
+
+        verify(dynamoDb).createTable(eq(TABLE_NAME), anyList(), anyList(), eq(null), eq(null), anyList(),
+                anyList(), eq("us-east-1"));
+        TableDefinition persisted = persistedTable();
+        assertEquals("PROVISIONED", persisted.getBillingMode());
+        assertEquals(5L, persisted.getProvisionedThroughput().getReadCapacityUnits());
+        assertEquals(5L, persisted.getProvisionedThroughput().getWriteCapacityUnits());
+    }
+
+    @Test
+    void payPerRequestWithThroughputIsRejectedBeforeCreate() throws Exception {
+        StackResource r = resource("AWS::DynamoDB::Table", "Orders");
+
+        AwsException e = assertThrows(AwsException.class, () -> provisioner.provision(r,
+                props("{\"TableName\":\"orders\",\"BillingMode\":\"PAY_PER_REQUEST\","
+                        + "\"ProvisionedThroughput\":{\"ReadCapacityUnits\":10,\"WriteCapacityUnits\":20}}"),
+                ctx()));
+
+        assertTrue(e.getMessage().contains("Neither ReadCapacityUnits nor WriteCapacityUnits can be specified"
+                + " when BillingMode is PAY_PER_REQUEST"), e.getMessage());
+        verify(dynamoDb, never()).createTable(anyString(), anyList(), anyList(), any(), any(), anyList(),
+                anyList(), anyString());
+    }
+
+    @Test
+    void invalidBillingModeIsRejectedBeforeCreate() throws Exception {
+        StackResource r = resource("AWS::DynamoDB::Table", "Orders");
+
+        AwsException e = assertThrows(AwsException.class, () -> provisioner.provision(r,
+                props("{\"TableName\":\"orders\",\"BillingMode\":\"HOURLY\"}"), ctx()));
+
+        assertTrue(e.getMessage().contains("Model validation failed (#/BillingMode:"), e.getMessage());
+        verify(dynamoDb, never()).createTable(anyString(), anyList(), anyList(), any(), any(), anyList(),
+                anyList(), anyString());
+    }
+
+    @Test
+    void gsiThroughputIsAppliedOnProvisionedTable() throws Exception {
+        List<GlobalSecondaryIndex> capturedGsis = new ArrayList<>();
+        when(dynamoDb.createTable(anyString(), anyList(), anyList(), any(), any(), anyList(), anyList(),
+                anyString())).thenAnswer(inv -> {
+                    capturedGsis.addAll(inv.getArgument(5));
+                    return table(false);
+                });
+        StackResource r = resource("AWS::DynamoDB::Table", "Orders");
+
+        provisioner.provision(r, props("{\"TableName\":\"orders\",\"BillingMode\":\"PROVISIONED\","
+                + "\"ProvisionedThroughput\":{\"ReadCapacityUnits\":10,\"WriteCapacityUnits\":20},"
+                + "\"GlobalSecondaryIndexes\":[{\"IndexName\":\"gsi1\","
+                + "\"KeySchema\":[{\"AttributeName\":\"g\",\"KeyType\":\"HASH\"}],"
+                + "\"Projection\":{\"ProjectionType\":\"ALL\"},"
+                + "\"ProvisionedThroughput\":{\"ReadCapacityUnits\":3,\"WriteCapacityUnits\":4}}]}"), ctx());
+
+        assertEquals(1, capturedGsis.size());
+        ProvisionedThroughput gsiThroughput = capturedGsis.get(0).getProvisionedThroughput();
+        assertEquals(3L, gsiThroughput.getReadCapacityUnits());
+        assertEquals(4L, gsiThroughput.getWriteCapacityUnits());
+    }
+
+    @Test
+    void gsiThroughputOnPayPerRequestTableIsRejectedBeforeCreate() throws Exception {
+        StackResource r = resource("AWS::DynamoDB::Table", "Orders");
+
+        assertThrows(AwsException.class, () -> provisioner.provision(r,
+                props("{\"TableName\":\"orders\",\"BillingMode\":\"PAY_PER_REQUEST\","
+                        + "\"GlobalSecondaryIndexes\":[{\"IndexName\":\"gsi1\","
+                        + "\"KeySchema\":[{\"AttributeName\":\"g\",\"KeyType\":\"HASH\"}],"
+                        + "\"Projection\":{\"ProjectionType\":\"ALL\"},"
+                        + "\"ProvisionedThroughput\":{\"ReadCapacityUnits\":3,\"WriteCapacityUnits\":4}}]}"),
+                ctx()));
+
+        verify(dynamoDb, never()).createTable(anyString(), anyList(), anyList(), any(), any(), anyList(),
+                anyList(), anyString());
+    }
+
+    @Test
+    void tableThroughputMissingWriteCapacityIsRejectedBeforeCreate() throws Exception {
+        StackResource r = resource("AWS::DynamoDB::Table", "Orders");
+
+        AwsException e = assertThrows(AwsException.class, () -> provisioner.provision(r,
+                props("{\"TableName\":\"orders\","
+                        + "\"ProvisionedThroughput\":{\"ReadCapacityUnits\":10}}"),
+                ctx()));
+
+        assertTrue(e.getMessage().contains("Model validation failed (#/ProvisionedThroughput: required key"
+                + " [WriteCapacityUnits] not found)"), e.getMessage());
+        verify(dynamoDb, never()).createTable(anyString(), anyList(), anyList(), any(), any(), anyList(),
+                anyList(), anyString());
+    }
+
+    @Test
+    void gsiThroughputMissingReadCapacityIsRejectedBeforeCreate() throws Exception {
+        StackResource r = resource("AWS::DynamoDB::Table", "Orders");
+
+        AwsException e = assertThrows(AwsException.class, () -> provisioner.provision(r,
+                props("{\"TableName\":\"orders\","
+                        + "\"GlobalSecondaryIndexes\":[{\"IndexName\":\"gsi1\","
+                        + "\"KeySchema\":[{\"AttributeName\":\"g\",\"KeyType\":\"HASH\"}],"
+                        + "\"Projection\":{\"ProjectionType\":\"ALL\"},"
+                        + "\"ProvisionedThroughput\":{\"WriteCapacityUnits\":4}}]}"),
+                ctx()));
+
+        assertTrue(e.getMessage().contains("Model validation failed"
+                + " (#/GlobalSecondaryIndexes/ProvisionedThroughput: required key [ReadCapacityUnits] not found)"),
+                e.getMessage());
+        verify(dynamoDb, never()).createTable(anyString(), anyList(), anyList(), any(), any(), anyList(),
+                anyList(), anyString());
     }
 }

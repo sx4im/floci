@@ -15,6 +15,7 @@ import io.floci.aws.services.dynamodb.model.AttributeDefinition;
 import io.floci.aws.services.dynamodb.model.GlobalSecondaryIndex;
 import io.floci.aws.services.dynamodb.model.KeySchemaElement;
 import io.floci.aws.services.dynamodb.model.LocalSecondaryIndex;
+import io.floci.aws.services.dynamodb.model.ProvisionedThroughput;
 import io.floci.aws.services.dynamodb.model.TableDefinition;
 import io.floci.aws.services.kinesis.KinesisService;
 import org.junit.jupiter.api.BeforeEach;
@@ -593,6 +594,88 @@ class DynamoDbLocalBackendTest {
                  "BillingMode":"PAY_PER_REQUEST",
                  "GlobalSecondaryIndexes":[{"IndexName":"gsi1","KeySchema":[{"AttributeName":"g","KeyType":"HASH"}],
                    "Projection":{"ProjectionType":"ALL"}}]}
+                """), sent("CreateTable"));
+    }
+
+    @Test
+    void createTableWithBillingModePayPerRequestJson() throws Exception {
+        answer("CreateTable", 200, "{\"TableDescription\":{\"TableName\":\"orders\",\"TableArn\":\"" + LOCAL
+                + "table/orders\"}}");
+        GlobalSecondaryIndex gsi = new GlobalSecondaryIndex();
+        gsi.setIndexName("gsi1");
+        gsi.setKeySchema(List.of(new KeySchemaElement("g", "HASH")));
+
+        backend.createTable(SCOPE, "orders", List.of(new KeySchemaElement("pk", "HASH")),
+                List.of(new AttributeDefinition("pk", "S"), new AttributeDefinition("g", "S")),
+                null, null, "PAY_PER_REQUEST", List.of(gsi), List.of());
+
+        assertEquals(json("""
+                {"TableName":"orders",
+                 "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+                 "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},
+                   {"AttributeName":"g","AttributeType":"S"}],
+                 "BillingMode":"PAY_PER_REQUEST",
+                 "GlobalSecondaryIndexes":[{"IndexName":"gsi1","KeySchema":[{"AttributeName":"g","KeyType":"HASH"}],
+                   "Projection":{"ProjectionType":"ALL"}}]}
+                """), sent("CreateTable"));
+    }
+
+    @Test
+    void createTableWithBillingModeProvisionedJson() throws Exception {
+        answer("CreateTable", 200, "{\"TableDescription\":{\"TableName\":\"orders\",\"TableArn\":\"" + LOCAL
+                + "table/orders\"}}");
+        GlobalSecondaryIndex gsi = new GlobalSecondaryIndex("gsi1",
+                List.of(new KeySchemaElement("g", "HASH")), null, "INCLUDE", List.of("a"));
+        gsi.setProvisionedThroughput(new ProvisionedThroughput(5, 6));
+
+        backend.createTable(SCOPE, "orders",
+                List.of(new KeySchemaElement("pk", "HASH"), new KeySchemaElement("sk", "RANGE")),
+                List.of(new AttributeDefinition("pk", "S"), new AttributeDefinition("sk", "S"),
+                        new AttributeDefinition("g", "S")),
+                3L, 4L, "PROVISIONED", List.of(gsi), List.of());
+
+        assertEquals(json("""
+                {"TableName":"orders",
+                 "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},{"AttributeName":"sk","KeyType":"RANGE"}],
+                 "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},
+                   {"AttributeName":"sk","AttributeType":"S"},{"AttributeName":"g","AttributeType":"S"}],
+                 "BillingMode":"PROVISIONED",
+                 "ProvisionedThroughput":{"ReadCapacityUnits":3,"WriteCapacityUnits":4},
+                 "GlobalSecondaryIndexes":[{"IndexName":"gsi1","KeySchema":[{"AttributeName":"g","KeyType":"HASH"}],
+                   "Projection":{"ProjectionType":"INCLUDE","NonKeyAttributes":["a"]},
+                   "ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":6}}]}
+                """), sent("CreateTable"));
+    }
+
+    @Test
+    void createTableWithNullBillingModeDefaultsToProvisionedJson() throws Exception {
+        answer("CreateTable", 200, "{\"TableDescription\":{\"TableName\":\"orders\"}}");
+
+        backend.createTable(SCOPE, "orders", List.of(new KeySchemaElement("pk", "HASH")),
+                List.of(new AttributeDefinition("pk", "S")),
+                null, null, null, List.of(), List.of());
+
+        assertEquals(json("""
+                {"TableName":"orders",
+                 "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+                 "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+                 "BillingMode":"PROVISIONED"}
+                """), sent("CreateTable"));
+    }
+
+    @Test
+    void createTableWithBillingModeProvisionedAndNoThroughputJson() throws Exception {
+        answer("CreateTable", 200, "{\"TableDescription\":{\"TableName\":\"orders\"}}");
+
+        backend.createTable(SCOPE, "orders", List.of(new KeySchemaElement("pk", "HASH")),
+                List.of(new AttributeDefinition("pk", "S")),
+                null, null, "PROVISIONED", List.of(), List.of());
+
+        assertEquals(json("""
+                {"TableName":"orders",
+                 "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+                 "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+                 "BillingMode":"PROVISIONED"}
                 """), sent("CreateTable"));
     }
 

@@ -19,6 +19,7 @@ import io.floci.aws.services.dynamodb.model.GlobalSecondaryIndex;
 import io.floci.aws.services.dynamodb.model.KeySchemaElement;
 import io.floci.aws.services.dynamodb.model.KinesisStreamingDestination;
 import io.floci.aws.services.dynamodb.model.LocalSecondaryIndex;
+import io.floci.aws.services.dynamodb.model.ProvisionedThroughput;
 import io.floci.aws.services.dynamodb.model.TableDefinition;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -157,10 +158,31 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
                 ? List.of(declaredKinesisDestination(kinesisSpec, engine))
                 : List.of();
 
+        // BillingMode and ProvisionedThroughput are read up front and validated here, the way
+        // the table service validates them, so an invalid combination fails before any table
+        // exists rather than after a provisioned table was already created.
+        String billingMode = ctx.resolveOptional(props, "BillingMode");
+        JsonNode throughputSpec = props != null ? engine.resolveNode(props.get("ProvisionedThroughput")) : null;
+        boolean throughputDeclared = throughputSpec != null && !throughputSpec.isNull();
+        if (throughputDeclared) {
+            CfnPropertyTypes.requireType("ProvisionedThroughput", throughputSpec, JsonNodeType.OBJECT);
+        }
+        Integer readCapacity = throughputDeclared
+                ? ctx.resolveOptionalInt(throughputSpec, "ReadCapacityUnits") : null;
+        Integer writeCapacity = throughputDeclared
+                ? ctx.resolveOptionalInt(throughputSpec, "WriteCapacityUnits") : null;
+        if (throughputDeclared && (readCapacity == null) != (writeCapacity == null)) {
+            String missing = readCapacity == null ? "ReadCapacityUnits" : "WriteCapacityUnits";
+            throw new AwsException("InvalidRequest",
+                    "Model validation failed (#/ProvisionedThroughput: required key [" + missing + "] not found)",
+                    400);
+        }
+
         List<KeySchemaElement> keySchema = new ArrayList<>();
         List<AttributeDefinition> attrDefs = new ArrayList<>();
         List<GlobalSecondaryIndex> gsis = new ArrayList<>();
         List<LocalSecondaryIndex> lsis = new ArrayList<>();
+        boolean gsiThroughputDeclared = false;
 
         if (props != null && props.has("KeySchema")) {
             for (JsonNode ks : props.get("KeySchema")) {
@@ -200,7 +222,24 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
                         }
                     }
                 }
-                gsis.add(new GlobalSecondaryIndex(indexName, gsiKeySchema, null, projectionType, nonKeyAttributes));
+                GlobalSecondaryIndex gsi = new GlobalSecondaryIndex(indexName, gsiKeySchema, null, projectionType,
+                        nonKeyAttributes);
+                JsonNode gsiThroughputSpec = engine.resolveNode(gsiNode.get("ProvisionedThroughput"));
+                if (gsiThroughputSpec != null && !gsiThroughputSpec.isNull()) {
+                    Integer gsiRead = ctx.resolveOptionalInt(gsiThroughputSpec, "ReadCapacityUnits");
+                    Integer gsiWrite = ctx.resolveOptionalInt(gsiThroughputSpec, "WriteCapacityUnits");
+                    if ((gsiRead == null) != (gsiWrite == null)) {
+                        String missing = gsiRead == null ? "ReadCapacityUnits" : "WriteCapacityUnits";
+                        throw new AwsException("InvalidRequest", "Model validation failed"
+                                + " (#/GlobalSecondaryIndexes/ProvisionedThroughput: required key [" + missing
+                                + "] not found)", 400);
+                    }
+                    if (gsiRead != null) {
+                        gsi.setProvisionedThroughput(new ProvisionedThroughput(gsiRead, gsiWrite));
+                        gsiThroughputDeclared = true;
+                    }
+                }
+                gsis.add(gsi);
             }
         }
 
@@ -229,11 +268,26 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
             attrDefs.add(new AttributeDefinition("id", "S"));
         }
 
+        String effectiveBillingMode = billingMode == null ? "PROVISIONED" : billingMode;
+        if (!"PROVISIONED".equals(effectiveBillingMode) && !"PAY_PER_REQUEST".equals(effectiveBillingMode)) {
+            throw new AwsException("InvalidRequest",
+                    "Model validation failed (#/BillingMode: failed validation constraint for keyword [enum])",
+                    400);
+        }
+        if ("PAY_PER_REQUEST".equals(effectiveBillingMode) && (throughputDeclared || gsiThroughputDeclared)) {
+            throw new AwsException("ValidationException",
+                    "One or more parameter values were invalid: Neither ReadCapacityUnits nor WriteCapacityUnits "
+                            + "can be specified when BillingMode is PAY_PER_REQUEST", 400);
+        }
+
         Scope scope = new Scope(ctx.accountId(), region);
         TableDefinition table;
         boolean created = false;
         try {
-            table = dynamoDb.tables().createTable(scope, tableName, keySchema, attrDefs, null, null, gsis, lsis);
+            table = dynamoDb.tables().createTable(scope, tableName, keySchema, attrDefs,
+                    readCapacity == null ? null : readCapacity.longValue(),
+                    writeCapacity == null ? null : writeCapacity.longValue(),
+                    effectiveBillingMode, gsis, lsis);
             created = true;
         } catch (AwsException e) {
             if (!"ResourceInUseException".equals(e.getErrorCode())) {

@@ -23,6 +23,7 @@ import io.floci.aws.services.dynamodb.model.AttributeDefinition;
 import io.floci.aws.services.dynamodb.model.GlobalSecondaryIndex;
 import io.floci.aws.services.dynamodb.model.KeySchemaElement;
 import io.floci.aws.services.dynamodb.model.LocalSecondaryIndex;
+import io.floci.aws.services.dynamodb.model.ProvisionedThroughput;
 import io.floci.aws.services.dynamodb.model.TableDefinition;
 import io.floci.aws.services.kinesis.KinesisService;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -397,6 +398,54 @@ public class DynamoDbLocalBackend implements DynamoDbBackend {
                 ObjectNode index = index(indexes, gsi.getIndexName(), gsi.getKeySchema(), gsi.getProjectionType(),
                         gsi.getNonKeyAttributes());
                 if (throughput != null) {
+                    index.set("ProvisionedThroughput", throughput.deepCopy());
+                }
+            }
+        }
+        if (localSecondaryIndexes != null && !localSecondaryIndexes.isEmpty()) {
+            ArrayNode indexes = body.putArray("LocalSecondaryIndexes");
+            for (LocalSecondaryIndex lsi : localSecondaryIndexes) {
+                index(indexes, lsi.getIndexName(), lsi.getKeySchema(), lsi.getProjectionType(),
+                        lsi.getNonKeyAttributes());
+            }
+        }
+        return table(call(scope, "CreateTable", body).path("TableDescription"));
+    }
+
+    /**
+     * Creates a table with an explicit billing mode: a null mode means PROVISIONED, the AWS
+     * default, so unlike the throughput-inferred shape above a provisioned table without a
+     * throughput is never mistaken for on-demand. A PAY_PER_REQUEST table carries no
+     * provisioned throughput, on the table or any index.
+     */
+    @Override
+    public TableDefinition createTable(Scope scope, String tableName, List<KeySchemaElement> keySchema,
+                                       List<AttributeDefinition> attributeDefinitions, Long readCapacity,
+                                       Long writeCapacity, String billingMode,
+                                       List<GlobalSecondaryIndex> globalSecondaryIndexes,
+                                       List<LocalSecondaryIndex> localSecondaryIndexes) {
+        boolean onDemand = "PAY_PER_REQUEST".equals(billingMode);
+        ObjectNode body = body(tableName, "KeySchema", keySchema, "AttributeDefinitions", attributeDefinitions);
+        body.put("BillingMode", onDemand ? "PAY_PER_REQUEST" : "PROVISIONED");
+        ObjectNode throughput = null;
+        if (!onDemand && readCapacity != null && writeCapacity != null) {
+            throughput = aws.createObjectNode()
+                    .put("ReadCapacityUnits", readCapacity)
+                    .put("WriteCapacityUnits", writeCapacity);
+            body.set("ProvisionedThroughput", throughput);
+        }
+        if (globalSecondaryIndexes != null && !globalSecondaryIndexes.isEmpty()) {
+            ArrayNode indexes = body.putArray("GlobalSecondaryIndexes");
+            for (GlobalSecondaryIndex gsi : globalSecondaryIndexes) {
+                ObjectNode index = index(indexes, gsi.getIndexName(), gsi.getKeySchema(), gsi.getProjectionType(),
+                        gsi.getNonKeyAttributes());
+                ProvisionedThroughput gsiThroughput = gsi.getProvisionedThroughput();
+                if (!onDemand && gsiThroughput != null && gsiThroughput.getReadCapacityUnits() > 0
+                        && gsiThroughput.getWriteCapacityUnits() > 0) {
+                    index.set("ProvisionedThroughput", aws.createObjectNode()
+                            .put("ReadCapacityUnits", gsiThroughput.getReadCapacityUnits())
+                            .put("WriteCapacityUnits", gsiThroughput.getWriteCapacityUnits()));
+                } else if (throughput != null) {
                     index.set("ProvisionedThroughput", throughput.deepCopy());
                 }
             }

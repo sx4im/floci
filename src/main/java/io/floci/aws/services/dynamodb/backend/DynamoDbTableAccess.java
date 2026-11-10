@@ -24,6 +24,21 @@ public interface DynamoDbTableAccess {
                                 Long writeCapacity, List<GlobalSecondaryIndex> globalSecondaryIndexes,
                                 List<LocalSecondaryIndex> localSecondaryIndexes);
 
+    /**
+     * Creates a table with an explicit billing mode. A null mode means PROVISIONED, the AWS
+     * default; PAY_PER_REQUEST creates the table with no provisioned throughput. The default
+     * drops the mode and delegates to {@link #createTable(Scope, String, List, List, Long, Long,
+     * List, List)}, so backends that do not apply the mode keep their previous behaviour.
+     */
+    default TableDefinition createTable(Scope scope, String tableName, List<KeySchemaElement> keySchema,
+                                        List<AttributeDefinition> attributeDefinitions, Long readCapacity,
+                                        Long writeCapacity, String billingMode,
+                                        List<GlobalSecondaryIndex> globalSecondaryIndexes,
+                                        List<LocalSecondaryIndex> localSecondaryIndexes) {
+        return createTable(scope, tableName, keySchema, attributeDefinitions, readCapacity, writeCapacity,
+                globalSecondaryIndexes, localSecondaryIndexes);
+    }
+
     TableDefinition describeTable(Scope scope, String tableName);
 
     Optional<TableDefinition> findTable(Scope scope, String tableName);

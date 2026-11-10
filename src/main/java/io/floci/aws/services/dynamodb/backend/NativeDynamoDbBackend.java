@@ -14,6 +14,7 @@ import io.floci.aws.services.dynamodb.model.AttributeDefinition;
 import io.floci.aws.services.dynamodb.model.GlobalSecondaryIndex;
 import io.floci.aws.services.dynamodb.model.KeySchemaElement;
 import io.floci.aws.services.dynamodb.model.LocalSecondaryIndex;
+import io.floci.aws.services.dynamodb.model.ProvisionedThroughput;
 import io.floci.aws.services.dynamodb.model.TableDefinition;
 import io.quarkus.arc.ClientProxy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -169,6 +170,35 @@ public class NativeDynamoDbBackend implements DynamoDbBackend {
         return RequestScopes.callAs(scope.accountId(), () -> dynamoDbService.createTable(tableName, keySchema,
                 attributeDefinitions, readCapacity, writeCapacity, globalSecondaryIndexes, localSecondaryIndexes,
                 scope.region()));
+    }
+
+    /**
+     * Creates a table with an explicit billing mode, the way the table service does it: a
+     * PAY_PER_REQUEST table carries no provisioned throughput, a PROVISIONED table (or a null
+     * mode, the AWS default) keeps the throughput the caller passed, and the stored table is
+     * persisted so the mode survives a restart.
+     */
+    @Override
+    public TableDefinition createTable(Scope scope, String tableName, List<KeySchemaElement> keySchema,
+                                       List<AttributeDefinition> attributeDefinitions, Long readCapacity,
+                                       Long writeCapacity, String billingMode,
+                                       List<GlobalSecondaryIndex> globalSecondaryIndexes,
+                                       List<LocalSecondaryIndex> localSecondaryIndexes) {
+        return RequestScopes.callAs(scope.accountId(), () -> {
+            TableDefinition table = dynamoDbService.createTable(tableName, keySchema, attributeDefinitions,
+                    readCapacity, writeCapacity, globalSecondaryIndexes, localSecondaryIndexes, scope.region());
+            if ("PAY_PER_REQUEST".equals(billingMode)) {
+                table.setBillingMode("PAY_PER_REQUEST");
+                table.setProvisionedThroughput(new ProvisionedThroughput(0, 0));
+            } else {
+                table.setBillingMode("PROVISIONED");
+                if (readCapacity != null && writeCapacity != null) {
+                    table.setProvisionedThroughput(new ProvisionedThroughput(readCapacity, writeCapacity));
+                }
+            }
+            dynamoDbService.persistTable(tableName, table, scope.region());
+            return table;
+        });
     }
 
     @Override
