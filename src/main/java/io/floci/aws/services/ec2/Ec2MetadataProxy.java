@@ -26,25 +26,25 @@ public final class Ec2MetadataProxy {
         return new String[]{"sh", "-c", String.join("\n",
                 "set -eu",
                 CLEAR_APPLICATION_PATHS,
-                "if command -v ip >/dev/null 2>&1 && command -v socat >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then exit 0; fi",
+                "if command -v ip >/dev/null 2>&1 && command -v socat >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && command -v iptables >/dev/null 2>&1; then exit 0; fi",
                 "if command -v apt-get >/dev/null 2>&1; then",
                 "  apt-get update -qq >/dev/null",
-                "  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iproute2 socat curl ca-certificates >/dev/null",
+                "  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iproute2 socat curl ca-certificates iptables >/dev/null",
                 "elif command -v dnf >/dev/null 2>&1; then",
                 // --allowerasing lets dnf swap the curl-minimal that
                 // public.ecr.aws/amazonlinux/amazonlinux:2023 ships by default for the full
                 // curl package this proxy needs. Without it, dnf aborts the whole transaction
                 // on a curl/curl-minimal conflict and iproute+socat never install either, even
                 // though neither of them conflicts with anything.
-                "  dnf install -y --allowerasing iproute socat curl ca-certificates >/dev/null",
+                "  dnf install -y --allowerasing iproute socat curl ca-certificates iptables >/dev/null",
                 // Same gap as the sshd probe: Amazon Linux 2 has only yum, so on an instance
                 // launched from ami-amazonlinux2 this chain reached its else branch and exited 1
                 // with "No supported package manager found for IMDS proxy dependencies",
                 // leaving the instance without a link-local IMDS endpoint.
                 "elif command -v yum >/dev/null 2>&1; then",
-                "  yum install -y iproute socat curl ca-certificates >/dev/null",
+                "  yum install -y iproute socat curl ca-certificates iptables >/dev/null",
                 "elif command -v apk >/dev/null 2>&1; then",
-                "  apk add --no-cache iproute2 socat curl ca-certificates >/dev/null",
+                "  apk add --no-cache iproute2 socat curl ca-certificates iptables >/dev/null",
                 "else",
                 "  echo 'No supported package manager found for IMDS proxy dependencies' >&2",
                 "  exit 1",
@@ -52,7 +52,7 @@ public final class Ec2MetadataProxy {
     }
 
     public static String[] startCommand(String flociHost, int imdsPort) {
-        return startCommand("imds", "169.254.169.254", 80, flociHost, imdsPort,
+        return startCommand("imds", "169.254.169.254", 80, 18080, flociHost, imdsPort,
                 imdsProbeCommand("http://169.254.169.254"));
     }
 
@@ -71,7 +71,7 @@ public final class Ec2MetadataProxy {
     }
 
     public static String[] podIdentityStartCommand(String flociHost, int flociPort) {
-        return startCommand("pod-identity", "169.254.170.23", 80, flociHost, flociPort,
+        return startCommand("pod-identity", "169.254.170.23", 80, 18081, flociHost, flociPort,
                 podIdentityProbeCommand("http://169.254.170.23"));
     }
 
@@ -85,14 +85,39 @@ public final class Ec2MetadataProxy {
                 + "/v1/credentials)\" != \"000\" ] && exit 0";
     }
 
-    public static String[] startCommand(String name, String bindIp, int bindPort,
+    /**
+     * Starts the link-local proxy for {@code bindIp}:{@code bindPort} inside a container.
+     * <p>
+     * On real AWS the metadata service lives outside the machine, so port 80 inside the
+     * instance is free for applications. A listener on the link-local address would occupy
+     * that port and break a server binding {@code 0.0.0.0:80}, so socat listens on loopback
+     * at {@code redirectPort} instead and an iptables OUTPUT rule redirects traffic for
+     * {@code bindIp}:{@code bindPort} to it. When iptables is missing or the rule cannot
+     * be installed, the proxy falls back to binding the link-local address directly, which
+     * keeps IMDS working at the cost of occupying port 80.
+     */
+    public static String[] startCommand(String name, String bindIp, int bindPort, int redirectPort,
                                         String targetHost, int targetPort, String probeCommand) {
         String pidFile = "/tmp/floci-" + name + "-proxy.pid";
         String logFile = "/tmp/floci-" + name + "-proxy.log";
+        String redirectRule = "-d " + bindIp + "/32 -p tcp --dport " + bindPort
+                + " -j REDIRECT --to-ports " + redirectPort;
         return new String[]{"sh", "-c", String.join("\n",
                 "set -eu",
                 CLEAR_APPLICATION_PATHS,
                 "ip addr show dev lo | grep -q '" + bindIp + "/32' || ip addr add " + bindIp + "/32 dev lo",
+                // The redirect keeps port 80 on the link-local address free for applications
+                // inside the container. The check-then-add keeps the rule idempotent across
+                // restarts, which get a fresh network namespace but keep the pid file.
+                "IPTABLES=$(command -v iptables 2>/dev/null || command -v /bin/aux/iptables 2>/dev/null || true)",
+                "if [ -n \"$IPTABLES\" ] && { \"$IPTABLES\" -t nat -C OUTPUT " + redirectRule + " 2>/dev/null"
+                        + " || \"$IPTABLES\" -t nat -A OUTPUT " + redirectRule + " 2>/dev/null; }; then",
+                "  LISTEN_PORT=" + redirectPort,
+                "  LISTEN_IP=127.0.0.1",
+                "else",
+                "  LISTEN_PORT=" + bindPort,
+                "  LISTEN_IP=" + bindIp,
+                "fi",
                 // The pid file is on the container's writable layer, so it outlives a restart while
                 // the PID namespace does not: only a pid that is still this socat listener counts.
                 // The command name matters as well as the arguments: the shell running this script
@@ -100,10 +125,10 @@ public final class Ec2MetadataProxy {
                 "if [ -f " + pidFile + " ] && pid=\"$(cat " + pidFile + ")\""
                         + " && [ \"$(cat \"/proc/$pid/comm\" 2>/dev/null)\" = socat ]"
                         + " && tr '\\0' ' ' 2>/dev/null <\"/proc/$pid/cmdline\""
-                        + " | grep -q 'TCP-LISTEN:" + bindPort + ",bind=" + bindIp + ",'; then",
+                        + " | grep -q \"TCP-LISTEN:$LISTEN_PORT,bind=$LISTEN_IP,\"; then",
                 "  exit 0",
                 "fi",
-                "nohup socat TCP-LISTEN:" + bindPort + ",bind=" + bindIp + ",fork,reuseaddr TCP:"
+                "nohup socat TCP-LISTEN:$LISTEN_PORT,bind=$LISTEN_IP,fork,reuseaddr TCP:"
                         + targetHost + ":" + targetPort + " >" + logFile + " 2>&1 &",
                 "echo $! > " + pidFile,
                 "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do",

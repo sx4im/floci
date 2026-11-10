@@ -1644,14 +1644,14 @@ class Ec2ContainerManagerTest {
         String script = Ec2ContainerManager.metadataProxyInstallCommand()[2];
 
         assertTrue(script.contains("command -v yum"), script);
-        assertTrue(script.contains("yum install -y iproute socat curl ca-certificates"), script);
+        assertTrue(script.contains("yum install -y iproute socat curl ca-certificates iptables"), script);
     }
 
     @Test
     void metadataProxyInstallCommandLetsDnfReplaceCurlMinimalWithCurl() {
         // public.ecr.aws/amazonlinux/amazonlinux:2023 -- the fallback image AmiImageResolver
         // uses for any unrecognized AMI ID -- ships curl-minimal by default. Without
-        // --allowerasing, "dnf install -y iproute socat curl ca-certificates" fails the whole
+        // --allowerasing, "dnf install -y iproute socat curl ca-certificates iptables" fails the whole
         // transaction on a curl/curl-minimal conflict (they both provide /usr/bin/curl), so
         // iproute and socat never install either, even though neither of them conflicts with
         // anything. Reproduced against the real image: dnf reported dozens of
@@ -1659,7 +1659,7 @@ class Ec2ContainerManagerTest {
         // instance was left with no link-local IMDS endpoint.
         String script = Ec2ContainerManager.metadataProxyInstallCommand()[2];
 
-        assertTrue(script.contains("dnf install -y --allowerasing iproute socat curl ca-certificates"),
+        assertTrue(script.contains("dnf install -y --allowerasing iproute socat curl ca-certificates iptables"),
                 script);
     }
 
@@ -1669,7 +1669,8 @@ class Ec2ContainerManagerTest {
 
         assertEquals("sh", command[0]);
         assertTrue(command[2].contains("169.254.169.254/32"));
-        assertTrue(command[2].contains("TCP-LISTEN:80,bind=169.254.169.254"));
+        assertTrue(command[2].contains("-t nat -C OUTPUT -d 169.254.169.254/32 -p tcp --dport 80 -j REDIRECT --to-ports 18080"));
+        assertTrue(command[2].contains("TCP-LISTEN:$LISTEN_PORT,bind=$LISTEN_IP,fork,reuseaddr"));
         assertTrue(command[2].contains("TCP:floci:9169"));
         assertTrue(command[2].contains("http://169.254.169.254/latest/meta-data/instance-id"));
     }

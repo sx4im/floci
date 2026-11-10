@@ -13,6 +13,7 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -36,11 +37,11 @@ class Ec2MetadataProxyTest {
         assertEquals("-c", command[1]);
 
         String script = command[2];
-        assertTrue(script.contains("command -v ip >/dev/null 2>&1 && command -v socat >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then exit 0; fi"));
-        assertTrue(script.contains("apt-get install -y --no-install-recommends iproute2 socat curl ca-certificates"));
-        assertTrue(script.contains("dnf install -y --allowerasing iproute socat curl ca-certificates"));
-        assertTrue(script.contains("yum install -y iproute socat curl ca-certificates"));
-        assertTrue(script.contains("apk add --no-cache iproute2 socat curl ca-certificates"));
+        assertTrue(script.contains("command -v ip >/dev/null 2>&1 && command -v socat >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && command -v iptables >/dev/null 2>&1; then exit 0; fi"));
+        assertTrue(script.contains("apt-get install -y --no-install-recommends iproute2 socat curl ca-certificates iptables"));
+        assertTrue(script.contains("dnf install -y --allowerasing iproute socat curl ca-certificates iptables"));
+        assertTrue(script.contains("yum install -y iproute socat curl ca-certificates iptables"));
+        assertTrue(script.contains("apk add --no-cache iproute2 socat curl ca-certificates iptables"));
     }
 
     @Test
@@ -53,11 +54,18 @@ class Ec2MetadataProxyTest {
         String script = command[2];
         // Attaches address if missing
         assertTrue(script.contains("ip addr show dev lo | grep -q '169.254.169.254/32' || ip addr add 169.254.169.254/32 dev lo"));
+        // Redirects the link-local port to a loopback listener so port 80 stays free
+        // for applications inside the instance, and falls back to a direct bind
+        // when iptables cannot install the rule.
+        assertTrue(script.contains("\"$IPTABLES\" -t nat -C OUTPUT -d 169.254.169.254/32 -p tcp --dport 80 -j REDIRECT --to-ports 18080 2>/dev/null"
+                + " || \"$IPTABLES\" -t nat -A OUTPUT -d 169.254.169.254/32 -p tcp --dport 80 -j REDIRECT --to-ports 18080 2>/dev/null; }; then"));
+        assertTrue(script.contains("  LISTEN_PORT=18080\n  LISTEN_IP=127.0.0.1"));
+        assertTrue(script.contains("  LISTEN_PORT=80\n  LISTEN_IP=169.254.169.254"));
         // Idempotent when pid file exists and process is alive
         assertTrue(script.contains("if [ -f /tmp/floci-imds-proxy.pid ] && pid=\"$(cat /tmp/floci-imds-proxy.pid)\" && [ \"$(cat \"/proc/$pid/comm\" 2>/dev/null)\" = socat ]"
-                + " && tr '\\0' ' ' 2>/dev/null <\"/proc/$pid/cmdline\" | grep -q 'TCP-LISTEN:80,bind=169.254.169.254,'; then\n  exit 0\nfi"));
+                + " && tr '\\0' ' ' 2>/dev/null <\"/proc/$pid/cmdline\" | grep -q \"TCP-LISTEN:$LISTEN_PORT,bind=$LISTEN_IP,\"; then\n  exit 0\nfi"));
         // Targets configured Floci host and IMDS port
-        assertTrue(script.contains("nohup socat TCP-LISTEN:80,bind=169.254.169.254,fork,reuseaddr TCP:10.0.0.1:9169 >/tmp/floci-imds-proxy.log 2>&1 &"));
+        assertTrue(script.contains("nohup socat TCP-LISTEN:$LISTEN_PORT,bind=$LISTEN_IP,fork,reuseaddr TCP:10.0.0.1:9169 >/tmp/floci-imds-proxy.log 2>&1 &"));
         // Verifies through an IMDSv2 token even when tokenless access is refused.
         assertTrue(script.contains("-X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60'"));
         assertTrue(script.contains("http://169.254.169.254/latest/api/token"));
@@ -73,9 +81,11 @@ class Ec2MetadataProxyTest {
 
         String script = command[2];
         assertTrue(script.contains("ip addr show dev lo | grep -q '169.254.170.23/32' || ip addr add 169.254.170.23/32 dev lo"));
+        assertTrue(script.contains("\"$IPTABLES\" -t nat -C OUTPUT -d 169.254.170.23/32 -p tcp --dport 80 -j REDIRECT --to-ports 18081 2>/dev/null"
+                + " || \"$IPTABLES\" -t nat -A OUTPUT -d 169.254.170.23/32 -p tcp --dport 80 -j REDIRECT --to-ports 18081 2>/dev/null; }; then"));
         assertTrue(script.contains("if [ -f /tmp/floci-pod-identity-proxy.pid ] && pid=\"$(cat /tmp/floci-pod-identity-proxy.pid)\" && [ \"$(cat \"/proc/$pid/comm\" 2>/dev/null)\" = socat ]"
-                + " && tr '\\0' ' ' 2>/dev/null <\"/proc/$pid/cmdline\" | grep -q 'TCP-LISTEN:80,bind=169.254.170.23,'; then\n  exit 0\nfi"));
-        assertTrue(script.contains("nohup socat TCP-LISTEN:80,bind=169.254.170.23,fork,reuseaddr TCP:10.0.0.1:4566 >/tmp/floci-pod-identity-proxy.log 2>&1 &"));
+                + " && tr '\\0' ' ' 2>/dev/null <\"/proc/$pid/cmdline\" | grep -q \"TCP-LISTEN:$LISTEN_PORT,bind=$LISTEN_IP,\"; then\n  exit 0\nfi"));
+        assertTrue(script.contains("nohup socat TCP-LISTEN:$LISTEN_PORT,bind=$LISTEN_IP,fork,reuseaddr TCP:10.0.0.1:4566 >/tmp/floci-pod-identity-proxy.log 2>&1 &"));
         assertTrue(script.contains("http://169.254.170.23/v1/credentials"));
     }
 
@@ -122,7 +132,7 @@ class Ec2MetadataProxyTest {
                 HelperShellFixture.output(directory));
 
         assertEquals("dnf\n", Files.readString(record));
-        assertEquals("install -y --allowerasing iproute socat curl ca-certificates\n",
+        assertEquals("install -y --allowerasing iproute socat curl ca-certificates iptables\n",
                 Files.readString(arguments));
     }
 
@@ -134,6 +144,8 @@ class Ec2MetadataProxyTest {
         Path proxyReady = directory.resolve("proxy-ready");
         HelperShellFixture.writeTool(bin, "ip", HelperShellFixture.checkedToolEnvironment()
                 + "printf '127.0.0.1/32\\n'\n");
+        HelperShellFixture.writeTool(bin, "iptables", HelperShellFixture.checkedToolEnvironment()
+                + "exit 0\n");
         HelperShellFixture.writeTool(bin, "socat", HelperShellFixture.checkedToolEnvironment()
                 + ": > \"$TEST_PROXY_READY\"\n");
         HelperShellFixture.writeTool(bin, "curl", HelperShellFixture.checkedToolEnvironment()
@@ -144,12 +156,107 @@ class Ec2MetadataProxyTest {
         String name = "unit-" + UUID.randomUUID();
         try {
             String[] command = Ec2MetadataProxy.startCommand(
-                    name, "127.0.0.1", 80, "127.0.0.1", 9169, "curl fixture && exit 0");
+                    name, "127.0.0.1", 80, 18080, "127.0.0.1", 9169, "curl fixture && exit 0");
             assertEquals(0, HelperShellFixture.run(command, directory,
                     HelperShellFixture.applicationEnvironment(Map.of("PATH", bin + ":" + System.getenv("PATH"),
                             "TEST_RECORD", record.toString(), "TEST_PROXY_READY", proxyReady.toString()))),
                     HelperShellFixture.output(directory));
-            assertEquals(Set.of("ip", "socat", "curl"), Set.copyOf(Files.readAllLines(record)));
+            assertEquals(Set.of("ip", "iptables", "socat", "curl"), Set.copyOf(Files.readAllLines(record)));
+        } finally {
+            deleteProxyFiles(name);
+        }
+    }
+
+    /**
+     * With iptables available the proxy must not occupy port 80 on the link-local address:
+     * socat listens on loopback and the redirect carries link-local traffic to it, so an
+     * application binding 0.0.0.0:80 inside the instance no longer fails.
+     */
+    /**
+     * The proxy starts socat in the background, so its invocation may not be
+     * recorded yet when the script exits. Wait for the fragment to appear in
+     * the file instead of asserting on a possibly stale read.
+     */
+    private static void waitForFileContaining(Path file, String fragment) throws Exception {
+        Instant deadline = Instant.now().plusSeconds(5);
+        while (Instant.now().isBefore(deadline)) {
+            if (Files.exists(file) && Files.readString(file).contains(fragment)) {
+                return;
+            }
+            Thread.sleep(50);
+        }
+    }
+
+    @Test
+    void startCommandListensOnLoopbackWhenIptablesInstallsTheRedirect(@TempDir Path directory)
+            throws Exception {
+        Path bin = Files.createDirectory(directory.resolve("bin"));
+        Path record = directory.resolve("tools");
+        Path iptablesArgs = directory.resolve("iptables-args");
+        Path socatArgs = directory.resolve("socat-args");
+        HelperShellFixture.writeTool(bin, "ip", HelperShellFixture.checkedToolEnvironment()
+                + "printf '127.0.0.1/32\\n'\n");
+        HelperShellFixture.writeTool(bin, "iptables", HelperShellFixture.checkedToolEnvironment()
+                + "printf '%s\\n' \"$*\" >> \"$TEST_IPTABLES_ARGS\"\n");
+        HelperShellFixture.writeTool(bin, "socat", HelperShellFixture.checkedToolEnvironment()
+                + "printf '%s\\n' \"$*\" > \"$TEST_SOCAT_ARGS\"\n");
+        HelperShellFixture.writeTool(bin, "curl", HelperShellFixture.checkedToolEnvironment()
+                + "exit 0\n");
+        String name = "unit-" + UUID.randomUUID();
+        try {
+            String[] command = Ec2MetadataProxy.startCommand(
+                    name, "169.254.169.254", 80, 18080, "127.0.0.1", 9169, "curl fixture && exit 0");
+            assertEquals(0, HelperShellFixture.run(command, directory,
+                    HelperShellFixture.applicationEnvironment(Map.of("PATH", bin + ":" + System.getenv("PATH"),
+                            "TEST_RECORD", record.toString(),
+                            "TEST_IPTABLES_ARGS", iptablesArgs.toString(),
+                            "TEST_SOCAT_ARGS", socatArgs.toString()))),
+                    HelperShellFixture.output(directory));
+            waitForFileContaining(record, "socat");
+            waitForFileContaining(socatArgs, "TCP-LISTEN:18080");
+            assertEquals(Set.of("ip", "iptables", "socat", "curl"), Set.copyOf(Files.readAllLines(record)));
+            assertEquals("-t nat -C OUTPUT -d 169.254.169.254/32 -p tcp --dport 80 -j REDIRECT --to-ports 18080",
+                    Files.readString(iptablesArgs).strip(), HelperShellFixture.output(directory));
+            assertTrue(Files.readString(socatArgs).contains("TCP-LISTEN:18080,bind=127.0.0.1,fork,reuseaddr"),
+                    HelperShellFixture.output(directory));
+        } finally {
+            deleteProxyFiles(name);
+        }
+    }
+
+    /**
+     * When iptables cannot install the rule the proxy must still start: it binds the
+     * link-local address directly, which keeps IMDS working at the cost of occupying
+     * port 80, exactly as before this change.
+     */
+    @Test
+    void startCommandBindsTheLinkLocalAddressWhenIptablesCannotInstallTheRedirect(
+            @TempDir Path directory) throws Exception {
+        Path bin = Files.createDirectory(directory.resolve("bin"));
+        Path record = directory.resolve("tools");
+        Path socatArgs = directory.resolve("socat-args");
+        HelperShellFixture.writeTool(bin, "ip", HelperShellFixture.checkedToolEnvironment()
+                + "printf '127.0.0.1/32\\n'\n");
+        HelperShellFixture.writeTool(bin, "iptables", HelperShellFixture.checkedToolEnvironment()
+                + "exit 1\n");
+        HelperShellFixture.writeTool(bin, "socat", HelperShellFixture.checkedToolEnvironment()
+                + "printf '%s\\n' \"$*\" > \"$TEST_SOCAT_ARGS\"\n");
+        HelperShellFixture.writeTool(bin, "curl", HelperShellFixture.checkedToolEnvironment()
+                + "exit 0\n");
+        String name = "unit-" + UUID.randomUUID();
+        try {
+            String[] command = Ec2MetadataProxy.startCommand(
+                    name, "169.254.169.254", 80, 18080, "127.0.0.1", 9169, "curl fixture && exit 0");
+            assertEquals(0, HelperShellFixture.run(command, directory,
+                    HelperShellFixture.applicationEnvironment(Map.of("PATH", bin + ":" + System.getenv("PATH"),
+                            "TEST_RECORD", record.toString(),
+                            "TEST_SOCAT_ARGS", socatArgs.toString()))),
+                    HelperShellFixture.output(directory));
+            waitForFileContaining(record, "socat");
+            waitForFileContaining(socatArgs, "TCP-LISTEN:80");
+            assertEquals(Set.of("ip", "iptables", "socat", "curl"), Set.copyOf(Files.readAllLines(record)));
+            assertTrue(Files.readString(socatArgs).contains("TCP-LISTEN:80,bind=169.254.169.254,fork,reuseaddr"),
+                    HelperShellFixture.output(directory));
         } finally {
             deleteProxyFiles(name);
         }
@@ -252,12 +359,13 @@ class Ec2MetadataProxyTest {
     void startScriptRetriesTheTokenProbeUntilATokenIsIssued(@TempDir Path directory) throws Exception {
         Path bin = Files.createDirectory(directory.resolve("bin"));
         HelperShellFixture.writeTool(bin, "ip", "printf '127.0.0.1/32\\n'\n");
+        HelperShellFixture.writeTool(bin, "iptables", "exit 0\n");
         HelperShellFixture.writeTool(bin, "socat", "exit 0\n");
         List<String> requests = new CopyOnWriteArrayList<>();
         HttpServer server = metadataStandIn(requests, attempt -> attempt == 1 ? 403 : 200, "fixture-token");
         String name = "unit-" + UUID.randomUUID();
         try {
-            String[] command = Ec2MetadataProxy.startCommand(name, "127.0.0.1", 80, "127.0.0.1", 9169,
+            String[] command = Ec2MetadataProxy.startCommand(name, "127.0.0.1", 80, 18080, "127.0.0.1", 9169,
                     Ec2MetadataProxy.imdsProbeCommand("http://127.0.0.1:" + server.getAddress().getPort()));
 
             int result = HelperShellFixture.run(command, directory,
@@ -283,12 +391,13 @@ class Ec2MetadataProxyTest {
         Path bin = Files.createDirectory(directory.resolve("bin"));
         Path proxyStarted = directory.resolve("proxy-started");
         HelperShellFixture.writeTool(bin, "ip", "printf '127.0.0.1/32\\n'\n");
+        HelperShellFixture.writeTool(bin, "iptables", "exit 0\n");
         HelperShellFixture.writeTool(bin, "socat", ": > '" + proxyStarted + "'\n");
         String name = "unit-" + UUID.randomUUID();
         try {
             // This JVM is alive, and it is not the proxy.
             Files.writeString(Path.of("/tmp/floci-" + name + "-proxy.pid"), ProcessHandle.current().pid() + "\n");
-            String[] command = Ec2MetadataProxy.startCommand(name, "127.0.0.1", 80, "127.0.0.1", 9169,
+            String[] command = Ec2MetadataProxy.startCommand(name, "127.0.0.1", 80, 18080, "127.0.0.1", 9169,
                     "[ -f '" + proxyStarted + "' ] && exit 0");
 
             int result = HelperShellFixture.run(command, directory, Map.of("PATH", bin + ":" + System.getenv("PATH")));
@@ -312,11 +421,12 @@ class Ec2MetadataProxyTest {
         Path bin = Files.createDirectory(directory.resolve("bin"));
         Path proxyStarted = directory.resolve("proxy-started");
         HelperShellFixture.writeTool(bin, "ip", "printf '127.0.0.1/32\\n'\n");
+        HelperShellFixture.writeTool(bin, "iptables", "exit 0\n");
         HelperShellFixture.writeTool(bin, "socat", ": > '" + proxyStarted + "'\n");
         String name = "unit-" + UUID.randomUUID();
         String pidFile = "/tmp/floci-" + name + "-proxy.pid";
         try {
-            String[] command = Ec2MetadataProxy.startCommand(name, "127.0.0.1", 80, "127.0.0.1", 9169,
+            String[] command = Ec2MetadataProxy.startCommand(name, "127.0.0.1", 80, 18080, "127.0.0.1", 9169,
                     "[ -f '" + proxyStarted + "' ] && exit 0");
             // The script's own shell takes the recorded pid, as a reused pid would after a restart.
             command[2] = command[2].replaceFirst("set -eu\n", "set -eu\necho \\$\\$ > " + pidFile + "\n");
