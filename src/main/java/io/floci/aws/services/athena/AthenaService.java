@@ -94,6 +94,9 @@ public class AthenaService {
             "^(?:SELECT|WITH|SHOW|DESCRIBE|DESC|EXPLAIN|VALUES)\\b",
             Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
 
+    private static final Pattern DECIMAL_TYPE_PATTERN =
+            Pattern.compile("DECIMAL\\((\\d+),(\\d+)\\)");
+
     private final StorageBackend<String, QueryExecution> queryStore;
     private final StorageBackend<String, WorkGroup> workGroupStore;
     private final StorageBackend<String, DataCatalog> dataCatalogStore;
@@ -542,7 +545,78 @@ public class AthenaService {
             return new ResultSet(List.of(), new ResultSet.ResultSetMetadata(List.of()));
         }
 
-        return readResultsFromS3(execution.getResultConfiguration().getOutputLocation(), id);
+        return readResultsFromS3(execution.getResultConfiguration().getOutputLocation(), id,
+                describeColumnTypes(execution));
+    }
+
+    /**
+     * Asks DuckDB for the result column types of the executed query so GetQueryResults
+     * can report the real Athena types instead of "varchar" for every column. Any
+     * failure degrades to the previous behavior: parseCsv reports "varchar".
+     */
+    private List<String> describeColumnTypes(QueryExecution execution) {
+        try {
+            String database = execution.getQueryExecutionContext() != null
+                    && execution.getQueryExecutionContext().getDatabase() != null
+                    ? execution.getQueryExecutionContext().getDatabase() : "default";
+            List<Map<String, Object>> rows = duckClient.query(
+                    "DESCRIBE " + statementText(execution.getQuery()), ddlBuilder.build(database));
+            List<String> types = new ArrayList<>();
+            for (Map<String, Object> row : rows) {
+                Object raw = row.get("column_type");
+                types.add(duckDbTypeToAthena(raw == null ? null : raw.toString()));
+            }
+            return types;
+        } catch (Exception e) {
+            LOG.debugv("Could not describe result columns for {0}: {1}",
+                    execution.getQueryExecutionId(), e.getMessage());
+            return List.of();
+        }
+    }
+
+    /**
+     * Maps a DuckDB column type, as reported by DESCRIBE, to the Athena type name
+     * real Athena reports in ColumnInfo. Complex types (struct, array, map) fall
+     * back to "varchar", matching GetTableMetadata's glueTypeToAthena, and anything
+     * unrecognized does the same so a new DuckDB type can never break results.
+     */
+    static String duckDbTypeToAthena(String duckType) {
+        if (duckType == null || duckType.isBlank()) {
+            return "varchar";
+        }
+        String type = duckType.strip().toUpperCase(Locale.ROOT);
+        Matcher decimal = DECIMAL_TYPE_PATTERN.matcher(type);
+        if (decimal.matches()) {
+            return "decimal(" + decimal.group(1) + "," + decimal.group(2) + ")";
+        }
+        if (type.startsWith("VARCHAR(")) {
+            return "varchar";
+        }
+        if (type.startsWith("CHAR(")) {
+            return "char";
+        }
+        return switch (type) {
+            case "BOOLEAN", "BOOL" -> "boolean";
+            case "TINYINT", "INT1" -> "tinyint";
+            case "SMALLINT", "INT2" -> "smallint";
+            case "INTEGER", "INT", "INT4" -> "integer";
+            case "BIGINT", "INT8" -> "bigint";
+            case "UTINYINT" -> "smallint";
+            case "USMALLINT" -> "integer";
+            case "UINTEGER" -> "bigint";
+            case "UBIGINT" -> "decimal(20,0)";
+            case "HUGEINT" -> "decimal(38,0)";
+            case "DOUBLE", "FLOAT8" -> "double";
+            case "FLOAT", "FLOAT4", "REAL" -> "float";
+            case "DECIMAL" -> "decimal(18,3)";
+            case "DATE" -> "date";
+            case "TIMESTAMP", "TIMESTAMP_NS", "TIMESTAMP_MS", "TIMESTAMP_S" -> "timestamp";
+            case "TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ" -> "timestamp with time zone";
+            case "BLOB" -> "varbinary";
+            case "VARCHAR" -> "varchar";
+            case "CHAR", "BPCHAR" -> "char";
+            default -> "varchar";
+        };
     }
 
     // ── private helpers ───────────────────────────────────────────────────────
@@ -1091,7 +1165,7 @@ public class AthenaService {
         }
     }
 
-    private ResultSet readResultsFromS3(String outputLocation, String queryId) {
+    private ResultSet readResultsFromS3(String outputLocation, String queryId, List<String> columnTypes) {
         try {
             String bucket = extractBucket(outputLocation);
             String prefix = extractKey(outputLocation);
@@ -1109,14 +1183,14 @@ public class AthenaService {
                 return emptyResultSet();
             }
 
-            return parseCsv(csv.get().getData());
+            return parseCsv(csv.get().getData(), columnTypes);
         } catch (Exception e) {
             LOG.warnv("Could not read query results for {0}: {1}", queryId, e.getMessage());
             return emptyResultSet();
         }
     }
 
-    private ResultSet parseCsv(byte[] data) {
+    private ResultSet parseCsv(byte[] data, List<String> columnTypes) {
         List<ResultSet.Row> rows = new ArrayList<>();
         List<ResultSet.ColumnInfo> columns = new ArrayList<>();
 
@@ -1129,8 +1203,9 @@ public class AthenaService {
             }
 
             String[] headers = CsvParser.parseLine(headerLine).toArray(String[]::new);
-            for (String h : headers) {
-                columns.add(new ResultSet.ColumnInfo(DEFAULT_CATALOG, "", "", h, "varchar"));
+            for (int i = 0; i < headers.length; i++) {
+                String columnType = i < columnTypes.size() ? columnTypes.get(i) : "varchar";
+                columns.add(new ResultSet.ColumnInfo(DEFAULT_CATALOG, "", "", headers[i], columnType));
             }
 
             // Header row is included in GetQueryResults per AWS spec
