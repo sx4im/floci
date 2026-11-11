@@ -1768,6 +1768,64 @@ class ResourceArnBuilderTest {
         assertEquals("arn:aws:s3:::my-bucket/folder/", arn);
     }
 
+    /**
+     * A key that starts with a slash ({@code /email.txt}, sent as {@code /bucket//email.txt})
+     * is checked against the ARN of that key, not of {@code email.txt}: JAX-RS collapses the
+     * double slash in the path, but the object is stored under the key as sent, so the ARN is
+     * built from the raw path the way {@code S3Controller} reads the key. The same key under
+     * any object action names the same ARN.
+     */
+    @Test
+    void s3LeadingSlashKeyIsCheckedAgainstItsOwnArn() {
+        when(uriInfo.getPath()).thenReturn("/slash-demo/email.txt");
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost/slash-demo//email.txt"));
+        assertEquals("arn:aws:s3:::slash-demo//email.txt",
+                builder.build("s3", ctx, "us-east-1", "000000000000"));
+        assertEquals(List.of("arn:aws:s3:::slash-demo//email.txt"),
+                builder.buildResources("s3", "s3:GetObject", ctx, "us-east-1", ACCOUNT, "aws"));
+        assertEquals(List.of("arn:aws:s3:::slash-demo//email.txt"),
+                builder.buildResources("s3", "s3:DeleteObject", ctx, "us-east-1", ACCOUNT, "aws"));
+    }
+
+    /**
+     * The same leading-slash key under virtual-hosted addressing, where S3VirtualHostFilter
+     * rewrote the request URI to {@code /slash-demo//email.txt}: the ARN still carries the
+     * double slash, so a policy naming the object as sent allows the write.
+     */
+    @Test
+    void s3LeadingSlashKeyVirtualHostedIsCheckedAgainstItsOwnArn() {
+        when(uriInfo.getPath()).thenReturn("/slash-demo/email.txt");
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost/slash-demo//email.txt"));
+        assertEquals(List.of("arn:aws:s3:::slash-demo//email.txt"),
+                builder.buildResources("s3", "s3:PutObject", ctx, "us-east-1", ACCOUNT, "aws"));
+    }
+
+    /** A folder marker whose key itself starts with a slash keeps both slashes in its ARN. */
+    @Test
+    void s3LeadingSlashFolderMarkerKeepsBothSlashes() {
+        when(uriInfo.getPath()).thenReturn("/my-bucket/folder/");
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost/my-bucket//folder/"));
+        assertEquals("arn:aws:s3:::my-bucket//folder/",
+                builder.build("s3", ctx, "us-east-1", "000000000000"));
+    }
+
+    /** A bucket-level request names no key, so the raw path changes nothing: the bucket ARN. */
+    @Test
+    void s3BucketArnWhenRawPathNamesNoKey() {
+        when(uriInfo.getPath()).thenReturn("/my-bucket/");
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost/my-bucket/"));
+        assertEquals("arn:aws:s3:::my-bucket", builder.build("s3", ctx, "us-east-1", "000000000000"));
+    }
+
+    /** A percent-encoded key is checked against its decoded ARN, as the collapsed path reads it. */
+    @Test
+    void s3EncodedKeyIsCheckedAgainstItsDecodedArn() {
+        when(uriInfo.getPath()).thenReturn("/my-bucket/my file.txt");
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost/my-bucket/my%20file.txt"));
+        assertEquals("arn:aws:s3:::my-bucket/my file.txt",
+                builder.build("s3", ctx, "us-east-1", "000000000000"));
+    }
+
     // ── S3 Control ─────────────────────────────────────────────────────────────
 
     /**

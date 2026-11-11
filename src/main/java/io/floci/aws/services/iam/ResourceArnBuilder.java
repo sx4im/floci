@@ -21,6 +21,7 @@ import io.floci.aws.services.lambda.LambdaArnUtils;
 import io.floci.aws.services.lambda.durable.DurableTokens;
 import io.floci.aws.services.lambdamicrovms.LambdaMicrovmsService;
 import io.floci.aws.services.s3.S3ControlArnUtils;
+import io.floci.aws.services.s3.S3ObjectKeys;
 import io.floci.aws.services.secretsmanager.SecretsManagerService;
 import io.floci.aws.services.sqs.SqsService;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -31,6 +32,7 @@ import jakarta.ws.rs.container.ContainerRequestContext;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -195,7 +197,7 @@ public class ResourceArnBuilder {
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
         }
-        String path = "s3".equals(credentialScope) ? ctx.getUriInfo().getPath()
+        String path = "s3".equals(credentialScope) ? s3ArnPath(operation, ctx)
                 : IamActionRegistry.decodedPath(ctx);
         return switch (credentialScope) {
             case "s3"             -> buildS3Resources(operation, path, region);
@@ -842,6 +844,40 @@ public class ResourceArnBuilder {
     // ── S3 ──────────────────────────────────────────────────────────────────────
     // Minted in the request's partition; IamEnforcementFilter re-mints an existing bucket's ARN
     // in the bucket's own partition through S3ResourcePolicyProvider before any policy sees it.
+
+    /**
+     * The path an S3 data-plane request is checked against, read from the path as it arrived.
+     * JAX-RS collapses consecutive slashes in {@code UriInfo.getPath()}, so a key that starts
+     * with a slash ({@code /email.txt}, sent as {@code /bucket//email.txt}) would otherwise be
+     * checked against the ARN of another object, while {@code S3Controller} stores it under the
+     * key as sent. The key is read the same way the controller and the IAM condition resolver
+     * read it ({@link S3ObjectKeys#fromRawPath}), so the check names the object the request
+     * writes. S3 Control tagging routes name their resource by ARN in the path and keep the
+     * collapsed path, as do requests whose raw path is unavailable or names no key.
+     */
+    private String s3ArnPath(String operation, ContainerRequestContext ctx) {
+        String path = ctx.getUriInfo().getPath();
+        if (operation != null && (operation.equals("s3:ListTagsForResource")
+                || operation.equals("s3:TagResource") || operation.equals("s3:UntagResource"))) {
+            return path;
+        }
+        URI requestUri = ctx.getUriInfo().getRequestUri();
+        if (requestUri == null || requestUri.getRawPath() == null) {
+            return path;
+        }
+        String stripped = path.startsWith("/") ? path.substring(1) : path;
+        int firstSlash = stripped.indexOf('/');
+        String bucket = firstSlash < 0 ? stripped : stripped.substring(0, firstSlash);
+        if (bucket.isEmpty()) {
+            return path;
+        }
+        String key = S3ObjectKeys.fromRawPath(requestUri.getRawPath(), requestUri.getPath(), bucket);
+        if (key == null || key.isEmpty()) {
+            return path;
+        }
+        return "/" + bucket + "/" + key;
+    }
+
     private String buildS3Arn(String path, String region) {
         // path: /bucket or /bucket/key
         String partition = AwsRegions.partitionFor(region);
