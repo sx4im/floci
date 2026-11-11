@@ -3,6 +3,7 @@ package io.floci.aws.services.lambda.launcher;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.ContainerConfig;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.Digests;
@@ -48,6 +49,7 @@ import java.nio.file.StandardCopyOption;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -82,6 +84,16 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private static final Logger LOG = Logger.getLogger(ContainerLauncher.class);
     private static final String TASK_DIR = "/var/task";
     private static final String RUNTIME_DIR = "/var/runtime";
+
+    /**
+     * The uid:gid image functions run as by default. AWS never runs an image as the image's own
+     * USER: it assigns a per-sandbox least-privilege user and documents no fixed uid, so any
+     * fixed non-root uid reproduces the semantics. {@code nobody} (65534:65534) is the obvious
+     * choice. An explicit user (the docker --user flag or an EFS mount user) suppresses it.
+     */
+    static final String DEFAULT_IMAGE_FUNCTION_USER = "65534:65534";
+    /** How many tar entries the working-directory probe scans before giving up and failing open. */
+    private static final int MAX_WORKDIR_PROBE_ENTRIES = 64;
 
     /**
      * Default base prefix for the containers and code volumes Lambda spawns: the prefix this
@@ -399,6 +411,16 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             specBuilder.withReadOnlyBind(hostPath, "/opt/aws-config");
         });
 
+        // Image functions run as a fixed non-root user by default: AWS never runs an image as
+        // the image's own USER, so keeping it would let a WORKDIR that fails on AWS (a directory
+        // the least-privilege runtime user cannot enter) start here instead. An explicit user
+        // (the docker --user flag or an EFS mount user) suppresses the default.
+        boolean efsMountUser = fn.getFileSystemConfigs() != null && !fn.getFileSystemConfigs().isEmpty()
+                && config.storage().efs().mountUser().isPresent();
+        if ("Image".equals(fn.getPackageType()) && dockerFlags.user() == null && !efsMountUser) {
+            specBuilder.withUser(DEFAULT_IMAGE_FUNCTION_USER);
+        }
+
         ContainerSpec spec = specBuilder.build();
 
         // Create container without starting — provided.* runtimes exec
@@ -414,6 +436,11 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // Copy code into container via Docker API tar stream (works inside Docker too).
         // Hot-reload functions skip the tar-copy — the bind-mount already wires the host path.
         DockerClient dockerClient = lifecycleManager.getDockerClient();
+        // Fail fast when the fixed non-root user cannot enter the image's working directory:
+        // on AWS init fails with Runtime.InvalidEntrypoint in the same situation.
+        if ("Image".equals(fn.getPackageType())) {
+            verifyImageFunctionWorkingDirectory(dockerClient, containerId, fn, spec);
+        }
         if (!fn.isHotReload() && fn.getCodeLocalPath() != null) {
             Path codePath = Path.of(fn.getCodeLocalPath());
 
@@ -1575,6 +1602,163 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     EXTENSIONS_DIR, functionName, e.getMessage());
             return List.of();
         }
+    }
+
+    /**
+     * Verifies the user an image function runs as can enter the image's working directory, and
+     * fails the launch as {@code Runtime.InvalidEntrypoint} when it definitely cannot. Any doubt
+     * fails open: a missing directory, an unreadable probe, a named user, or a group-only grant
+     * with an unknown primary gid all let the launch proceed, because a false failure here would
+     * break functions AWS runs fine.
+     */
+    void verifyImageFunctionWorkingDirectory(DockerClient dockerClient, String containerId,
+                                           LambdaFunction fn, ContainerSpec spec) {
+        String user = null;
+        String workingDir = null;
+        try {
+            ContainerConfig containerConfig = dockerClient.inspectContainerCmd(containerId).exec().getConfig();
+            if (containerConfig != null) {
+                user = containerConfig.getUser();
+                workingDir = containerConfig.getWorkingDir();
+            }
+        } catch (Exception ignored) {
+            // Inspect is best-effort: the spec below carries the same values when it fails.
+        }
+        if (user == null || user.isBlank()) {
+            user = spec.user();
+        }
+        if (workingDir == null || workingDir.isBlank()) {
+            workingDir = spec.workingDir();
+        }
+        if (user == null || user.isBlank() || workingDir == null || workingDir.isBlank()) {
+            LOG.debugv("Skipping working-directory check for function {0}: user '{1}' or working "
+                    + "directory '{2}' is unknown", fn.getFunctionName(), user, workingDir);
+            return;
+        }
+        int[] userIds = parseUserId(user);
+        if (userIds == null) {
+            LOG.debugv("Skipping working-directory check for function {0}: user '{1}' is not numeric",
+                    fn.getFunctionName(), user);
+            return;
+        }
+        int uid = userIds[0];
+        int gid = userIds[1];
+        Set<Integer> gids = new HashSet<>();
+        if (gid >= 0) {
+            gids.add(gid);
+        }
+        if (spec.groupAdd() != null) {
+            for (String group : spec.groupAdd()) {
+                try {
+                    gids.add(Integer.parseInt(group.trim()));
+                } catch (NumberFormatException ignored) {
+                    // A named supplementary group cannot be matched against a numeric owner gid.
+                }
+            }
+        }
+        for (String directory : ancestorDirectories(workingDir)) {
+            TarArchiveEntry entry = probeWorkdirEntry(dockerClient, containerId, directory);
+            if (entry == null || entry.isSymbolicLink() || !entry.isDirectory()) {
+                // Missing, unreadable, a link or not a directory: fail open, the runtime decides.
+                return;
+            }
+            int mode = entry.getMode();
+            if (!canTraverseAs(mode, (int) entry.getUserId(), (int) entry.getGroupId(), uid, gids)) {
+                if (gid < 0 && (mode & 0010) != 0) {
+                    // The only possible grant is the group bit, but the primary gid is unknown
+                    // (a bare "uid" user): the real gid may match, so fail open.
+                    return;
+                }
+                throw new RuntimeException("Runtime.InvalidEntrypoint: function '" + fn.getFunctionName()
+                        + "' cannot enter working directory '" + workingDir + "' as user '" + user
+                        + "': directory '" + directory + "' has mode " + String.format("%04o", mode)
+                        + " and is owned by " + entry.getUserId() + ":" + entry.getGroupId()
+                        + " (image functions run as a fixed non-root user, not the image USER)");
+            }
+        }
+    }
+
+    /**
+     * Reads one working-directory ancestor through the Docker archive API (the same probe
+     * {@link #listExtensionBinaries} uses for /opt/extensions) and returns its tar entry, or
+     * null when the directory is missing, unreadable, or the archive holds no entry for it.
+     */
+    private TarArchiveEntry probeWorkdirEntry(DockerClient dockerClient, String containerId,
+                                             String directory) {
+        try (InputStream tarStream = dockerClient.copyArchiveFromContainerCmd(containerId, directory).exec();
+             TarArchiveInputStream tar = new TarArchiveInputStream(tarStream)) {
+            String wanted = directory.substring(directory.lastIndexOf('/') + 1);
+            int scanned = 0;
+            TarArchiveEntry entry;
+            while ((entry = tar.getNextEntry()) != null && scanned < MAX_WORKDIR_PROBE_ENTRIES) {
+                scanned++;
+                String name = entry.getName();
+                if (name.startsWith("./")) {
+                    name = name.substring(2);
+                }
+                if (name.equals(wanted) || name.equals(wanted + "/")) {
+                    return entry;
+                }
+            }
+            return null;
+        } catch (Exception ignored) {
+            // A probe that cannot be read proves nothing; the launch proceeds and the
+            // runtime decides whether the directory is usable.
+            return null;
+        }
+    }
+
+    /** Parses a docker "uid[:gid]" user into {uid, gid} (gid -1 when absent), or null when not numeric. */
+    static int[] parseUserId(String user) {
+        if (user == null || user.isBlank()) {
+            return null;
+        }
+        String[] parts = user.split(":", -1);
+        if (parts.length > 2) {
+            return null;
+        }
+        try {
+            int uid = Integer.parseInt(parts[0]);
+            int gid = parts.length == 2 ? Integer.parseInt(parts[1]) : -1;
+            return new int[]{uid, gid};
+        } catch (NumberFormatException ignored) {
+            // A named user (e.g. "nonroot") has no numeric id to check against.
+            return null;
+        }
+    }
+
+    /** The ancestors of a working directory below "/": "/home/nonroot" gives ["/home", "/home/nonroot"]. */
+    static List<String> ancestorDirectories(String workingDir) {
+        if (workingDir == null || workingDir.isBlank()) {
+            return List.of();
+        }
+        String normalized = workingDir.endsWith("/") && workingDir.length() > 1
+                ? workingDir.substring(0, workingDir.length() - 1) : workingDir;
+        if (!normalized.startsWith("/")) {
+            normalized = "/" + normalized;
+        }
+        if (normalized.equals("/")) {
+            return List.of();
+        }
+        List<String> ancestors = new ArrayList<>();
+        int slash = normalized.indexOf('/', 1);
+        while (slash >= 0) {
+            ancestors.add(normalized.substring(0, slash));
+            slash = normalized.indexOf('/', slash + 1);
+        }
+        ancestors.add(normalized);
+        return ancestors;
+    }
+
+    /** Whether (uid, gids) may traverse a directory with the given mode and owner, by the usual unix rules. */
+    static boolean canTraverseAs(int mode, int ownerUid, int ownerGid, int uid, Set<Integer> gids) {
+        if ((mode & 0100) != 0 && ownerUid == uid) {
+            return true;
+        }
+        if ((mode & 0010) != 0 && gids.contains(ownerGid)) {
+            return true;
+        }
+        return (mode & 0001) != 0;
     }
 
     private static String extractRegionFromArn(String arn, String defaultRegion) {
