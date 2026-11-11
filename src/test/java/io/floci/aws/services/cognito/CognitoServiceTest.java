@@ -3295,6 +3295,59 @@ class CognitoServiceTest {
         assertEquals("UserNotFoundException", exception.getErrorCode());
     }
 
+    /**
+     * With user existence errors prevented, USER_PASSWORD_AUTH answers an unknown username the same
+     * way as a wrong password: NotAuthorizedException, so the two cannot be told apart.
+     */
+    @Test
+    void initiateAuthWithUserPasswordAuthHidesAnUnknownUserWhenPreventionIsEnabled() {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient client = clientWithFlows(pool, "ALLOW_USER_PASSWORD_AUTH");
+        service.describeUserPoolClient(client.getClientId()).setPreventUserExistenceErrors("ENABLED");
+
+        AwsException wrongPassword = assertThrows(AwsException.class, () -> service.initiateAuth(
+                client.getClientId(), "USER_PASSWORD_AUTH",
+                Map.of("USERNAME", "alice", "PASSWORD", "wrong")));
+        assertEquals("NotAuthorizedException", wrongPassword.getErrorCode());
+        assertEquals("Incorrect username or password", wrongPassword.getMessage());
+
+        AwsException unknownUser = assertThrows(AwsException.class, () -> service.initiateAuth(
+                client.getClientId(), "USER_PASSWORD_AUTH",
+                Map.of("USERNAME", "nobody", "PASSWORD", "anything")));
+        assertEquals("NotAuthorizedException", unknownUser.getErrorCode());
+        assertEquals("Incorrect username or password", unknownUser.getMessage());
+    }
+
+    /** The same hiding applies to the admin password flow, which shares the credential check. */
+    @Test
+    void adminInitiateAuthWithUserPasswordAuthHidesAnUnknownUserWhenPreventionIsEnabled() {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient client = clientWithFlows(pool, "ALLOW_ADMIN_USER_PASSWORD_AUTH");
+        service.describeUserPoolClient(client.getClientId()).setPreventUserExistenceErrors("ENABLED");
+
+        AwsException unknownUser = assertThrows(AwsException.class, () -> service.adminInitiateAuth(
+                pool.getId(), client.getClientId(), "ADMIN_USER_PASSWORD_AUTH",
+                Map.of("USERNAME", "nobody", "PASSWORD", "anything")));
+        assertEquals("NotAuthorizedException", unknownUser.getErrorCode());
+        assertEquals("Incorrect username or password", unknownUser.getMessage());
+    }
+
+    /** Without prevention, and for LEGACY clients, the unknown user still reports UserNotFound. */
+    @Test
+    void initiateAuthWithUserPasswordAuthKeepsUserNotFoundWhenPreventionIsNotEnabled() {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient unsetClient = clientWithFlows(pool, "ALLOW_USER_PASSWORD_AUTH");
+        UserPoolClient legacyClient = clientWithFlows(pool, "ALLOW_USER_PASSWORD_AUTH");
+        service.describeUserPoolClient(legacyClient.getClientId()).setPreventUserExistenceErrors("LEGACY");
+
+        for (UserPoolClient client : List.of(unsetClient, legacyClient)) {
+            AwsException exception = assertThrows(AwsException.class, () -> service.initiateAuth(
+                    client.getClientId(), "USER_PASSWORD_AUTH",
+                    Map.of("USERNAME", "nobody", "PASSWORD", "anything")));
+            assertEquals("UserNotFoundException", exception.getErrorCode());
+        }
+    }
+
     @Test
     void respondToAuthChallengeRejectsASimulatedUserSessionAfterExpiry() {
         MutableClock clock = new MutableClock();
