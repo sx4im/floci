@@ -667,6 +667,7 @@ public class ApiGatewayV2OpenApiImporter {
             request.put("integrationType", type.toUpperCase(Locale.ROOT));
         }
         putIfPresent(request, "credentialsArn", stringValue(definition.get("credentials")));
+        putIfPresent(request, "description", stringValue(definition.get("description")));
         putIfPresent(request, "integrationUri", stringValue(definition.get("uri")));
         putIfPresent(request, "integrationMethod", stringValue(definition.get("httpMethod")));
         putIfPresent(request, "connectionType", upper(stringValue(definition.get("connectionType"))));

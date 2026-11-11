@@ -22,15 +22,20 @@ public class Integration {
     private String connectionId;
 
     private String credentialsArn;
+    private String description;
 
     public Integration() {}
 
     public String getCredentialsArn() { return credentialsArn; }
     public void setCredentialsArn(String credentialsArn) { this.credentialsArn = credentialsArn; }
 
+    public String getDescription() { return description; }
+    public void setDescription(String description) { this.description = description; }
+
     /** Shallow copy. Add new fields here so callers like {@code withResolvedUri} keep them. */
     public Integration(Integration src) {
         this.credentialsArn = src.credentialsArn;
+        this.description = src.description;
         this.integrationId = src.integrationId;
         this.integrationType = src.integrationType;
         this.connectionType = src.connectionType;

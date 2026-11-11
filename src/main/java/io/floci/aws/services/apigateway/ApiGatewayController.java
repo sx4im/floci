@@ -2891,6 +2891,9 @@ public class ApiGatewayController {
         if (i.getIntegrationMethod() != null) {
             node.put("integrationMethod", i.getIntegrationMethod());
         }
+        if (i.getDescription() != null) {
+            node.put("description", i.getDescription());
+        }
         if (i.getTimeoutInMillis() != 0) {
             node.put("timeoutInMillis", i.getTimeoutInMillis());
         }

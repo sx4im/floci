@@ -343,4 +343,68 @@ class ApiGatewayV2JsonHandlerTest {
         // Cleanup
         given().when().delete("/v2/apis/" + localApiId).then().statusCode(204);
     }
+
+    @Test
+    @Order(21)
+    void json11IntegrationDescriptionRoundTripsThroughCreateUpdateAndGet() throws Exception {
+        String localApiId = given()
+                .contentType(AMZ_JSON)
+                .header("X-Amz-Target", TARGET_PREFIX + "CreateApi")
+                .header("Authorization", AUTH_HEADER)
+                .body("""
+                        {"Name":"desc-test","ProtocolType":"HTTP"}
+                        """)
+                .when().post("/")
+                .then().statusCode(201).extract().path("ApiId");
+
+        String createBody = given()
+                .contentType(AMZ_JSON)
+                .header("X-Amz-Target", TARGET_PREFIX + "CreateIntegration")
+                .header("Authorization", AUTH_HEADER)
+                .body("""
+                        {
+                          "ApiId": "%s",
+                          "IntegrationType": "HTTP_PROXY",
+                          "IntegrationMethod": "GET",
+                          "IntegrationUri": "https://example.com",
+                          "PayloadFormatVersion": "1.0",
+                          "Description": "probe"
+                        }
+                        """.formatted(localApiId))
+                .when().post("/")
+                .then().statusCode(201).extract().asString();
+
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode created = mapper.readTree(createBody);
+        String localIntegrationId = created.get("IntegrationId").asText();
+        Assertions.assertEquals("probe", created.get("Description").asText(),
+                "CreateIntegration response should include Description");
+
+        given()
+                .contentType(AMZ_JSON)
+                .header("X-Amz-Target", TARGET_PREFIX + "UpdateIntegration")
+                .header("Authorization", AUTH_HEADER)
+                .body("""
+                        {"ApiId":"%s","IntegrationId":"%s","Description":"probe2"}
+                        """.formatted(localApiId, localIntegrationId))
+                .when().post("/")
+                .then().statusCode(200)
+                .body("Description", equalTo("probe2"));
+
+        String getBody = given()
+                .contentType(AMZ_JSON)
+                .header("X-Amz-Target", TARGET_PREFIX + "GetIntegration")
+                .header("Authorization", AUTH_HEADER)
+                .body("""
+                        {"ApiId":"%s","IntegrationId":"%s"}
+                        """.formatted(localApiId, localIntegrationId))
+                .when().post("/")
+                .then().statusCode(200).extract().asString();
+
+        Assertions.assertEquals("probe2", mapper.readTree(getBody).get("Description").asText(),
+                "GetIntegration should return the updated Description");
+
+        // Cleanup
+        given().when().delete("/v2/apis/" + localApiId).then().statusCode(204);
+    }
 }
