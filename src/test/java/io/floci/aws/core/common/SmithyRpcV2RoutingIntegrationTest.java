@@ -8,6 +8,9 @@ import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
+
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.equalTo;
@@ -185,5 +188,146 @@ class SmithyRpcV2RoutingIntegrationTest {
         .then()
             .statusCode(200)
             .contentType("application/x-amz-cbor-1.1");
+    }
+
+    // --- generic JSON-service routing (floci-io/floci#7983) ---
+    //
+    // Every JSON-protocol service answers over smithy-rpc-v2-cbor through the
+    // same JSON controllers its JSON requests already go through, so each
+    // test below sends one operation per service over CBOR and asserts the
+    // service's own answer comes back. List operations take an empty request
+    // and create no state, so these tests are order-independent.
+
+    private byte[] postRpcV2(String serviceId, String operation, Object request) throws Exception {
+        return given()
+            .contentType("application/cbor")
+            .accept("application/cbor")
+            .header("smithy-protocol", "rpc-v2-cbor")
+            .body(CBOR_MAPPER.writeValueAsBytes(request))
+        .when()
+            .post("/service/" + serviceId + "/operation/" + operation)
+        .then()
+            .statusCode(200)
+            .header("smithy-protocol", equalTo("rpc-v2-cbor"))
+            .contentType("application/cbor")
+            .extract().asByteArray();
+    }
+
+    @Test
+    void codeBuildListProjectsRoutesGenerically() throws Exception {
+        byte[] response = postRpcV2("CodeBuild_20161006", "ListProjects", JSON_MAPPER.createObjectNode());
+
+        assertThat(CBOR_MAPPER.readTree(response).path("projects").isArray(), equalTo(true));
+    }
+
+    @Test
+    void codeDeployListApplicationsRoutesGenerically() throws Exception {
+        byte[] response = postRpcV2("CodeDeploy_20141006", "ListApplications", JSON_MAPPER.createObjectNode());
+
+        assertThat(CBOR_MAPPER.readTree(response).path("applications").isArray(), equalTo(true));
+    }
+
+    @Test
+    void codePipelineListPipelinesRoutesGenerically() throws Exception {
+        byte[] response = postRpcV2("CodePipeline_20150709", "ListPipelines", JSON_MAPPER.createObjectNode());
+
+        assertThat(CBOR_MAPPER.readTree(response).path("pipelines").isArray(), equalTo(true));
+    }
+
+    @Test
+    void comprehendDetectDominantLanguageRoutesGenerically() throws Exception {
+        byte[] response = postRpcV2("Comprehend_20171127", "DetectDominantLanguage",
+                JSON_MAPPER.readTree("{\"Text\": \"Hello world\"}"));
+
+        assertThat(CBOR_MAPPER.readTree(response).path("Languages").isArray(), equalTo(true));
+    }
+
+    @Test
+    void dataSyncListTasksRoutesGenerically() throws Exception {
+        byte[] response = postRpcV2("FmrsService", "ListTasks", JSON_MAPPER.createObjectNode());
+
+        assertThat(CBOR_MAPPER.readTree(response).path("Tasks").isArray(), equalTo(true));
+    }
+
+    @Test
+    void memoryDbDescribeClustersRoutesGenerically() throws Exception {
+        byte[] response = postRpcV2("AmazonMemoryDB", "DescribeClusters", JSON_MAPPER.createObjectNode());
+
+        assertThat(CBOR_MAPPER.readTree(response).path("Clusters").isArray(), equalTo(true));
+    }
+
+    @Test
+    void networkFirewallListFirewallsRoutesGenerically() throws Exception {
+        byte[] response = postRpcV2("NetworkFirewall_20201112", "ListFirewalls", JSON_MAPPER.createObjectNode());
+
+        assertThat(CBOR_MAPPER.readTree(response).path("Firewalls").isArray(), equalTo(true));
+    }
+
+    @Test
+    void resourceGroupsTaggingGetResourcesRoutesGenerically() throws Exception {
+        byte[] response = postRpcV2("ResourceGroupsTaggingAPI_20170126", "GetResources",
+                JSON_MAPPER.createObjectNode());
+
+        assertThat(CBOR_MAPPER.readTree(response).path("ResourceTagMappingList").isArray(), equalTo(true));
+    }
+
+    @Test
+    void serviceCatalogListPortfoliosRoutesGenerically() throws Exception {
+        byte[] response = postRpcV2("AWS242ServiceCatalogService", "ListPortfolios",
+                JSON_MAPPER.createObjectNode());
+
+        assertThat(CBOR_MAPPER.readTree(response).path("PortfolioDetails").isArray(), equalTo(true));
+    }
+
+    @Test
+    void cloudMapListNamespacesRoutesGenerically() throws Exception {
+        byte[] response = postRpcV2("Route53AutoNaming_v20170314", "ListNamespaces",
+                JSON_MAPPER.createObjectNode());
+
+        assertThat(CBOR_MAPPER.readTree(response).path("Namespaces").isArray(), equalTo(true));
+    }
+
+    @Test
+    void textractDetectDocumentTextRoutesGenerically() throws Exception {
+        // Document.Bytes travels as a CBOR byte string: the blob the issue
+        // calls out. Textract ignores the bytes beyond the mock lookup, so
+        // any bytes do; the stub Blocks come back.
+        byte[] response = postRpcV2("Textract", "DetectDocumentText",
+                Map.of("Document", Map.of("Bytes", "hello".getBytes(StandardCharsets.UTF_8))));
+
+        assertThat(CBOR_MAPPER.readTree(response).path("Blocks").isArray(), equalTo(true));
+    }
+
+    @Test
+    void transcribeListTranscriptionJobsRoutesGenerically() throws Exception {
+        byte[] response = postRpcV2("Transcribe", "ListTranscriptionJobs", JSON_MAPPER.createObjectNode());
+
+        assertThat(CBOR_MAPPER.readTree(response).path("TranscriptionJobSummaries").isArray(), equalTo(true));
+    }
+
+    @Test
+    void cloudHsmDescribeClustersRoutesGenerically() throws Exception {
+        byte[] response = postRpcV2("BaldrApiService", "DescribeClusters", JSON_MAPPER.createObjectNode());
+
+        assertThat(CBOR_MAPPER.readTree(response).path("Clusters").isArray(), equalTo(true));
+    }
+
+    @Test
+    void translateTextRoutesGenerically() throws Exception {
+        byte[] response = postRpcV2("AWSShineFrontendService_20170701", "TranslateText",
+                JSON_MAPPER.readTree("{\"Text\": \"Hello\","
+                        + " \"SourceLanguageCode\": \"en\", \"TargetLanguageCode\": \"es\"}"));
+
+        assertThat(CBOR_MAPPER.readTree(response).path("TranslatedText").asText(), equalTo("Hello"));
+    }
+
+    @Test
+    void swfListDomainsRoutesGenericallyThroughJson10() throws Exception {
+        // SWF is a JSON 1.0-only service, so this also covers the fallback
+        // from the JSON 1.1 controller to the JSON 1.0 controller.
+        byte[] response = postRpcV2("SimpleWorkflowService", "ListDomains",
+                JSON_MAPPER.readTree("{\"registrationStatus\": \"REGISTERED\"}"));
+
+        assertThat(CBOR_MAPPER.readTree(response).path("domainInfos").isArray(), equalTo(true));
     }
 }
