@@ -2204,6 +2204,109 @@ class DynamoDbServiceTest {
         assertFalse(notifs.has("sms"), "sms should be removed");
     }
 
+    /**
+     * Test REMOVE with several list-index actions in one expression.
+     * Reproduces GitHub issue #7971: every action addresses the item as it
+     * was before the update, so REMOVE L[0], L[2] on ["zero","one","two"]
+     * removes the original elements 0 and 2 and leaves ["one"].
+     */
+    @Test
+    void removeMultipleListIndexesAddressesOriginalList() {
+        String region = "eu-west-1";
+        createUsersTable(region);
+
+        ObjectNode initialItem = item("userId", "remove-repro");
+        ObjectNode listValue = mapper.createObjectNode();
+        ArrayNode list = listValue.putArray("L");
+        list.add(attributeValue("S", "zero"));
+        list.add(attributeValue("S", "one"));
+        list.add(attributeValue("S", "two"));
+        initialItem.set("L", listValue);
+        service.putItem("Users", initialItem, region);
+
+        DynamoDbService.UpdateResult result = service.updateItem("Users",
+                userIdKey("remove-repro"), null,
+                "REMOVE L[0], L[2]", null, null, "ALL_NEW", region);
+
+        JsonNode updatedList = result.newItem().get("L").get("L");
+        assertEquals(1, updatedList.size());
+        assertEquals("one", updatedList.get(0).get("S").asText());
+    }
+
+    @Test
+    void removeMultipleListIndexesInReverseOrder() {
+        String region = "eu-west-1";
+        createUsersTable(region);
+
+        ObjectNode initialItem = item("userId", "remove-repro-reverse");
+        ObjectNode listValue = mapper.createObjectNode();
+        ArrayNode list = listValue.putArray("L");
+        list.add(attributeValue("S", "zero"));
+        list.add(attributeValue("S", "one"));
+        list.add(attributeValue("S", "two"));
+        initialItem.set("L", listValue);
+        service.putItem("Users", initialItem, region);
+
+        DynamoDbService.UpdateResult result = service.updateItem("Users",
+                userIdKey("remove-repro-reverse"), null,
+                "REMOVE L[2], L[0]", null, null, "ALL_NEW", region);
+
+        JsonNode updatedList = result.newItem().get("L").get("L");
+        assertEquals(1, updatedList.size());
+        assertEquals("one", updatedList.get(0).get("S").asText());
+    }
+
+    @Test
+    void removeListIndexAndWholeAttributeTogether() {
+        String region = "eu-west-1";
+        createUsersTable(region);
+
+        ObjectNode initialItem = item("userId", "remove-repro-mixed");
+        ObjectNode listValue = mapper.createObjectNode();
+        ArrayNode list = listValue.putArray("L");
+        list.add(attributeValue("S", "zero"));
+        list.add(attributeValue("S", "one"));
+        list.add(attributeValue("S", "two"));
+        initialItem.set("L", listValue);
+        initialItem.set("note", attributeValue("S", "gone"));
+        service.putItem("Users", initialItem, region);
+
+        DynamoDbService.UpdateResult result = service.updateItem("Users",
+                userIdKey("remove-repro-mixed"), null,
+                "REMOVE L[0], note", null, null, "ALL_NEW", region);
+
+        JsonNode updated = result.newItem();
+        JsonNode updatedList = updated.get("L").get("L");
+        assertEquals(2, updatedList.size());
+        assertEquals("one", updatedList.get(0).get("S").asText());
+        assertEquals("two", updatedList.get(1).get("S").asText());
+        assertFalse(updated.has("note"), "note should be removed");
+    }
+
+    @Test
+    void removeListIndexOutOfRangeIsSkipped() {
+        String region = "eu-west-1";
+        createUsersTable(region);
+
+        ObjectNode initialItem = item("userId", "remove-repro-range");
+        ObjectNode listValue = mapper.createObjectNode();
+        ArrayNode list = listValue.putArray("L");
+        list.add(attributeValue("S", "zero"));
+        list.add(attributeValue("S", "one"));
+        list.add(attributeValue("S", "two"));
+        initialItem.set("L", listValue);
+        service.putItem("Users", initialItem, region);
+
+        DynamoDbService.UpdateResult result = service.updateItem("Users",
+                userIdKey("remove-repro-range"), null,
+                "REMOVE L[0], L[5]", null, null, "ALL_NEW", region);
+
+        JsonNode updatedList = result.newItem().get("L").get("L");
+        assertEquals(2, updatedList.size());
+        assertEquals("one", updatedList.get(0).get("S").asText());
+        assertEquals("two", updatedList.get(1).get("S").asText());
+    }
+
     @Test
     void updateItemAddResolvesNestedPlaceholderPath() {
         String region = "eu-west-1";

@@ -3715,6 +3715,12 @@ public class DynamoDbService {
 
     private String applyRemoveClause(ObjectNode item, String clause, JsonNode exprAttrNames,
                                      List<String> touched) {
+        // Collect every action first. DynamoDB evaluates all actions in one
+        // UpdateExpression against the item as it was before the update, so
+        // REMOVE L[0], L[2] removes the original elements 0 and 2. Applying
+        // the removals in written order would shift the list after L[0] and
+        // make L[2] resolve to the wrong element (or skip it entirely).
+        List<String> attrParts = new ArrayList<>();
         while (!clause.isEmpty()) {
             String upper = clause.toUpperCase();
             if (upper.startsWith("SET ") || upper.startsWith("ADD ") || upper.startsWith("DELETE ")) {
@@ -3740,9 +3746,48 @@ public class DynamoDbService {
             }
 
             touched.add(attrPart);
+            attrParts.add(attrPart);
+        }
+
+        // Apply list-index removals highest-index-first, and deeper paths
+        // before the paths that contain them, so no removal shifts an index
+        // or deletes a container that a later removal still has to resolve.
+        attrParts.sort((a, b) -> compareRemovePaths(parsePath(a, exprAttrNames), parsePath(b, exprAttrNames)));
+        for (String attrPart : attrParts) {
             removeValueAtPath(item, attrPart, exprAttrNames);
         }
         return clause;
+    }
+
+    /**
+     * Order REMOVE actions so each one resolves against the pre-update item:
+     * at the first token where two paths differ, the larger list index goes
+     * first; a path that extends another (a removal inside a container that a
+     * second action removes wholesale) goes first as well. Plain attribute
+     * removals are unaffected by order, so any deterministic order will do.
+     */
+    private static int compareRemovePaths(List<Object> a, List<Object> b) {
+        int shared = Math.min(a.size(), b.size());
+        for (int i = 0; i < shared; i++) {
+            Object x = a.get(i);
+            Object y = b.get(i);
+            if (x instanceof Long lx && y instanceof Long ly) {
+                int cmp = Long.compare(ly, lx);
+                if (cmp != 0) {
+                    return cmp;
+                }
+            } else if (x instanceof String sx && y instanceof String sy) {
+                int cmp = sy.compareTo(sx);
+                if (cmp != 0) {
+                    return cmp;
+                }
+            } else if (x instanceof Long) {
+                return -1;
+            } else {
+                return 1;
+            }
+        }
+        return Integer.compare(b.size(), a.size());
     }
 
     private String applyAddClause(ObjectNode item, String clause,
