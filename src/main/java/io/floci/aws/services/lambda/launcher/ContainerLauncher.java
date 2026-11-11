@@ -2,6 +2,7 @@ package io.floci.aws.services.lambda.launcher;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.ExecCreateCmd;
+import com.github.dockerjava.api.command.InspectImageResponse;
 import com.github.dockerjava.api.exception.NotFoundException;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
@@ -414,6 +415,9 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // Copy code into container via Docker API tar stream (works inside Docker too).
         // Hot-reload functions skip the tar-copy — the bind-mount already wires the host path.
         DockerClient dockerClient = lifecycleManager.getDockerClient();
+        if ("Image".equals(fn.getPackageType())) {
+            checkImageWorkdirAccessible(dockerClient, containerId, fn, image);
+        }
         if (!fn.isHotReload() && fn.getCodeLocalPath() != null) {
             Path codePath = Path.of(fn.getCodeLocalPath());
 
@@ -1574,6 +1578,100 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             LOG.debugv("Could not list {0} for function {1} ({2}); assuming no extensions",
                     EXTENSIONS_DIR, functionName, e.getMessage());
             return List.of();
+        }
+    }
+
+    /**
+     * Fails image-function init the way AWS does when the function's working directory
+     * is not enterable by a least-privilege user: AWS runs image functions as its own
+     * default user, not the image USER, so a working directory only the image user
+     * can enter (for example {@code /home/nonroot} at mode {@code 0700}) fails init
+     * there with {@code Runtime.InvalidEntrypoint} while an emulator that keeps the
+     * image USER runs it fine. Runs after the container is created but before it
+     * starts, so the check fails fast before any code copy; the launch catch block
+     * reaps the created container.
+     */
+    private void checkImageWorkdirAccessible(DockerClient dockerClient, String containerId,
+                                             LambdaFunction fn, String image) {
+        String workdir = effectiveImageWorkdir(fn, dockerClient, image);
+        if (workdir == null || workdir.isBlank()) {
+            return;
+        }
+        String blocked = LambdaImageWorkdirValidator.firstBlockedComponent(workdir,
+                path -> readDirectoryEntry(dockerClient, containerId, path));
+        if (blocked != null) {
+            throw new LambdaInitException("Runtime.InvalidEntrypoint",
+                    "Image function '" + fn.getFunctionName() + "' working directory '" + workdir
+                            + "' is not enterable by the Lambda default user: '" + blocked
+                            + "' denies execute permission to others (AWS runs image functions "
+                            + "as its own least-privilege user, not the image USER)");
+        }
+    }
+
+    /**
+     * The working directory the container will start in: the function's
+     * ImageConfig.WorkingDirectory when set, otherwise the image's own WORKDIR.
+     * Null when neither is set or the image cannot be inspected, in which case the
+     * check is skipped rather than blocking the launch on missing metadata.
+     */
+    private String effectiveImageWorkdir(LambdaFunction fn, DockerClient dockerClient, String image) {
+        if (fn.getImageConfigWorkingDirectory() != null && !fn.getImageConfigWorkingDirectory().isBlank()) {
+            return fn.getImageConfigWorkingDirectory().trim();
+        }
+        try {
+            InspectImageResponse inspect = dockerClient.inspectImageCmd(image).exec();
+            if (inspect != null && inspect.getConfig() != null) {
+                return inspect.getConfig().getWorkingDir();
+            }
+        } catch (NotFoundException e) {
+            LOG.debugv("Could not inspect image {0} for function {1}; skipping workdir check",
+                    image, fn.getFunctionName());
+        } catch (Exception e) {
+            LOG.debugv("Could not inspect image {0} for function {1} ({2}); skipping workdir check",
+                    image, fn.getFunctionName(), e.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * Reads one directory's entry through the Docker archive API (the same API
+     * {@link #listExtensionBinaries} uses, so it works on minimal images with no
+     * shell or utilities). Null when the path cannot be read: the validator treats
+     * that as an inconclusive check, not a failure.
+     */
+    private LambdaImageWorkdirValidator.DirEntry readDirectoryEntry(DockerClient dockerClient,
+                                                                    String containerId, String path) {
+        try (InputStream tarStream = dockerClient.copyArchiveFromContainerCmd(containerId, path).exec();
+             TarArchiveInputStream tar = new TarArchiveInputStream(tarStream)) {
+            String baseName = path.substring(path.lastIndexOf('/') + 1);
+            TarArchiveEntry entry;
+            while ((entry = tar.getNextEntry()) != null) {
+                String name = entry.getName();
+                if (name.endsWith("/")) {
+                    name = name.substring(0, name.length() - 1);
+                }
+                int slash = name.lastIndexOf('/');
+                String leaf = slash >= 0 ? name.substring(slash + 1) : name;
+                if (!baseName.equals(leaf)) {
+                    continue;
+                }
+                if (entry.isSymbolicLink()) {
+                    return new LambdaImageWorkdirValidator.DirEntry(entry.getMode(), true, entry.getLinkName());
+                }
+                if (entry.isDirectory()) {
+                    return new LambdaImageWorkdirValidator.DirEntry(entry.getMode(), false, null);
+                }
+                return null;
+            }
+            return null;
+        } catch (NotFoundException e) {
+            LOG.debugv("No directory entry for {0} in container {1}; skipping workdir check",
+                    path, containerId);
+            return null;
+        } catch (Exception e) {
+            LOG.debugv("Could not read directory mode for {0} in container {1} ({2}); skipping workdir check",
+                    path, containerId, e.getMessage());
+            return null;
         }
     }
 

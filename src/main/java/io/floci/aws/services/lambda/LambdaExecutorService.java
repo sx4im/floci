@@ -7,6 +7,7 @@ import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.Resettable;
 import io.floci.aws.services.lambda.launcher.ContainerHandle;
+import io.floci.aws.services.lambda.launcher.LambdaInitException;
 import io.floci.aws.services.lambda.model.FunctionEventInvokeConfig;
 import io.floci.aws.services.lambda.model.InvocationType;
 import io.floci.aws.services.lambda.model.InvokeResult;
@@ -372,6 +373,21 @@ public class LambdaExecutorService implements Resettable {
         return "Failed to start Lambda container: " + e.getMessage();
     }
 
+    /**
+     * The AWS error type for a failed container acquisition: a launch that names its
+     * own init error type (for example an image function whose working directory the
+     * Lambda default user cannot enter) reports that type, everything else the
+     * generic {@code Lambda.InitError}.
+     */
+    static String initErrorType(Exception e) {
+        for (Throwable cause = e; cause != null; cause = cause.getCause()) {
+            if (cause instanceof LambdaInitException initFailure) {
+                return initFailure.errorType();
+            }
+        }
+        return "Lambda.InitError";
+    }
+
     private InvokeResult executeSync(LambdaFunction fn, byte[] payload, String requestId,
                                      String clientContext, String invokedQualifier,
                                      ResponseStreamListener listener) {
@@ -384,7 +400,7 @@ public class LambdaExecutorService implements Resettable {
         } catch (Exception e) {
             LOG.warnv("Failed to acquire container for function {0}: {1}", fn.getFunctionName(), e.getMessage());
             return new InvokeResult(200, "Unhandled",
-                    buildErrorPayload(initFailureMessage(e, dockerExecutor), "Lambda.InitError"),
+                    buildErrorPayload(initFailureMessage(e, dockerExecutor), initErrorType(e)),
                     null, requestId);
         }
         long deadlineMs = System.currentTimeMillis() + (long) fn.getTimeout() * 1000;
