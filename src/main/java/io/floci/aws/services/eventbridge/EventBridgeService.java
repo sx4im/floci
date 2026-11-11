@@ -42,6 +42,7 @@ import io.floci.aws.services.eventbridge.model.RuleState;
 import io.floci.aws.services.eventbridge.model.Target;
 import io.floci.aws.services.pipes.PipesFilterMatcher;
 import io.floci.aws.services.resourcegroupstagging.ResourceGroupsTaggingService;
+import io.floci.aws.services.scheduler.SchedulerExpressionParser;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -361,6 +362,9 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         }
         if (eventPattern != null && !eventPattern.isBlank()) {
             validateEventPattern(eventPattern);
+        }
+        if (scheduleExpression != null && !scheduleExpression.isBlank()) {
+            validateScheduleExpression(scheduleExpression);
         }
         String effectiveBus = resolvedBusName(busName);
         ensureBusExists(effectiveBus, region);
@@ -1182,6 +1186,18 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
             throw new AwsException("InvalidEventPatternException", "Event pattern must be a JSON object.", 400);
         }
         validateNumericPatterns(pattern);
+    }
+
+    private void validateScheduleExpression(String scheduleExpression) {
+        if (!ScheduleExpressionParser.isRateExpression(scheduleExpression)) {
+            return;
+        }
+        try {
+            SchedulerExpressionParser.validateRateUnitAgreement(scheduleExpression);
+        } catch (IllegalArgumentException e) {
+            throw new AwsException("ValidationException",
+                    "Parameter ScheduleExpression is not valid.", 400);
+        }
     }
 
     private void validateNumericPatterns(JsonNode pattern) {

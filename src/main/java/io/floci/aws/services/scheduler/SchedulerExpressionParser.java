@@ -76,17 +76,30 @@ public final class SchedulerExpressionParser {
                     throw new IllegalArgumentException("Week-based rates are not supported by Scheduler");
                 }
                 parseRateMillis(expression);
-                long value = Long.parseLong(rate.group(1));
-                String unit = rate.group(2);
-                boolean plural = unit.endsWith("s") || unit.endsWith("S");
-                if ((value == 1) == plural) {
-                    throw new IllegalArgumentException("Rate unit must be singular for 1 and plural for values greater than 1");
-                }
+                validateRateUnitAgreement(expression);
             }
             case CRON -> {
                 parseCron(expression);
                 resolveZone(timezone);
             }
+        }
+    }
+
+    /**
+     * Enforces the AWS rule that a rate value of 1 takes the singular unit
+     * and any larger value takes the plural unit. Shared with EventBridge
+     * PutRule, which applies the same rule to its own rate expressions.
+     */
+    public static void validateRateUnitAgreement(String expression) {
+        Matcher rate = RATE_PATTERN.matcher(expression.trim());
+        if (!rate.matches()) {
+            throw new IllegalArgumentException("Not a valid rate() expression: " + expression);
+        }
+        long value = Long.parseLong(rate.group(1));
+        String unit = rate.group(2);
+        boolean plural = unit.endsWith("s") || unit.endsWith("S");
+        if ((value == 1) == plural) {
+            throw new IllegalArgumentException("Rate unit must be singular for 1 and plural for values greater than 1");
         }
     }
 

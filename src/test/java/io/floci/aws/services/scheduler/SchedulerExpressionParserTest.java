@@ -93,6 +93,18 @@ class SchedulerExpressionParserTest {
     }
 
     @Test
+    void validateRateUnitAgreementChecksSingularPluralOnly() {
+        assertDoesNotThrow(() -> SchedulerExpressionParser.validateRateUnitAgreement("rate(1 minute)"));
+        assertDoesNotThrow(() -> SchedulerExpressionParser.validateRateUnitAgreement("rate(2 minutes)"));
+        assertDoesNotThrow(() -> SchedulerExpressionParser.validateRateUnitAgreement("rate(1 week)"));
+        assertDoesNotThrow(() -> SchedulerExpressionParser.validateRateUnitAgreement("rate(2 weeks)"));
+        assertThrows(IllegalArgumentException.class,
+                () -> SchedulerExpressionParser.validateRateUnitAgreement("rate(1 minutes)"));
+        assertThrows(IllegalArgumentException.class,
+                () -> SchedulerExpressionParser.validateRateUnitAgreement("rate(2 minute)"));
+    }
+
+    @Test
     void nextCronFireComputesFutureInstant() {
         Instant from = ZonedDateTime.of(2026, 4, 21, 9, 0, 0, 0, ZoneOffset.UTC).toInstant();
         Instant next = SchedulerExpressionParser.nextCronFire("cron(30 10 * * ? *)", from, null);
