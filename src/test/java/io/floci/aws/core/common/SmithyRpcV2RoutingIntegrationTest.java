@@ -2,6 +2,7 @@ package io.floci.aws.core.common;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
 import io.floci.aws.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
@@ -185,5 +186,173 @@ class SmithyRpcV2RoutingIntegrationTest {
         .then()
             .statusCode(200)
             .contentType("application/x-amz-cbor-1.1");
+    }
+
+    @Test
+    void translateRoutesViaTargetPrefixServiceName() throws Exception {
+        byte[] response = given()
+            .contentType("application/cbor")
+            .accept("application/cbor")
+            .header("smithy-protocol", "rpc-v2-cbor")
+            .body(CBOR_MAPPER.writeValueAsBytes(JSON_MAPPER.readTree("""
+                {"Text":"Ciao","SourceLanguageCode":"it","TargetLanguageCode":"de"}
+                """)))
+        .when()
+            .post("/service/AWSShineFrontendService_20170701/operation/TranslateText")
+        .then()
+            .statusCode(200)
+            .header("smithy-protocol", equalTo("rpc-v2-cbor"))
+            .contentType("application/cbor")
+            .extract().asByteArray();
+
+        assertThat(CBOR_MAPPER.readTree(response)
+                .path("TranslatedText").asText(), equalTo("Ciao"));
+    }
+
+    @Test
+    void translateDocumentRoundTripsContentAsCborByteString() throws Exception {
+        // Non-UTF-8 bytes included on purpose: Document.Content is a blob, not text.
+        byte[] document = {'H', 'e', 'l', 'l', 'o', ' ', (byte) 0xC3, (byte) 0xA9, 0x00, (byte) 0xFF, '\n'};
+        ObjectNode request = JSON_MAPPER.createObjectNode();
+        request.putObject("Document")
+                .put("Content", document)
+                .put("ContentType", "text/plain");
+        request.put("SourceLanguageCode", "en");
+        request.put("TargetLanguageCode", "es");
+
+        byte[] response = given()
+            .contentType("application/cbor")
+            .accept("application/cbor")
+            .header("smithy-protocol", "rpc-v2-cbor")
+            .body(CBOR_MAPPER.writeValueAsBytes(request))
+        .when()
+            .post("/service/AWSShineFrontendService_20170701/operation/TranslateDocument")
+        .then()
+            .statusCode(200)
+            .header("smithy-protocol", equalTo("rpc-v2-cbor"))
+            .contentType("application/cbor")
+            .extract().asByteArray();
+
+        JsonNode decoded = CBOR_MAPPER.readTree(response);
+        JsonNode content = decoded.path("TranslatedDocument").path("Content");
+        assertThat(content.isBinary(), equalTo(true));
+        assertThat(content.binaryValue(), equalTo(document));
+        assertThat(decoded.path("SourceLanguageCode").asText(), equalTo("en"));
+        assertThat(decoded.path("TargetLanguageCode").asText(), equalTo("es"));
+    }
+
+    /**
+     * One operation per JSON service that used to answer 404 over
+     * smithy-rpc-v2-cbor (floci-io/floci#7983): each now routes through the
+     * JSON 1.1 handlers instead of needing its own CBOR case.
+     */
+    private JsonNode postCborAndDecode(String serviceName, String operation, JsonNode request) throws Exception {
+        byte[] response = given()
+            .contentType("application/cbor")
+            .accept("application/cbor")
+            .header("smithy-protocol", "rpc-v2-cbor")
+            .body(CBOR_MAPPER.writeValueAsBytes(request))
+        .when()
+            .post("/service/" + serviceName + "/operation/" + operation)
+        .then()
+            .statusCode(200)
+            .header("smithy-protocol", equalTo("rpc-v2-cbor"))
+            .contentType("application/cbor")
+            .extract().asByteArray();
+        return CBOR_MAPPER.readTree(response);
+    }
+
+    @Test
+    void cloudHsmV2DescribeClustersRoutesViaTargetPrefixServiceName() throws Exception {
+        JsonNode decoded = postCborAndDecode("BaldrApiService", "DescribeClusters",
+                JSON_MAPPER.createObjectNode());
+        assertThat(decoded.path("Clusters"), notNullValue());
+    }
+
+    @Test
+    void codeBuildListProjectsRoutesViaTargetPrefixServiceName() throws Exception {
+        JsonNode decoded = postCborAndDecode("CodeBuild_20161006", "ListProjects",
+                JSON_MAPPER.createObjectNode());
+        assertThat(decoded.path("projects"), notNullValue());
+    }
+
+    @Test
+    void codeDeployListApplicationsRoutesViaTargetPrefixServiceName() throws Exception {
+        JsonNode decoded = postCborAndDecode("CodeDeploy_20141006", "ListApplications",
+                JSON_MAPPER.createObjectNode());
+        assertThat(decoded.path("applications"), notNullValue());
+    }
+
+    @Test
+    void codePipelineListPipelinesRoutesViaTargetPrefixServiceName() throws Exception {
+        JsonNode decoded = postCborAndDecode("CodePipeline_20150709", "ListPipelines",
+                JSON_MAPPER.createObjectNode());
+        assertThat(decoded.path("pipelines"), notNullValue());
+    }
+
+    @Test
+    void comprehendDetectSentimentRoutesViaTargetPrefixServiceName() throws Exception {
+        JsonNode decoded = postCborAndDecode("Comprehend_20171127", "DetectSentiment",
+                JSON_MAPPER.readTree("""
+                    {"Text": "Hello world", "LanguageCode": "en"}
+                    """));
+        assertThat(decoded.path("Sentiment"), notNullValue());
+    }
+
+    @Test
+    void dataSyncListTasksRoutesViaTargetPrefixServiceName() throws Exception {
+        JsonNode decoded = postCborAndDecode("FmrsService", "ListTasks",
+                JSON_MAPPER.createObjectNode());
+        assertThat(decoded.path("Tasks"), notNullValue());
+    }
+
+    @Test
+    void memoryDbDescribeClustersRoutesViaTargetPrefixServiceName() throws Exception {
+        JsonNode decoded = postCborAndDecode("AmazonMemoryDB", "DescribeClusters",
+                JSON_MAPPER.createObjectNode());
+        assertThat(decoded.path("Clusters"), notNullValue());
+    }
+
+    @Test
+    void networkFirewallListFirewallsRoutesViaTargetPrefixServiceName() throws Exception {
+        JsonNode decoded = postCborAndDecode("NetworkFirewall_20201112", "ListFirewalls",
+                JSON_MAPPER.createObjectNode());
+        assertThat(decoded.path("Firewalls"), notNullValue());
+    }
+
+    @Test
+    void taggingGetResourcesRoutesViaTargetPrefixServiceName() throws Exception {
+        JsonNode decoded = postCborAndDecode("ResourceGroupsTaggingAPI_20170126", "GetResources",
+                JSON_MAPPER.createObjectNode());
+        assertThat(decoded.path("ResourceTagMappingList"), notNullValue());
+    }
+
+    @Test
+    void serviceCatalogListPortfoliosRoutesViaTargetPrefixServiceName() throws Exception {
+        JsonNode decoded = postCborAndDecode("AWS242ServiceCatalogService", "ListPortfolios",
+                JSON_MAPPER.createObjectNode());
+        assertThat(decoded.path("PortfolioDetails"), notNullValue());
+    }
+
+    @Test
+    void cloudMapListNamespacesRoutesViaTargetPrefixServiceName() throws Exception {
+        JsonNode decoded = postCborAndDecode("Route53AutoNaming_v20170314", "ListNamespaces",
+                JSON_MAPPER.createObjectNode());
+        assertThat(decoded.path("Namespaces"), notNullValue());
+    }
+
+    @Test
+    void textractDetectDocumentTextRoutesViaTargetPrefixServiceName() throws Exception {
+        ObjectNode request = JSON_MAPPER.createObjectNode();
+        request.putObject("Document").put("Bytes", new byte[] {'H', 'i', (byte) 0xFF});
+        JsonNode decoded = postCborAndDecode("Textract", "DetectDocumentText", request);
+        assertThat(decoded.path("Blocks"), notNullValue());
+    }
+
+    @Test
+    void transcribeListTranscriptionJobsRoutesViaTargetPrefixServiceName() throws Exception {
+        JsonNode decoded = postCborAndDecode("Transcribe", "ListTranscriptionJobs",
+                JSON_MAPPER.createObjectNode());
+        assertThat(decoded.path("TranscriptionJobSummaries"), notNullValue());
     }
 }

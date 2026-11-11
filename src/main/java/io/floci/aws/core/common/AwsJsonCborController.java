@@ -18,12 +18,14 @@ import io.floci.aws.services.marketplace.MarketplaceEntitlementController;
 import io.floci.aws.services.sns.SnsJsonHandler;
 import io.floci.aws.services.sqs.SqsJsonHandler;
 import io.floci.aws.services.stepfunctions.StepFunctionsJsonHandler;
+import io.floci.aws.services.translate.TranslateJsonHandler;
 import io.smallrye.common.annotation.RunOnVirtualThread;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.UriInfo;
 import org.jboss.logging.Logger;
 
 import java.io.ByteArrayInputStream;
@@ -31,6 +33,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.net.URI;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
@@ -43,7 +46,9 @@ import java.util.zip.GZIPInputStream;
  * via either smithy-rpc-v2-cbor path routing or the legacy X-Amz-Target header.
  * <p>
  * Currently supported services: DynamoDB (incl. Streams), SQS, SNS, Kinesis,
- * Step Functions, CloudWatch Metrics, and EventBridge V2.
+ * Step Functions, CloudWatch Metrics, and EventBridge V2. Every other JSON
+ * service is routed through {@link AwsJson11Controller#dispatch}, so all JSON
+ * services answer over this protocol instead of a bare 404.
  * <p>
  * Requests run on virtual threads, as in {@link AwsJsonController}, so a ReceiveMessage or
  * GetActivityTask long poll does not hold one of the shared request workers while it waits.
@@ -72,6 +77,8 @@ public class AwsJsonCborController {
     private final CloudWatchMetricsJsonHandler cloudWatchMetricsJsonHandler;
     private final MarketplaceEntitlementController marketplaceEntitlementController;
     private final EventBridgeV2Handler eventBridgeV2Handler;
+    private final TranslateJsonHandler translateJsonHandler;
+    private final AwsJson11Controller json11Controller;
 
     @Inject
     public AwsJsonCborController(ObjectMapper objectMapper, ResolvedServiceCatalog catalog,
@@ -83,7 +90,9 @@ public class AwsJsonCborController {
                                  StepFunctionsJsonHandler sfnJsonHandler,
                                  CloudWatchMetricsJsonHandler cloudWatchMetricsJsonHandler,
                                  MarketplaceEntitlementController marketplaceEntitlementController,
-                                 EventBridgeV2Handler eventBridgeV2Handler) {
+                                 EventBridgeV2Handler eventBridgeV2Handler,
+                                 TranslateJsonHandler translateJsonHandler,
+                                 AwsJson11Controller json11Controller) {
         this.objectMapper = objectMapper;
         this.catalog = catalog;
         this.regionResolver = regionResolver;
@@ -96,6 +105,8 @@ public class AwsJsonCborController {
         this.cloudWatchMetricsJsonHandler = cloudWatchMetricsJsonHandler;
         this.marketplaceEntitlementController = marketplaceEntitlementController;
         this.eventBridgeV2Handler = eventBridgeV2Handler;
+        this.translateJsonHandler = translateJsonHandler;
+        this.json11Controller = json11Controller;
     }
 
 
@@ -179,6 +190,10 @@ public class AwsJsonCborController {
             gen.writeEndArray();
         } else if (numberIsTimestamp && node.isNumber()) {
             writeCborTimestamp(gen, node, legacyDialect);
+        } else if (node.isBinary()) {
+            // A blob member (e.g. Translate's TranslatedDocument.Content) is a CBOR byte
+            // string on the wire, never base64 text.
+            gen.writeBinary(node.binaryValue());
         } else if (node.isTextual()) {
             gen.writeString(node.textValue());
         } else if (node.isDouble() || node.isFloat()) {
@@ -319,6 +334,7 @@ public class AwsJsonCborController {
             @PathParam(RPC_V2_SERVICE_PARAMETER) String serviceId,
             @PathParam(RPC_V2_OPERATION_PARAMETER) String operation,
             @Context HttpHeaders httpHeaders,
+            @Context UriInfo uriInfo,
             byte[] body) {
 
         LOG.debugv("Smithy RPC v2 CBOR: service={0}, operation={1}", serviceId, operation);
@@ -326,8 +342,13 @@ public class AwsJsonCborController {
         try {
             JsonNode request = bodyToJson(httpHeaders, body);
             String region = regionResolver.resolveRegion(httpHeaders);
+            String authorization = httpHeaders.getHeaderString("Authorization");
+            if (authorization == null || authorization.isBlank()) {
+                authorization = IamEnforcementFilter.requestAuthorization(null, uriInfo.getQueryParameters());
+            }
 
-            Response delegated = dispatchCbor(serviceId, operation, request, region);
+            Response delegated = dispatchCbor(serviceId, operation, request, region,
+                    authorization, uriInfo.getBaseUri());
             if (delegated == null) {
                 return Response.status(404).build();
             }
@@ -496,8 +517,13 @@ public class AwsJsonCborController {
 
     /**
      * Dispatches a CBOR request to the appropriate service handler by SDK service ID.
+     * Services with their own CBOR handling keep their case; every other resolved JSON
+     * service falls through to {@link AwsJson11Controller#dispatch}, so a new JSON service
+     * needs no CBOR case of its own. A service the catalog cannot resolve, or one no
+     * dispatcher serves, still answers 404 through the null return.
      */
-    private Response dispatchCbor(String serviceId, String operation, JsonNode request, String region) throws Exception {
+    private Response dispatchCbor(String serviceId, String operation, JsonNode request, String region,
+            String authorization, URI baseUri) throws Exception {
         ServiceDescriptor descriptor = catalog.byCborSdkServiceId(serviceId).orElse(null);
         if (descriptor == null) {
             return null;
@@ -516,15 +542,32 @@ public class AwsJsonCborController {
             case "monitoring" -> cloudWatchMetricsJsonHandler.handle(operation, request, region);
             case "marketplace" -> marketplaceEntitlementController.handle(operation, request, region);
             case "eventsv2" -> eventBridgeV2Handler.handle(operation, request, region);
-            default -> null;
+            case "translate" -> translateJsonHandler.handleCbor(operation, request, region);
+            default -> json11Controller.dispatch(descriptor.externalKey(), operation, request, region,
+                    authorization, regionResolver.getAccountId(), baseUri, null);
         };
     }
+
+    /**
+     * Timestamp members a service's responses carry under names {@link #isTimestampField}
+     * does not match, keyed by external key. A service whose model names its timestamps
+     * otherwise declares them here; anything else stays untagged, as the EventBridge V2
+     * test documents for undeclared names.
+     */
+    private static final Map<String, Set<String>> TIMESTAMP_MEMBERS_BY_SERVICE = Map.of(
+            "eventsv2", EventBridgeV2Handler.TIMESTAMP_MEMBERS,
+            "codebuild", Set.of("startTime", "endTime"),
+            "codedeploy", Set.of("startTime", "endTime", "lastUpdatedAt"),
+            "codepipeline", Set.of("startTime", "lastUpdateTime", "approvedAt"),
+            "datasync", Set.of("CreationTime", "LastConnectionTime"),
+            "servicecatalog", Set.of("CreatedTime", "UpdatedTime"),
+            "servicediscovery", Set.of("CreateDate", "UpdateDate"),
+            "transcribe", Set.of("CreationTime", "CompletionTime"));
 
     /** The timestamp members a service's responses carry under names {@link #isTimestampField} does not match. */
     private Set<String> timestampMembers(String serviceId) {
         return catalog.byCborSdkServiceId(serviceId)
-                .filter(descriptor -> "eventsv2".equals(descriptor.externalKey()))
-                .map(descriptor -> EventBridgeV2Handler.TIMESTAMP_MEMBERS)
+                .map(descriptor -> TIMESTAMP_MEMBERS_BY_SERVICE.getOrDefault(descriptor.externalKey(), Set.of()))
                 .orElse(Set.of());
     }
 
