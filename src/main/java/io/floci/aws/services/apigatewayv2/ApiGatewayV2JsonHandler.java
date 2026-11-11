@@ -665,6 +665,9 @@ public class ApiGatewayV2JsonHandler {
         if (i.getIntegrationMethod() != null) {
             node.put("IntegrationMethod", i.getIntegrationMethod());
         }
+        if (i.getDescription() != null) {
+            node.put("Description", i.getDescription());
+        }
         if (i.getTimeoutInMillis() != 0) {
             node.put("TimeoutInMillis", i.getTimeoutInMillis());
         }

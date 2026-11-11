@@ -20,6 +20,7 @@ public class Integration {
     private String templateSelectionExpression;
     private Map<String, String> requestParameters;
     private String connectionId;
+    private String description;
 
     private String credentialsArn;
 
@@ -43,6 +44,7 @@ public class Integration {
         this.templateSelectionExpression = src.templateSelectionExpression;
         this.requestParameters = src.requestParameters;
         this.connectionId = src.connectionId;
+        this.description = src.description;
     }
 
     public String getIntegrationId() { return integrationId; }
@@ -80,4 +82,7 @@ public class Integration {
 
     public String getConnectionId() { return connectionId; }
     public void setConnectionId(String connectionId) { this.connectionId = connectionId; }
+
+    public String getDescription() { return description; }
+    public void setDescription(String description) { this.description = description; }
 }

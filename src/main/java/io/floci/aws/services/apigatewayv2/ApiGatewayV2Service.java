@@ -777,6 +777,7 @@ public class ApiGatewayV2Service {
         integration.setRequestParameters(requestParameters);
 
         integration.setConnectionId((String) request.get("connectionId"));
+        integration.setDescription((String) request.get("description"));
 
         integrationStore.put(integrationKey(region, apiId, integration.getIntegrationId()), integration);
         return integration;
@@ -850,6 +851,9 @@ public class ApiGatewayV2Service {
         }
         if (request.containsKey("connectionId") && request.get("connectionId") != null) {
             integration.setConnectionId((String) request.get("connectionId"));
+        }
+        if (request.containsKey("description") && request.get("description") != null) {
+            integration.setDescription((String) request.get("description"));
         }
 
         integrationStore.put(integrationKey(region, apiId, integrationId), integration);
