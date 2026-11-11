@@ -64,6 +64,18 @@ final class DynamoDbAttributeValueValidator {
         if (hasFalseNull(value)) {
             return FALSE_NULL;
         }
+        if (value.isObject() && TYPES.stream().noneMatch(value::has)) {
+            // The request-shape check skips members it does not know, so a value naming no
+            // type at all ({"0": "v"}, {}) slips past it and would otherwise be stored.
+            // A value naming a type, even a null one ({"S": null}), is left to the
+            // operation's own validation, as before. typeOf can only throw the empty
+            // ValidationException here: the value is an object with no type member.
+            try {
+                typeOf(value);
+            } catch (AwsException e) {
+                return INVALID + e.getMessage();
+            }
+        }
         if (value.path("N").isTextual()) {
             String problem = DynamoDbNumberUtils.itemNumberProblem(value.get("N").asText());
             if (problem != null) {
