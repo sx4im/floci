@@ -60,6 +60,47 @@ class SecretsManagerServiceTest {
     }
 
     @Test
+    void createSecretWithoutValueCreatesNoVersion() {
+        Secret secret = service.createSecret("no-value-secret", null, null, null, null, null, REGION);
+
+        assertNotNull(secret.getArn());
+        assertNull(secret.getCurrentVersionId());
+        assertNotNull(secret.getVersions());
+        assertTrue(secret.getVersions().isEmpty());
+    }
+
+    @Test
+    void getSecretValueOnValuelessSecretThrows() {
+        service.createSecret("no-value-secret", null, null, null, null, null, REGION);
+
+        AwsException e = assertThrows(AwsException.class, () ->
+                service.getSecretValue("no-value-secret", null, null, REGION));
+        assertEquals("ResourceNotFoundException", e.getErrorCode());
+        assertTrue(e.getMessage().contains("AWSCURRENT"));
+    }
+
+    @Test
+    void describeSecretOnValuelessSecretHasNoVersions() {
+        service.createSecret("no-value-secret", null, null, null, null, null, REGION);
+
+        Secret described = service.describeSecret("no-value-secret", REGION);
+        assertNull(described.getCurrentVersionId());
+        assertTrue(described.getVersions().isEmpty());
+    }
+
+    @Test
+    void putSecretValueCreatesFirstVersionOnValuelessSecret() {
+        service.createSecret("no-value-secret", null, null, null, null, null, REGION);
+
+        SecretVersion version = service.putSecretValue("no-value-secret", "first-value", null, null, REGION, null);
+        assertEquals("first-value", version.getSecretString());
+        assertTrue(version.getVersionStages().contains("AWSCURRENT"));
+
+        SecretVersion read = service.getSecretValue("no-value-secret", null, null, REGION);
+        assertEquals("first-value", read.getSecretString());
+    }
+
+    @Test
     void getSecretValue() {
         service.createSecret("db-password", "s3cr3t", null, null, null, null, REGION);
         SecretVersion version = service.getSecretValue("db-password", null, null, REGION);

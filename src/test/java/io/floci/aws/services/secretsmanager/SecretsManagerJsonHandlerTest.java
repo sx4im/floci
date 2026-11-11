@@ -147,10 +147,50 @@ class SecretsManagerJsonHandlerTest {
         ObjectNode describeReq = MAPPER.createObjectNode();
         describeReq.put("SecretId", "kms-secret");
         Response response = handler.handle("DescribeSecret", describeReq, REGION);
-        
+
         assertThat(response.getStatus(), is(200));
         ObjectNode body = (ObjectNode) response.getEntity();
         assertThat(body.get("KmsKeyId").asText(), is("my-kms-key"));
+    }
+
+    @Test
+    void createSecretWithoutValueOmitsVersionId() {
+        ObjectNode createReq = MAPPER.createObjectNode();
+        createReq.put("Name", "no-value-secret");
+        Response response = handler.handle("CreateSecret", createReq, REGION);
+
+        assertThat(response.getStatus(), is(200));
+        ObjectNode body = (ObjectNode) response.getEntity();
+        assertThat(body.get("ARN").asText(), containsString("no-value-secret"));
+        assertThat(body.has("VersionId"), is(false));
+    }
+
+    @Test
+    void describeSecretWithoutValueOmitsVersionIdsToStages() {
+        ObjectNode createReq = MAPPER.createObjectNode();
+        createReq.put("Name", "no-value-secret");
+        handler.handle("CreateSecret", createReq, REGION);
+
+        ObjectNode describeReq = MAPPER.createObjectNode();
+        describeReq.put("SecretId", "no-value-secret");
+        Response response = handler.handle("DescribeSecret", describeReq, REGION);
+
+        assertThat(response.getStatus(), is(200));
+        ObjectNode body = (ObjectNode) response.getEntity();
+        assertThat(body.has("VersionIdsToStages"), is(false));
+    }
+
+    @Test
+    void getSecretValueWithoutValueIsResourceNotFound() {
+        ObjectNode createReq = MAPPER.createObjectNode();
+        createReq.put("Name", "no-value-secret");
+        handler.handle("CreateSecret", createReq, REGION);
+
+        ObjectNode getReq = MAPPER.createObjectNode();
+        getReq.put("SecretId", "no-value-secret");
+        AwsException e = expectAwsException("GetSecretValue", getReq);
+        assertThat(e.getErrorCode(), is("ResourceNotFoundException"));
+        assertThat(e.getMessage(), containsString("AWSCURRENT"));
     }
 
     @Test
@@ -297,6 +337,15 @@ class SecretsManagerJsonHandlerTest {
     private void createSecret(String name) {
         ObjectNode req = MAPPER.createObjectNode();
         req.put("Name", name);
+        handler.handle("CreateSecret", req, REGION);
+    }
+
+    // A secret with a value, so it carries an AWSCURRENT version: the setup the
+    // version-stage tests need, since a valueless secret has no versions at all.
+    private void createSecretWithValue(String name) {
+        ObjectNode req = MAPPER.createObjectNode();
+        req.put("Name", name);
+        req.put("SecretString", "initial-value");
         handler.handle("CreateSecret", req, REGION);
     }
 
@@ -997,7 +1046,7 @@ class SecretsManagerJsonHandlerTest {
 
     @Test
     void listSecretsIncludesVersionStagesAndRotationFields() {
-        createSecret("rich-entry");
+        createSecretWithValue("rich-entry");
         enableRotation("rich-entry");
 
         ObjectNode entry = (ObjectNode) listSecrets(MAPPER.createObjectNode()).get("SecretList").get(0);
@@ -1226,7 +1275,7 @@ class SecretsManagerJsonHandlerTest {
     void describeSecretOmitsVersionsThatNoLongerCarryStagingLabels() {
         // AWS: "A list of the versions of the secret that have staging labels attached.
         // Versions that don't have staging labels are considered deprecated."
-        createSecret("deprecating");
+        createSecretWithValue("deprecating");
         String pendingToken = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
         service.putSecretValue("deprecating", "pending", null, pendingToken, REGION,
                 List.of("AWSPENDING"));
@@ -1446,7 +1495,7 @@ class SecretsManagerJsonHandlerTest {
 
     @Test
     void getSecretValueStillReportsStagesForACurrentVersion() {
-        createSecret("current-read");
+        createSecretWithValue("current-read");
         ObjectNode req = MAPPER.createObjectNode();
         req.put("SecretId", "current-read");
         ObjectNode body = (ObjectNode) handler.handle("GetSecretValue", req, REGION).getEntity();
@@ -1733,7 +1782,7 @@ class SecretsManagerJsonHandlerTest {
     @Test
     void listSecretVersionIdsExcludesDeprecatedVersionsByDefault() {
         // AWS: "By default, versions without staging labels aren't included."
-        createSecret("versioned");
+        createSecretWithValue("versioned");
         String deprecated = stageThenDeprecate("versioned");
 
         ObjectNode req = MAPPER.createObjectNode();
@@ -1746,7 +1795,7 @@ class SecretsManagerJsonHandlerTest {
 
     @Test
     void listSecretVersionIdsIncludesDeprecatedVersionsWhenAsked() {
-        createSecret("versioned");
+        createSecretWithValue("versioned");
         String deprecated = stageThenDeprecate("versioned");
 
         ObjectNode req = MAPPER.createObjectNode();
@@ -1768,7 +1817,7 @@ class SecretsManagerJsonHandlerTest {
 
     @Test
     void listSecretVersionIdsPaginates() {
-        createSecret("versioned");
+        createSecretWithValue("versioned");
         for (int i = 1; i <= 3; i++) {
             service.putSecretValue("versioned", "v" + i, null, null, REGION,
                     List.of("stage-" + i));

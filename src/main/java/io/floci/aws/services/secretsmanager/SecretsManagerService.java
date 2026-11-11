@@ -261,15 +261,21 @@ public class SecretsManagerService implements ResourceProvider {
         Instant now = Instant.now();
 
         String versionId = clientRequestToken != null ? clientRequestToken : UUID.randomUUID().toString();
-        SecretVersion version = new SecretVersion();
-        version.setVersionId(versionId);
-        version.setSecretString(secretString);
-        version.setSecretBinary(secretBinary);
-        version.setVersionStages(List.of(AWSCURRENT));
-        version.setCreatedDate(now);
-
         Map<String, SecretVersion> versions = new HashMap<>();
-        versions.put(versionId, version);
+        String currentVersionId = null;
+        // AWS creates an initial version only when CreateSecret carries a value: a secret
+        // created without SecretString or SecretBinary has no versions until the first
+        // PutSecretValue, so no empty version is staged AWSCURRENT here.
+        if (secretString != null || secretBinary != null) {
+            SecretVersion version = new SecretVersion();
+            version.setVersionId(versionId);
+            version.setSecretString(secretString);
+            version.setSecretBinary(secretBinary);
+            version.setVersionStages(List.of(AWSCURRENT));
+            version.setCreatedDate(now);
+            versions.put(versionId, version);
+            currentVersionId = versionId;
+        }
 
         Secret secret = new Secret();
         secret.setName(name);
@@ -281,7 +287,7 @@ public class SecretsManagerService implements ResourceProvider {
         secret.setLastChangedDate(now);
         secret.setTags(tags != null ? new ArrayList<>(tags) : new ArrayList<>());
         secret.setVersions(versions);
-        secret.setCurrentVersionId(versionId);
+        secret.setCurrentVersionId(currentVersionId);
         secret.setOwningService(owningService);
 
         store.put(storageKey, secret);
