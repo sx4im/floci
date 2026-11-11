@@ -2204,6 +2204,152 @@ class DynamoDbServiceTest {
         assertFalse(notifs.has("sms"), "sms should be removed");
     }
 
+    /**
+     * Test REMOVE with several list-index actions in one expression.
+     * Reproduces GitHub issue #7971: every action addresses the item as it
+     * was before the update, so REMOVE L[0], L[2] on ["zero", "one", "two"]
+     * leaves ["one"], not ["one", "two"].
+     */
+    @Test
+    void removeMultipleListIndexesAppliesAgainstOriginalList() {
+        String region = "eu-west-1";
+        createUsersTable(region);
+
+        ObjectNode initialItem = item("userId", "user-remove-multi");
+        initialItem.set("L", listAttributeValue("zero", "one", "two"));
+        service.putItem("Users", initialItem, region);
+
+        ObjectNode key = mapper.createObjectNode();
+        key.set("userId", attributeValue("S", "user-remove-multi"));
+
+        DynamoDbService.UpdateResult result = service.updateItem("Users", key, null,
+                "REMOVE L[0], L[2]", null, null, "ALL_NEW", region);
+
+        JsonNode remaining = result.newItem().get("L").get("L");
+        assertEquals(1, remaining.size(), "only the original middle element should remain");
+        assertEquals("one", remaining.get(0).get("S").asText());
+    }
+
+    /**
+     * Test REMOVE with several list-index actions given in descending order.
+     */
+    @Test
+    void removeMultipleListIndexesInDescendingOrder() {
+        String region = "eu-west-1";
+        createUsersTable(region);
+
+        ObjectNode initialItem = item("userId", "user-remove-desc");
+        initialItem.set("L", listAttributeValue("zero", "one", "two"));
+        service.putItem("Users", initialItem, region);
+
+        ObjectNode key = mapper.createObjectNode();
+        key.set("userId", attributeValue("S", "user-remove-desc"));
+
+        DynamoDbService.UpdateResult result = service.updateItem("Users", key, null,
+                "REMOVE L[2], L[0]", null, null, "ALL_NEW", region);
+
+        JsonNode remaining = result.newItem().get("L").get("L");
+        assertEquals(1, remaining.size(), "only the original middle element should remain");
+        assertEquals("one", remaining.get(0).get("S").asText());
+    }
+
+    /**
+     * Test REMOVE of the same list index twice removes that element once;
+     * the second action addresses the original list, not the shifted one.
+     */
+    @Test
+    void removeSameListIndexTwiceRemovesOnce() {
+        String region = "eu-west-1";
+        createUsersTable(region);
+
+        ObjectNode initialItem = item("userId", "user-remove-dup");
+        initialItem.set("L", listAttributeValue("zero", "one", "two"));
+        service.putItem("Users", initialItem, region);
+
+        ObjectNode key = mapper.createObjectNode();
+        key.set("userId", attributeValue("S", "user-remove-dup"));
+
+        DynamoDbService.UpdateResult result = service.updateItem("Users", key, null,
+                "REMOVE L[1], L[1]", null, null, "ALL_NEW", region);
+
+        JsonNode remaining = result.newItem().get("L").get("L");
+        assertEquals(2, remaining.size(), "only the original middle element should be removed");
+        assertEquals("zero", remaining.get(0).get("S").asText());
+        assertEquals("two", remaining.get(1).get("S").asText());
+    }
+
+    /**
+     * Test REMOVE mixing a list-index action with a deeper path into the
+     * same list: the deeper removal must apply before the shift, so
+     * REMOVE L[0], L[1].x removes x from the original second element.
+     */
+    @Test
+    void removeListIndexAndNestedPathInSameClause() {
+        String region = "eu-west-1";
+        createUsersTable(region);
+
+        ObjectNode first = mapper.createObjectNode();
+        first.set("x", attributeValue("S", "1"));
+        first.set("y", attributeValue("S", "2"));
+        ObjectNode second = mapper.createObjectNode();
+        second.set("x", attributeValue("S", "3"));
+        second.set("z", attributeValue("S", "4"));
+        ArrayNode list = mapper.createArrayNode();
+        list.add(attributeValue("S", "a"));
+        list.add(mapAttributeValue(first));
+        list.add(mapAttributeValue(second));
+        ObjectNode listAttr = mapper.createObjectNode();
+        listAttr.set("L", list);
+
+        ObjectNode initialItem = item("userId", "user-remove-mixed");
+        initialItem.set("L", listAttr);
+        service.putItem("Users", initialItem, region);
+
+        ObjectNode key = mapper.createObjectNode();
+        key.set("userId", attributeValue("S", "user-remove-mixed"));
+
+        DynamoDbService.UpdateResult result = service.updateItem("Users", key, null,
+                "REMOVE L[0], L[1].x", null, null, "ALL_NEW", region);
+
+        JsonNode remaining = result.newItem().get("L").get("L");
+        assertEquals(2, remaining.size(), "the first element should be removed");
+        JsonNode keptFirst = remaining.get(0).get("M");
+        assertFalse(keptFirst.has("x"), "x should be removed from the original second element");
+        assertEquals("2", keptFirst.get("y").get("S").asText());
+        JsonNode keptSecond = remaining.get(1).get("M");
+        assertEquals("3", keptSecond.get("x").get("S").asText());
+        assertEquals("4", keptSecond.get("z").get("S").asText());
+    }
+
+    /**
+     * Test REMOVE of a list index together with the whole list, in either
+     * order: the list itself is gone either way.
+     */
+    @Test
+    void removeListIndexAndWholeListInSameClause() {
+        String region = "eu-west-1";
+        createUsersTable(region);
+
+        ObjectNode firstItem = item("userId", "user-remove-whole-a");
+        firstItem.set("L", listAttributeValue("zero", "one", "two"));
+        service.putItem("Users", firstItem, region);
+        ObjectNode secondItem = item("userId", "user-remove-whole-b");
+        secondItem.set("L", listAttributeValue("zero", "one", "two"));
+        service.putItem("Users", secondItem, region);
+
+        ObjectNode firstKey = mapper.createObjectNode();
+        firstKey.set("userId", attributeValue("S", "user-remove-whole-a"));
+        DynamoDbService.UpdateResult firstResult = service.updateItem("Users", firstKey, null,
+                "REMOVE L[1], L", null, null, "ALL_NEW", region);
+        assertFalse(firstResult.newItem().has("L"), "the whole list should be removed");
+
+        ObjectNode secondKey = mapper.createObjectNode();
+        secondKey.set("userId", attributeValue("S", "user-remove-whole-b"));
+        DynamoDbService.UpdateResult secondResult = service.updateItem("Users", secondKey, null,
+                "REMOVE L, L[1]", null, null, "ALL_NEW", region);
+        assertFalse(secondResult.newItem().has("L"), "the whole list should be removed");
+    }
+
     @Test
     void updateItemAddResolvesNestedPlaceholderPath() {
         String region = "eu-west-1";

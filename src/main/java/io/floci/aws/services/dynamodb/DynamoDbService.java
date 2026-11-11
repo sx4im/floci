@@ -3715,6 +3715,7 @@ public class DynamoDbService {
 
     private String applyRemoveClause(ObjectNode item, String clause, JsonNode exprAttrNames,
                                      List<String> touched) {
+        List<String> parts = new ArrayList<>();
         while (!clause.isEmpty()) {
             String upper = clause.toUpperCase();
             if (upper.startsWith("SET ") || upper.startsWith("ADD ") || upper.startsWith("DELETE ")) {
@@ -3740,9 +3741,81 @@ public class DynamoDbService {
             }
 
             touched.add(attrPart);
-            removeValueAtPath(item, attrPart, exprAttrNames);
+            parts.add(attrPart);
         }
+
+        applyRemovalsAgainstOriginal(item, parts, exprAttrNames);
         return clause;
+    }
+
+    private record RemoveAction(String path, List<Object> tokens) {
+    }
+
+    /**
+     * Applies every REMOVE path in one clause against the item as it was
+     * before the clause ran. DynamoDB resolves every action in an
+     * UpdateExpression against the pre-update item, so removing L[0] must
+     * not shift the element a later L[2] in the same clause refers to.
+     * Applying the removals deepest first, with same-parent list indexes in
+     * descending order, makes the sequential application match the
+     * simultaneous one; identical paths are applied once.
+     */
+    private void applyRemovalsAgainstOriginal(ObjectNode item, List<String> parts,
+                                              JsonNode exprAttrNames) {
+        List<RemoveAction> actions = new ArrayList<>();
+        for (String part : parts) {
+            List<Object> tokens = parsePath(part, exprAttrNames);
+            if (tokens.isEmpty()) {
+                continue;
+            }
+            boolean duplicate = false;
+            for (RemoveAction existing : actions) {
+                if (existing.tokens().equals(tokens)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                actions.add(new RemoveAction(part, tokens));
+            }
+        }
+        actions.sort((left, right) -> compareRemovalOrder(left.tokens(), right.tokens()));
+        for (RemoveAction action : actions) {
+            removeValueAtPath(item, action.path(), exprAttrNames);
+        }
+    }
+
+    /**
+     * Orders two REMOVE paths so applying them in sequence matches applying
+     * them simultaneously against the original item: deeper paths first (so
+     * removing a list element cannot shift a deeper path inside a later
+     * element), then list indexes in descending order within the same parent.
+     */
+    private static int compareRemovalOrder(List<Object> left, List<Object> right) {
+        int byDepth = Integer.compare(right.size(), left.size());
+        if (byDepth != 0) {
+            return byDepth;
+        }
+        for (int i = left.size() - 1; i >= 0; i--) {
+            Object leftToken = left.get(i);
+            Object rightToken = right.get(i);
+            if (leftToken instanceof Long leftIdx && rightToken instanceof Long rightIdx) {
+                int byIndex = Long.compare(rightIdx, leftIdx);
+                if (byIndex != 0) {
+                    return byIndex;
+                }
+            } else if (leftToken instanceof String leftName && rightToken instanceof String rightName) {
+                int byName = leftName.compareTo(rightName);
+                if (byName != 0) {
+                    return byName;
+                }
+            } else if (leftToken instanceof Long) {
+                return -1;
+            } else if (rightToken instanceof Long) {
+                return 1;
+            }
+        }
+        return 0;
     }
 
     private String applyAddClause(ObjectNode item, String clause,
