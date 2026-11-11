@@ -733,7 +733,9 @@ public class EksClusterManager
             try {
                 String accountId = resolveClusterAccountId(cluster);
                 String issuer = resolveClusterIssuer(cluster);
-                ClusterOidcKey oidcKey = oidcService.ensureKeyForAccount(accountId, cluster.getName(), issuer);
+                ClusterOidcKey oidcKey = oidcService.ensureKeyForAccount(accountId,
+                        AwsArnUtils.regionOrDefault(cluster.getArn(), config.defaultRegion()),
+                        cluster.getName(), issuer);
                 signingKeyFiles = writeSigningKeyFiles(cluster, oidcKey);
                 if (signingKeyFiles != null) {
                     serverArgs.addAll(buildIrsaServerArgs(oidcKey.getIssuer()));
@@ -1404,18 +1406,21 @@ public class EksClusterManager
     }
 
     /**
-     * Account-qualified Docker name for a cluster. Cluster names are unique only within an
-     * account, so a non-default account's cluster is qualified with its account ID — otherwise
-     * two accounts' same-named clusters would resolve to the same container and data volume,
-     * letting one account reach (or, via startCluster's stale-container removal, destroy) the
-     * other's workloads. The default account keeps the historical unqualified name so existing
-     * containers, volumes, and {@code endpoint-mode=network} DNS names keep working.
+     * Account- and Region-qualified Docker name for a cluster. Cluster names are unique only
+     * within an account and a Region, so a non-default account's cluster is qualified with its
+     * account ID and every cluster is qualified with its Region — otherwise two accounts' or
+     * two Regions' same-named clusters would resolve to the same container and data volume,
+     * letting one reach (or, via startCluster's stale-container removal, destroy) the other's
+     * workloads. A cluster created before Region qualification keeps its historical
+     * unqualified name when its container survives: {@link #resolveRestoredDockerName} adopts
+     * it when the container's account and Region labels match.
      *
      * <p>The qualifier separator is a dot: EksService validates cluster names against the AWS
-     * charset ({@code [0-9A-Za-z][A-Za-z0-9\-_]*}), which admits no dot, so no default-account
-     * cluster name can spell out {@code <accountId>.<name>} and collide with another account's
-     * qualified name — a dash separator would (cluster "999999999999-demo" vs account
-     * 999999999999's "demo"). Dots are valid in Docker container and volume names.
+     * charset ({@code [0-9A-Za-z][A-Za-z0-9\-_]*}), which admits no dot, so no cluster name can
+     * spell out {@code <region>.<name>} or {@code <accountId>.<region>.<name>} and collide with
+     * another account's or Region's qualified name — a dash separator would (cluster
+     * "999999999999-demo" vs account 999999999999's "demo"). Dots are valid in Docker container
+     * and volume names.
      *
      * <p>The record's accountId is set before every call path reaches here (createCluster on
      * create; the startup account rehydration on restore/stop); a null falls back to the
@@ -1428,7 +1433,9 @@ public class EksClusterManager
     private String accountQualifiedClusterName(Cluster cluster) {
         String accountId = cluster.getAccountId();
         boolean defaultAccount = accountId == null || accountId.equals(config.defaultAccountId());
-        return defaultAccount ? cluster.getName() : accountId + "." + cluster.getName();
+        String region = clusterRegion(cluster);
+        return defaultAccount ? region + "." + cluster.getName()
+                : accountId + "." + region + "." + cluster.getName();
     }
 
     /**
@@ -2107,7 +2114,9 @@ public class EksClusterManager
         try {
             String accountId = resolveClusterAccountId(cluster);
             String issuer = resolveClusterIssuer(cluster);
-            ClusterOidcKey oidcKey = oidcService.ensureKeyForAccount(accountId, cluster.getName(), issuer);
+            ClusterOidcKey oidcKey = oidcService.ensureKeyForAccount(accountId,
+                    AwsArnUtils.regionOrDefault(cluster.getArn(), config.defaultRegion()),
+                    cluster.getName(), issuer);
             SigningKeyFiles keyFiles = writeSigningKeyFiles(cluster, oidcKey);
             if (keyFiles != null) {
                 copySigningKeysIntoContainer(containerId, keyFiles, cluster.getName());

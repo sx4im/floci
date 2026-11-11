@@ -1,6 +1,7 @@
 package io.floci.aws.services.eks;
 
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.Base64Url;
 import io.floci.aws.services.eks.model.Cluster;
@@ -71,7 +72,9 @@ public class EksOidcWellKnownController {
     @Path("keys")
     public Response keys(@PathParam("name") String clusterName) {
         requireIssuer(clusterName);
-        ClusterOidcKey key = oidcService.findKeyByCluster(clusterName)
+        Cluster cluster = eksService.describeCluster(clusterName);
+        String region = AwsArnUtils.regionOrDefault(cluster.getArn(), config.defaultRegion());
+        ClusterOidcKey key = oidcService.findKeyByCluster(region, clusterName)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "No OIDC signing key for cluster: " + clusterName, 404));
 

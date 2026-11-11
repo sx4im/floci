@@ -228,8 +228,8 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                 cluster.setStatus(ClusterStatus.CREATING);
                 cluster.setPodCidr(EksClusterManager.DEFAULT_POD_CIDR);
                 if (cluster.getNodeInstanceType() == null) {
-                    firstNodeGroup(cluster.getName(), entry.accountId()).ifPresent(group ->
-                            cluster.setNodeInstanceType(selectedNodeInstanceType(group)));
+                    firstNodeGroup(clusterRegion(cluster), cluster.getName(), entry.accountId())
+                            .ifPresent(group -> cluster.setNodeInstanceType(selectedNodeInstanceType(group)));
                 }
                 clusterManager.restoreCluster(cluster);
                 restoreJoinedInstances(entry.accountId(), cluster);
@@ -330,30 +330,52 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         }
     }
 
-    private Optional<Nodegroup> firstNodeGroup(String clusterName, String accountId) {
-        String prefix = clusterName + "/";
-        List<Nodegroup> groups;
-        if (nodeGroupStorage instanceof AccountAwareStorageBackend<Nodegroup> aware) {
-            groups = aware.scanAllAccountEntries(key -> key.startsWith(prefix)).stream()
-                    .filter(entry -> accountId.equals(entry.accountId()))
-                    .map(AccountAwareStorageBackend.AccountEntry::value).toList();
-        } else {
-            groups = nodeGroupStorage.scan(key -> key.startsWith(prefix));
-        }
+    private Optional<Nodegroup> firstNodeGroup(String region, String clusterName, String accountId) {
+        List<Nodegroup> groups = scanNodeGroups(region, clusterName, accountId);
         return groups.stream().filter(group -> group.getStatus() == NodegroupStatus.ACTIVE)
                 .min(Comparator.comparing(Nodegroup::getCreatedAt,
                         Comparator.nullsLast(Comparator.naturalOrder()))
                 .thenComparing(Nodegroup::getNodegroupName));
     }
 
-    List<Nodegroup> listNodeGroupsForCluster(String clusterName, String accountId) {
-        String prefix = clusterName + "/";
+    List<Nodegroup> listNodeGroupsForCluster(String region, String clusterName, String accountId) {
+        return scanNodeGroups(region, clusterName, accountId);
+    }
+
+    /**
+     * Node groups of one cluster in one Region. Scans the Region-qualified prefix and the legacy
+     * bare-name prefix: a group persisted under the bare name still belongs to its cluster until
+     * a read migrates it, and the ARN filter keeps a same-named cluster in another Region from
+     * leaking in. Two entries for the same group (one under each key) collapse to one.
+     */
+    private List<Nodegroup> scanNodeGroups(String region, String clusterName, String accountId) {
+        String prefix = nodeGroupPrefix(region, clusterName);
+        String legacyPrefix = clusterName + "/";
+        List<Nodegroup> found;
         if (nodeGroupStorage instanceof AccountAwareStorageBackend<Nodegroup> aware) {
-            return aware.scanAllAccountEntries(key -> key.startsWith(prefix)).stream()
+            found = aware.scanAllAccountEntries(key -> key.startsWith(prefix) || key.startsWith(legacyPrefix))
+                    .stream()
                     .filter(entry -> accountId == null || accountId.equals(entry.accountId()))
                     .map(AccountAwareStorageBackend.AccountEntry::value).toList();
+        } else {
+            found = nodeGroupStorage.scan(key -> key.startsWith(prefix) || key.startsWith(legacyPrefix));
         }
-        return nodeGroupStorage.scan(key -> key.startsWith(prefix));
+        Map<String, Nodegroup> byArn = new LinkedHashMap<>();
+        for (Nodegroup group : found) {
+            if (!isNodeGroupOfRegion(group, region)) {
+                continue;
+            }
+            String identity = group.getNodegroupArn() != null ? group.getNodegroupArn()
+                    : group.getNodegroupName();
+            byArn.putIfAbsent(identity, group);
+        }
+        return List.copyOf(byArn.values());
+    }
+
+    /** Whether a node group belongs to {@code region}: its ARN names it, and a group with no
+     *  ARN is taken at face value, as it was before Region keys. */
+    private boolean isNodeGroupOfRegion(Nodegroup group, String region) {
+        return region.equals(AwsArnUtils.regionOrDefault(group.getNodegroupArn(), region));
     }
 
     /**
@@ -376,15 +398,18 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
 
             if (cluster.getIdentity() != null && cluster.getIdentity().getOidc() != null
                     && cluster.getIdentity().getOidc().getIssuer() != null) {
-                oidcService.ensureKeyForAccount(accountId, cluster.getName(),
-                        cluster.getIdentity().getOidc().getIssuer());
+                oidcService.ensureKeyForAccount(accountId,
+                        AwsArnUtils.regionOrDefault(cluster.getArn(), config.defaultRegion()),
+                        cluster.getName(), cluster.getIdentity().getOidc().getIssuer());
                 continue;
             }
             // The cluster's own region, from its ARN: the issuer must match the one create mints there.
             String issuer = oidcService.newIssuerUrl(
                     AwsArnUtils.regionOrDefault(cluster.getArn(), config.defaultRegion()));
             cluster.setIdentity(new ClusterIdentity(new OidcIdentity(issuer)));
-            oidcService.ensureKeyForAccount(accountId, cluster.getName(), issuer);
+            oidcService.ensureKeyForAccount(accountId,
+                    AwsArnUtils.regionOrDefault(cluster.getArn(), config.defaultRegion()),
+                    cluster.getName(), issuer);
             putClusterForAccount(accountId, cluster);
             LOG.infov("Backfilled IRSA OIDC issuer for existing EKS cluster {0} in account {1}",
                     cluster.getName(), accountId);
@@ -392,23 +417,91 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     }
 
     void putClusterForAccount(String accountId, Cluster cluster) {
+        String region = clusterRegion(cluster);
         if (storage instanceof AccountAwareStorageBackend<Cluster> aware) {
-            aware.putForAccount(accountId, cluster.getName(), cluster);
+            aware.putForAccount(accountId, clusterKey(region, cluster.getName()), cluster);
+            // A record persisted under the bare name for this Region's cluster is now stored
+            // twice: drop the legacy key so scans do not see the cluster twice. A bare-name
+            // record whose ARN names another Region belongs to a same-named cluster there and
+            // is left alone.
+            aware.getForAccount(accountId, cluster.getName())
+                    .filter(legacy -> region.equals(clusterRegion(legacy)))
+                    .ifPresent(legacy -> aware.deleteForAccount(accountId, cluster.getName()));
             return;
         }
-        storage.put(cluster.getName(), cluster);
+        storage.put(clusterKey(region, cluster.getName()), cluster);
+        storage.get(cluster.getName())
+                .filter(legacy -> region.equals(clusterRegion(legacy)))
+                .ifPresent(legacy -> storage.delete(cluster.getName()));
     }
 
-    void deleteClusterForAccount(String accountId, String clusterName) {
-        synchronized (capacityLock(accountId, clusterName)) {
-            deleteClusterForAccountHoldingCapacity(accountId, clusterName);
+    /** Stores the cluster under its Region key in the cluster's own account, or the request's account when the record names none. */
+    void putCluster(Cluster cluster) {
+        String accountId = cluster.getAccountId() != null ? cluster.getAccountId() : regionResolver.getAccountId();
+        putClusterForAccount(accountId, cluster);
+    }
+
+    /** The storage key for a cluster: Region-qualified, so same-named clusters in different
+     *  Regions are distinct records. */
+    private static String clusterKey(String region, String clusterName) {
+        return region + "/" + clusterName;
+    }
+
+    /** The storage key for a node group: Region-qualified, like its cluster. */
+    private static String nodeGroupPrefix(String region, String clusterName) {
+        return region + "/" + clusterName + "/";
+    }
+
+    /** The Region a cluster lives in: its ARN names it, falling back to the request Region
+     *  for a record that predates ARNs. */
+    private String clusterRegion(Cluster cluster) {
+        if (cluster == null) {
+            return regionResolver.getRegion();
+        }
+        return AwsArnUtils.regionOrDefault(cluster.getArn(), regionResolver.getRegion());
+    }
+
+    /**
+     * The cluster named {@code clusterName} in {@code region} for {@code accountId}, adopting
+     * a record persisted under the bare name when its ARN names that Region. A bare-name
+     * record whose ARN names another Region belongs to a same-named cluster there and is
+     * left alone, so this lookup never returns the wrong Region's cluster.
+     */
+    Optional<Cluster> findClusterInRegion(String accountId, String region, String clusterName) {
+        String key = clusterKey(region, clusterName);
+        if (storage instanceof AccountAwareStorageBackend<Cluster> aware) {
+            return aware.getForAccountMigratingLegacyKeys(accountId, key, List.of(clusterName),
+                    stored -> region.equals(clusterRegion(stored)));
+        }
+        Optional<Cluster> current = storage.get(key);
+        if (current.isPresent()) {
+            return current;
+        }
+        return storage.get(clusterName)
+                .filter(stored -> region.equals(clusterRegion(stored)))
+                .map(stored -> {
+                    storage.put(key, stored);
+                    storage.delete(clusterName);
+                    return stored;
+                });
+    }
+
+    void deleteClusterForAccount(String accountId, String region, String clusterName) {
+        synchronized (capacityLock(accountId, region, clusterName)) {
+            deleteClusterForAccountHoldingCapacity(accountId, region, clusterName);
         }
     }
 
-    private void deleteClusterForAccountHoldingCapacity(String accountId, String clusterName) {
+    private void deleteClusterForAccountHoldingCapacity(String accountId, String region,
+                                                        String clusterName) {
         Cluster cluster = (storage instanceof AccountAwareStorageBackend<Cluster> aware)
-                ? aware.getForAccount(accountId, clusterName).orElse(null)
-                : storage.get(clusterName).orElse(null);
+                ? aware.getForAccount(accountId, clusterKey(region, clusterName)).orElse(null)
+                : storage.get(clusterKey(region, clusterName)).orElse(null);
+        if (cluster == null) {
+            // A cluster persisted under the bare name has not been migrated yet: read it through
+            // the Region-aware lookup, which moves it under its own Region key.
+            cluster = findClusterInRegion(accountId, region, clusterName).orElse(null);
+        }
         if (cluster != null) {
             if (cluster.getAccountId() == null) {
                 cluster.setAccountId(accountId);
@@ -425,10 +518,22 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             }
             synchronized (clustersBeingDeleted) {
                 if (storage instanceof AccountAwareStorageBackend<Cluster> aware) {
-                    aware.deleteForAccount(accountId, clusterName);
+                    aware.deleteForAccount(accountId, clusterKey(region, clusterName));
+                    if (cluster != null) {
+                        Optional<Cluster> legacy = aware.getForAccount(accountId, clusterName);
+                        if (legacy.isPresent() && region.equals(clusterRegion(legacy.get()))) {
+                            aware.deleteForAccount(accountId, clusterName);
+                        }
+                    }
                     return;
                 }
-                storage.delete(clusterName);
+                storage.delete(clusterKey(region, clusterName));
+                if (cluster != null) {
+                    Optional<Cluster> legacy = storage.get(clusterName);
+                    if (legacy.isPresent() && region.equals(clusterRegion(legacy.get()))) {
+                        storage.delete(clusterName);
+                    }
+                }
             }
         } finally {
             if (cluster != null) {
@@ -615,7 +720,11 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                             + "satisfy regular expression pattern: ^" + CLUSTER_NAME_REGEX + "$",
                     400);
         }
-        if (storage.get(name).isPresent()) {
+        // Names need only be unique per Region: a same-named cluster in another Region is no
+        // conflict, and one in this Region is.
+        String region = regionResolver.getRegion();
+        String accountId = regionResolver.getAccountId();
+        if (findClusterInRegion(accountId, region, name).isPresent()) {
             throw new AwsException("ResourceInUseException",
                     "Cluster already exists: " + name, 409);
         }
@@ -629,9 +738,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         AccessConfig accessConfig = new AccessConfig(authenticationMode,
                 requestedAccess == null || requestedAccess.bootstrapClusterCreatorAdminPermissions() == null
                         || requestedAccess.bootstrapClusterCreatorAdminPermissions());
-        String region = regionResolver.getRegion();
         String resolvedVpcId = validateSubnetsAndResolveVpcId(region, request.getResourcesVpcConfig());
-        String accountId = regionResolver.getAccountId();
         String arn = AwsArnUtils.Arn.of("eks", region, accountId, "cluster/" + name).toString();
 
         Cluster cluster = new Cluster();
@@ -701,7 +808,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         try {
             String issuer = oidcService.newIssuerUrl(region);
             cluster.setIdentity(new ClusterIdentity(new OidcIdentity(issuer)));
-            oidcService.ensureKey(name, issuer);
+            oidcService.ensureKey(region, name, issuer);
 
             if (config.services().eks().mock()) {
                 markMetadataOnlyActive(cluster);
@@ -719,7 +826,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                 }
             }
 
-            storage.put(name, cluster);
+            putCluster(cluster);
         } catch (RuntimeException e) {
             if (clusterSg != null) {
                 try {
@@ -747,8 +854,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     }
 
     public Optional<Cluster> findAuthenticationCluster(String accountId, String name) {
-        return storage instanceof AccountAwareStorageBackend<Cluster> aware
-                ? aware.getForAccount(accountId, name) : storage.get(name);
+        return findClusterInRegion(accountId, regionResolver.getRegion(), name);
     }
 
     /**
@@ -759,7 +865,8 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
      * or the handler would refuse the lookup.
      */
     public Optional<String> findResourceArn(String clusterName, String collection, String name) {
-        Optional<Cluster> cluster = storage.get(clusterName);
+        Optional<Cluster> cluster = findClusterInRegion(regionResolver.getAccountId(),
+                regionResolver.getRegion(), clusterName);
         if (cluster.isEmpty() || collection == null) {
             return cluster.map(Cluster::getArn);
         }
@@ -783,7 +890,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     }
 
     public Cluster describeCluster(String name) {
-        Cluster cluster = storage.get(name)
+        Cluster cluster = findClusterInRegion(regionResolver.getAccountId(), regionResolver.getRegion(), name)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "No cluster found for name: " + name, 404));
         if (cluster.getLogging() == null) {
@@ -820,7 +927,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         Cluster cluster = describeCluster(clusterName);
         validateInstanceRegion(cluster, instance);
         clusterManager.joinInstance(cluster, instance);
-        storage.put(cluster.getName(), cluster);
+        putCluster(cluster);
     }
 
     void joinInstance(String clusterName, String instanceId) {
@@ -905,8 +1012,9 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         // A first node group replacing the node holds this lock while the swap runs; deleting
         // meanwhile would find no container to stop and have its cluster written back. Read the
         // cluster only once the lock is held: a delete that waited may find it gone.
-        synchronized (capacityLock(regionResolver.getAccountId(), name)) {
-            Cluster cluster = storage.get(name)
+        String region = regionResolver.getRegion();
+        synchronized (capacityLock(regionResolver.getAccountId(), region, name)) {
+            Cluster cluster = findClusterInRegion(regionResolver.getAccountId(), region, name)
                     .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                             "No cluster found for name: " + name, 404));
             if (inRequestRegion) {
@@ -948,9 +1056,22 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                 addons.deleteClusterAddons(cluster);
             }
             synchronized (clustersBeingDeleted) {
-                storage.delete(name);
+                String region = resolveClusterRegion(cluster);
+                String accountId = cluster.getAccountId() != null
+                        ? cluster.getAccountId() : regionResolver.getAccountId();
+                if (storage instanceof AccountAwareStorageBackend<Cluster> aware) {
+                    aware.deleteForAccount(accountId, clusterKey(region, name));
+                    aware.getForAccount(accountId, name)
+                            .filter(legacy -> region.equals(clusterRegion(legacy)))
+                            .ifPresent(legacy -> aware.deleteForAccount(accountId, name));
+                } else {
+                    storage.delete(clusterKey(region, name));
+                    storage.get(name)
+                            .filter(legacy -> region.equals(clusterRegion(legacy)))
+                            .ifPresent(legacy -> storage.delete(name));
+                }
                 clearAppliedClusterUserData(cluster, name);
-                oidcService.deleteKey(name);
+                oidcService.deleteKey(region, name);
             }
             return cluster;
         } finally {
@@ -996,13 +1117,13 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             throw new AwsException("InvalidParameterException", "subnets are required", 400);
         }
 
-        String storageKey = nodeGroupKey(clusterName, nodegroupName);
-        if (nodeGroupStorage.get(storageKey).isPresent()) {
+        String region = resolveClusterRegion(cluster);
+        String storageKey = nodeGroupKey(region, clusterName, nodegroupName);
+        if (findNodeGroup(region, clusterName, nodegroupName).isPresent()) {
             throw new AwsException("ResourceInUseException",
                     "Nodegroup already exists: " + nodegroupName, 409);
         }
 
-        String region = resolveClusterRegion(cluster);
         LaunchTemplateData launchTemplateData = validateLaunchTemplate(region, request.getLaunchTemplate());
 
         String accountId = regionResolver.getAccountId();
@@ -1043,8 +1164,8 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         nodeGroup.setLabels(request.getLabels() != null ? new HashMap<>(request.getLabels()) : null);
         nodeGroup.setTags(request.getTags() != null ? new HashMap<>(request.getTags()) : new HashMap<>());
 
-        String capacityKey = accountId + "/" + clusterName;
-        Object capacityLock = capacityLock(accountId, clusterName);
+        String capacityKey = accountId + "/" + region + "/" + clusterName;
+        Object capacityLock = capacityLock(accountId, region, clusterName);
         boolean hasUserData = launchTemplateData != null && launchTemplateData.getUserData() != null
                 && !launchTemplateData.getUserData().isBlank();
         Cluster currentCluster;
@@ -1057,7 +1178,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             }
             currentCluster = describeCluster(clusterName);
             pendingFirst = pendingFirstNodeGroups.get(capacityKey);
-            boolean firstGroup = firstNodeGroup(clusterName, accountId).isEmpty() && pendingFirst == null;
+            boolean firstGroup = firstNodeGroup(region, clusterName, accountId).isEmpty() && pendingFirst == null;
             if (firstGroup && !config.services().eks().mock() && clusterManager != null) {
                 applyFirstNodeGroupCapacity(clusterName, nodegroupName, currentCluster, nodeGroup);
                 if (currentCluster.getContainerId() != null && currentCluster.getStatus() == ClusterStatus.ACTIVE) {
@@ -1067,16 +1188,16 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             } else if (!firstGroup && pendingFirst == null
                     && !config.services().eks().mock() && clusterManager != null) {
                 if (currentCluster.getNodeInstanceType() == null) {
-                    firstNodeGroup(clusterName, accountId).ifPresent(group ->
+                    firstNodeGroup(region, clusterName, accountId).ifPresent(group ->
                             currentCluster.setNodeInstanceType(selectedNodeInstanceType(group)));
-                    storage.put(clusterName, currentCluster);
+                    putCluster(currentCluster);
                 }
                 if (!nodeGroup.getInstanceTypes().isEmpty()
                         && !nodeGroup.getInstanceTypes().contains(currentCluster.getNodeInstanceType())) {
                     LOG.warnv("EKS cluster {0} has one shared node; nodegroup {1} cannot change its capacity from {2}",
                             clusterName, nodegroupName, currentCluster.getNodeInstanceType());
                 }
-                firstNodeGroup(clusterName, accountId).ifPresent(first -> {
+                firstNodeGroup(region, clusterName, accountId).ifPresent(first -> {
                     if (!nodegroupName.equals(first.getNodegroupName())) {
                         LOG.warnv(
                                 "EKS cluster {0} has one shared node; nodegroup {1} metadata (labels/taints) is not applied to the node (already represented by nodegroup {2})",
@@ -1123,7 +1244,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                 if (nodeGroupStorage.get(storageKey)
                         .filter(saved -> arn.equals(saved.getNodegroupArn())).isPresent()) {
                     if (nodeGroup.getStatus() == NodegroupStatus.CREATING) {
-                        if (!ownsPendingFirst && firstNodeGroup(clusterName, accountId).isEmpty()
+                        if (!ownsPendingFirst && firstNodeGroup(region, clusterName, accountId).isEmpty()
                                 && !config.services().eks().mock() && clusterManager != null) {
                             Cluster refreshedCluster = describeCluster(clusterName);
                             applyFirstNodeGroupCapacity(clusterName, nodegroupName, refreshedCluster, nodeGroup);
@@ -1170,7 +1291,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                         clusterName, e.getMessage());
             }
         }
-        storage.put(clusterName, currentCluster);
+        putCluster(currentCluster);
     }
 
     private String selectedNodeInstanceType(Nodegroup group) {
@@ -1218,32 +1339,40 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     }
 
     public Nodegroup describeNodeGroup(String clusterName, String nodegroupName) {
-        describeCluster(clusterName);
-        return nodeGroupStorage.get(nodeGroupKey(clusterName, nodegroupName))
+        Cluster cluster = describeCluster(clusterName);
+        return findNodeGroup(resolveClusterRegion(cluster), clusterName, nodegroupName)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "No nodegroup found for name: " + nodegroupName, 404));
     }
 
     public List<String> listNodeGroups(String clusterName) {
-        describeCluster(clusterName);
-        String prefix = clusterName + "/";
-        return nodeGroupStorage.scan(key -> key.startsWith(prefix)).stream()
+        Cluster cluster = describeCluster(clusterName);
+        return scanNodeGroups(resolveClusterRegion(cluster), clusterName, regionResolver.getAccountId())
+                .stream()
                 .map(Nodegroup::getNodegroupName)
+                .distinct()
                 .collect(Collectors.toList());
     }
 
     /** Serializes node group capacity changes and cluster deletion; taken before clustersBeingDeleted. */
-    private Object capacityLock(String accountId, String clusterName) {
-        return nodeGroupCapacityLocks.computeIfAbsent(accountId + "/" + clusterName, ignored -> new Object());
+    private Object capacityLock(String accountId, String region, String clusterName) {
+        return nodeGroupCapacityLocks.computeIfAbsent(accountId + "/" + region + "/" + clusterName,
+                ignored -> new Object());
     }
 
     public Nodegroup deleteNodeGroup(String clusterName, String nodegroupName) {
-        Object capacityLock = capacityLock(regionResolver.getAccountId(), clusterName);
+        Cluster cluster = describeCluster(clusterName);
+        String region = resolveClusterRegion(cluster);
+        Object capacityLock = capacityLock(regionResolver.getAccountId(), region, clusterName);
         synchronized (capacityLock) {
             Nodegroup nodeGroup = describeNodeGroup(clusterName, nodegroupName);
             nodeGroup.setStatus(NodegroupStatus.DELETING);
             nodeGroup.setModifiedAt(Instant.now());
-            nodeGroupStorage.delete(nodeGroupKey(clusterName, nodegroupName));
+            nodeGroupStorage.delete(nodeGroupKey(region, clusterName, nodegroupName));
+            nodeGroupStorage.get(legacyNodeGroupKey(clusterName, nodegroupName))
+                    .filter(legacy -> region.equals(
+                            AwsArnUtils.regionOrDefault(legacy.getNodegroupArn(), region)))
+                    .ifPresent(legacy -> nodeGroupStorage.delete(legacyNodeGroupKey(clusterName, nodegroupName)));
             return nodeGroup;
         }
     }
@@ -1259,13 +1388,13 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             throw new AwsException("InvalidParameterException", "podExecutionRoleArn is required", 400);
         }
 
-        String storageKey = fargateProfileKey(clusterName, fargateProfileName);
-        if (fargateProfileStorage.get(storageKey).isPresent()) {
+        String region = resolveClusterRegion(cluster);
+        String storageKey = fargateProfileKey(region, clusterName, fargateProfileName);
+        if (findFargateProfile(region, clusterName, fargateProfileName).isPresent()) {
             throw new AwsException("ResourceInUseException",
                     "Fargate profile already exists: " + fargateProfileName, 409);
         }
 
-        String region = resolveClusterRegion(cluster);
         String accountId = regionResolver.getAccountId();
         String id = UUID.randomUUID().toString();
         String arn = AwsArnUtils.Arn.of("eks", region, accountId,
@@ -1289,24 +1418,32 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     }
 
     public FargateProfile describeFargateProfile(String clusterName, String fargateProfileName) {
-        describeCluster(clusterName);
-        return fargateProfileStorage.get(fargateProfileKey(clusterName, fargateProfileName))
+        Cluster cluster = describeCluster(clusterName);
+        return findFargateProfile(resolveClusterRegion(cluster), clusterName, fargateProfileName)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "No fargate profile found for name: " + fargateProfileName, 404));
     }
 
     public List<String> listFargateProfiles(String clusterName) {
-        describeCluster(clusterName);
-        String prefix = clusterName + "/";
-        return fargateProfileStorage.scan(key -> key.startsWith(prefix)).stream()
+        Cluster cluster = describeCluster(clusterName);
+        return scanFargateProfiles(resolveClusterRegion(cluster), clusterName, regionResolver.getAccountId())
+                .stream()
                 .map(FargateProfile::getFargateProfileName)
+                .distinct()
                 .collect(Collectors.toList());
     }
 
     public FargateProfile deleteFargateProfile(String clusterName, String fargateProfileName) {
+        Cluster cluster = describeCluster(clusterName);
+        String region = resolveClusterRegion(cluster);
         FargateProfile profile = describeFargateProfile(clusterName, fargateProfileName);
         profile.setStatus(FargateProfileStatus.DELETING);
-        fargateProfileStorage.delete(fargateProfileKey(clusterName, fargateProfileName));
+        fargateProfileStorage.delete(fargateProfileKey(region, clusterName, fargateProfileName));
+        fargateProfileStorage.get(legacyFargateProfileKey(clusterName, fargateProfileName))
+                .filter(legacy -> region.equals(
+                        AwsArnUtils.regionOrDefault(legacy.getFargateProfileArn(), region)))
+                .ifPresent(legacy -> fargateProfileStorage.delete(
+                        legacyFargateProfileKey(clusterName, fargateProfileName)));
         return profile;
     }
 
@@ -1370,7 +1507,8 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
      * access entry ARN; each child ARN names its cluster as the segment after the resource type.
      */
     private Map<String, String> retag(String resourceArn, UnaryOperator<Map<String, String>> edit) {
-        String resource = AwsArnUtils.isArnFor(resourceArn, "eks") ? AwsArnUtils.parse(resourceArn).resource() : "";
+        AwsArnUtils.Arn arn = AwsArnUtils.isArnFor(resourceArn, "eks") ? AwsArnUtils.parse(resourceArn) : null;
+        String resource = arn != null ? arn.resource() : "";
         String[] parts = resource.split("/", -1);
         boolean child = !"cluster".equals(parts[0]);
         if (parts.length < (child ? 3 : 2) || parts[1].isEmpty() || (child && parts[2].isEmpty())) {
@@ -1378,6 +1516,8 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         }
         String clusterName = parts[1];
         String childName = child ? parts[2] : "";
+        String region = arn != null ? arn.region() : regionResolver.getRegion();
+        String accountId = arn != null ? arn.accountId() : regionResolver.getAccountId();
         UnaryOperator<Map<String, String>> change = current -> {
             Map<String, String> next = edit.apply(current);
             if (!next.equals(current)) {
@@ -1386,29 +1526,31 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             return next;
         };
         Optional<Map<String, String>> tags = switch (parts[0]) {
-            case "cluster" -> storage.get(clusterName).map(cluster -> applyTags(cluster.getTags(), change, next -> {
-                cluster.setTags(new HashMap<>(next));
-                storage.put(clusterName, cluster);
-            }));
-            case "nodegroup" -> nodeGroupStorage.get(nodeGroupKey(clusterName, childName))
+            case "cluster" -> findClusterInRegion(accountId, region, clusterName)
+                    .map(cluster -> applyTags(cluster.getTags(), change, next -> {
+                        cluster.setTags(new HashMap<>(next));
+                        putClusterForAccount(accountId, cluster);
+                    }));
+            case "nodegroup" -> findNodeGroup(region, clusterName, childName)
                     .filter(nodegroup -> resourceArn.equals(nodegroup.getNodegroupArn()))
                     .map(nodegroup -> applyTags(nodegroup.getTags(), change, next -> {
                         nodegroup.setTags(new HashMap<>(next));
-                        nodeGroupStorage.put(nodeGroupKey(clusterName, childName), nodegroup);
+                        nodeGroupStorage.put(nodeGroupKey(region, clusterName, childName), nodegroup);
                     }));
-            case "fargateprofile" -> fargateProfileStorage.get(fargateProfileKey(clusterName, childName))
+            case "fargateprofile" -> findFargateProfile(region, clusterName, childName)
                     .filter(profile -> resourceArn.equals(profile.getFargateProfileArn()))
                     .map(profile -> applyTags(profile.getTags(), change, next -> {
                         profile.setTags(new HashMap<>(next));
-                        fargateProfileStorage.put(fargateProfileKey(clusterName, childName), profile);
+                        fargateProfileStorage.put(fargateProfileKey(region, clusterName, childName), profile);
                     }));
-            case "addon" -> addons == null ? Optional.empty() : storage.get(clusterName)
+            case "addon" -> addons == null ? Optional.empty() : findClusterInRegion(accountId, region, clusterName)
                     .flatMap(cluster -> addons.retag(cluster, childName, resourceArn, change));
             case "podidentityassociation" -> podIdentityAssociations == null ? Optional.empty()
-                    : storage.get(clusterName)
+                    : findClusterInRegion(accountId, region, clusterName)
                             .flatMap(cluster -> podIdentityAssociations.retag(cluster, childName, resourceArn, change));
-            case "access-entry" -> accessEntries == null ? Optional.empty() : storage.get(clusterName)
-                    .flatMap(cluster -> accessEntries.retag(cluster, resourceArn, change));
+            case "access-entry" -> accessEntries == null ? Optional.empty()
+                    : findClusterInRegion(accountId, region, clusterName)
+                            .flatMap(cluster -> accessEntries.retag(cluster, resourceArn, change));
             default -> Optional.empty();
         };
         return tags.orElseThrow(() -> new AwsException("NotFoundException",
@@ -1642,12 +1784,83 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         return List.of(new EncryptionConfig(List.of("secrets"), new Provider(config.getProvider().getKeyArn())));
     }
 
-    private String nodeGroupKey(String clusterName, String nodegroupName) {
+    /** The storage key for a node group: Region-qualified, like its cluster. */
+    private static String nodeGroupKey(String region, String clusterName, String nodegroupName) {
+        return region + "/" + clusterName + "/" + nodegroupName;
+    }
+
+    /** The storage key for a Fargate profile: Region-qualified, like its cluster. */
+    private static String fargateProfileKey(String region, String clusterName, String fargateProfileName) {
+        return region + "/" + clusterName + "/" + fargateProfileName;
+    }
+
+    /** The pre-fix storage key for a node group: the bare cluster name, kept only to adopt legacy records. */
+    private static String legacyNodeGroupKey(String clusterName, String nodegroupName) {
         return clusterName + "/" + nodegroupName;
     }
 
-    private String fargateProfileKey(String clusterName, String fargateProfileName) {
+    /** The pre-fix storage key for a Fargate profile: the bare cluster name, kept only to adopt legacy records. */
+    private static String legacyFargateProfileKey(String clusterName, String fargateProfileName) {
         return clusterName + "/" + fargateProfileName;
+    }
+
+    /**
+     * The node group named {@code nodegroupName} in {@code region} for {@code clusterName},
+     * adopting a group persisted under the bare key when its ARN names that Region.
+     */
+    private Optional<Nodegroup> findNodeGroup(String region, String clusterName, String nodegroupName) {
+        Optional<Nodegroup> current = nodeGroupStorage.get(nodeGroupKey(region, clusterName, nodegroupName));
+        if (current.isPresent()) {
+            return current;
+        }
+        return nodeGroupStorage.get(legacyNodeGroupKey(clusterName, nodegroupName))
+                .filter(group -> region.equals(AwsArnUtils.regionOrDefault(group.getNodegroupArn(), region)));
+    }
+
+    /**
+     * The Fargate profile named {@code fargateProfileName} in {@code region} for
+     * {@code clusterName}, adopting a profile persisted under the bare key when its ARN
+     * names that Region.
+     */
+    private Optional<FargateProfile> findFargateProfile(String region, String clusterName,
+                                                        String fargateProfileName) {
+        Optional<FargateProfile> current = fargateProfileStorage.get(
+                fargateProfileKey(region, clusterName, fargateProfileName));
+        if (current.isPresent()) {
+            return current;
+        }
+        return fargateProfileStorage.get(legacyFargateProfileKey(clusterName, fargateProfileName))
+                .filter(profile -> region.equals(
+                        AwsArnUtils.regionOrDefault(profile.getFargateProfileArn(), region)));
+    }
+
+    /**
+     * Fargate profiles of one cluster in one Region. Scans the Region-qualified prefix and the
+     * legacy bare-name prefix; the ARN filter keeps a same-named cluster in another Region from
+     * leaking in. Two entries for the same profile collapse to one.
+     */
+    private List<FargateProfile> scanFargateProfiles(String region, String clusterName, String accountId) {
+        String prefix = fargateProfileKey(region, clusterName, "");
+        String legacyPrefix = clusterName + "/";
+        List<FargateProfile> found;
+        if (fargateProfileStorage instanceof AccountAwareStorageBackend<FargateProfile> aware) {
+            found = aware.scanAllAccountEntries(key -> key.startsWith(prefix) || key.startsWith(legacyPrefix))
+                    .stream()
+                    .filter(entry -> accountId == null || accountId.equals(entry.accountId()))
+                    .map(AccountAwareStorageBackend.AccountEntry::value).toList();
+        } else {
+            found = fargateProfileStorage.scan(key -> key.startsWith(prefix) || key.startsWith(legacyPrefix));
+        }
+        Map<String, FargateProfile> byArn = new LinkedHashMap<>();
+        for (FargateProfile profile : found) {
+            if (!region.equals(AwsArnUtils.regionOrDefault(profile.getFargateProfileArn(), region))) {
+                continue;
+            }
+            String identity = profile.getFargateProfileArn() != null ? profile.getFargateProfileArn()
+                    : profile.getFargateProfileName();
+            byArn.putIfAbsent(identity, profile);
+        }
+        return List.copyOf(byArn.values());
     }
 
     private NodegroupScalingConfig defaultScalingConfig() {
@@ -1849,14 +2062,6 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             return aware.scanAllAccounts();
         }
         return storage.scan(k -> true);
-    }
-
-    private void putCluster(Cluster cluster) {
-        if (cluster.getAccountId() != null && storage instanceof AccountAwareStorageBackend<Cluster> aware) {
-            aware.putForAccount(cluster.getAccountId(), cluster.getName(), cluster);
-        } else {
-            storage.put(cluster.getName(), cluster);
-        }
     }
 
     // ─── Resource Explorer 2 ───────────────────────────────────────────────────

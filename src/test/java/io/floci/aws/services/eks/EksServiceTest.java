@@ -648,6 +648,85 @@ class EksServiceTest {
         assertThrows(AwsException.class, () -> eksService.createCluster(req));
     }
 
+    private EksService serviceForRegion(StorageFactory factory, EksOidcService oidcService, String region) {
+        return new EksService(factory, testConfig(), new RegionResolver(region, "000000000000"),
+                null, ec2Service, oidcService, mock(EksAccessEntryService.class),
+                mock(EksPodIdentityAssociationService.class));
+    }
+
+    @Test
+    void createClusterSameNameInTwoRegionsSucceeds() {
+        // #7966: a cluster name only has to be unique within its Region. Two services
+        // sharing one store but resolving different Regions must each create "demo".
+        AccountAwareStorageBackend<Cluster> clusterStore =
+                AccountAwareStorageBackend.inMemory("000000000000");
+        AccountAwareStorageBackend<ClusterOidcKey> keyStore =
+                AccountAwareStorageBackend.inMemory("000000000000");
+        EksOidcService oidcService = new EksOidcService(fixedStorageFactory(keyStore), new ObjectMapper());
+        EksService west = serviceForRegion(fixedStorageFactory(clusterStore), oidcService, "eu-west-1");
+        EksService central = serviceForRegion(fixedStorageFactory(clusterStore), oidcService, "eu-central-1");
+
+        CreateClusterRequest req = new CreateClusterRequest();
+        req.setName("demo");
+        req.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+
+        Cluster westCluster = west.createCluster(req);
+        assertEquals(ClusterStatus.ACTIVE, westCluster.getStatus());
+        assertTrue(westCluster.getArn().contains("eu-west-1"));
+
+        Cluster centralCluster = central.createCluster(req);
+        assertEquals(ClusterStatus.ACTIVE, centralCluster.getStatus());
+        assertTrue(centralCluster.getArn().contains("eu-central-1"));
+
+        // Each Region sees only its own cluster, with its own OIDC issuer.
+        assertEquals(westCluster.getArn(), west.describeCluster("demo").getArn());
+        assertEquals(centralCluster.getArn(), central.describeCluster("demo").getArn());
+        assertNotEquals(westCluster.getIdentity().getOidc().getIssuer(),
+                centralCluster.getIdentity().getOidc().getIssuer());
+    }
+
+    @Test
+    void createClusterSameNameTwiceInSameRegionStillFails() {
+        AccountAwareStorageBackend<Cluster> clusterStore =
+                AccountAwareStorageBackend.inMemory("000000000000");
+        AccountAwareStorageBackend<ClusterOidcKey> keyStore =
+                AccountAwareStorageBackend.inMemory("000000000000");
+        EksOidcService oidcService = new EksOidcService(fixedStorageFactory(keyStore), new ObjectMapper());
+        EksService west = serviceForRegion(fixedStorageFactory(clusterStore), oidcService, "eu-west-1");
+
+        CreateClusterRequest req = new CreateClusterRequest();
+        req.setName("demo");
+        req.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+
+        west.createCluster(req);
+
+        AwsException ex = assertThrows(AwsException.class, () -> west.createCluster(req));
+        assertEquals("ResourceInUseException", ex.getErrorCode());
+    }
+
+    @Test
+    void deleteClusterInOneRegionLeavesSameNamedClusterInAnotherRegion() {
+        AccountAwareStorageBackend<Cluster> clusterStore =
+                AccountAwareStorageBackend.inMemory("000000000000");
+        AccountAwareStorageBackend<ClusterOidcKey> keyStore =
+                AccountAwareStorageBackend.inMemory("000000000000");
+        EksOidcService oidcService = new EksOidcService(fixedStorageFactory(keyStore), new ObjectMapper());
+        EksService west = serviceForRegion(fixedStorageFactory(clusterStore), oidcService, "eu-west-1");
+        EksService central = serviceForRegion(fixedStorageFactory(clusterStore), oidcService, "eu-central-1");
+
+        CreateClusterRequest req = new CreateClusterRequest();
+        req.setName("demo");
+        req.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+
+        Cluster centralCluster = central.createCluster(req);
+        west.createCluster(req);
+
+        west.deleteCluster("demo");
+
+        assertThrows(AwsException.class, () -> west.describeCluster("demo"));
+        assertEquals(centralCluster.getArn(), central.describeCluster("demo").getArn());
+    }
+
     @Test
     void createClusterRejectsNamesOutsideTheAwsCharset() {
         // Matches real EKS validation. The dot matters most: EksClusterManager account-qualifies

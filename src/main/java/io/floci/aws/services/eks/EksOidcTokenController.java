@@ -1,6 +1,7 @@
 package io.floci.aws.services.eks;
 
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.services.eks.model.Cluster;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -34,11 +35,14 @@ public class EksOidcTokenController {
 
     private final EksService eksService;
     private final EksOidcService oidcService;
+    private final RegionResolver regionResolver;
 
     @Inject
-    public EksOidcTokenController(EksService eksService, EksOidcService oidcService) {
+    public EksOidcTokenController(EksService eksService, EksOidcService oidcService,
+                                  RegionResolver regionResolver) {
         this.eksService = eksService;
         this.oidcService = oidcService;
+        this.regionResolver = regionResolver;
     }
 
     @POST
@@ -59,7 +63,7 @@ public class EksOidcTokenController {
         Integer lifetime = integer(body, "expirySeconds");
 
         String token = oidcService.mintServiceAccountToken(
-                clusterName, issuer, namespace, serviceAccount, audience, lifetime);
+                regionResolver.getRegion(), clusterName, issuer, namespace, serviceAccount, audience, lifetime);
 
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("token", token);

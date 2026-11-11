@@ -33,6 +33,7 @@ class EksOidcServiceTest {
     private static final String ISSUER =
             "https://oidc.eks.us-east-1.amazonaws.com/id/ABCDEF0123456789ABCDEF0123456789";
     private static final String CLUSTER = "irsa-test-cluster";
+    private static final String REGION = "us-east-1";
 
     private EksOidcService oidcService;
 
@@ -64,8 +65,8 @@ class EksOidcServiceTest {
 
     @Test
     void ensureKeyIsIdempotentForTheSameIssuer() {
-        ClusterOidcKey first = oidcService.ensureKey(CLUSTER, ISSUER);
-        ClusterOidcKey second = oidcService.ensureKey(CLUSTER, ISSUER);
+        ClusterOidcKey first = oidcService.ensureKey(REGION, CLUSTER, ISSUER);
+        ClusterOidcKey second = oidcService.ensureKey(REGION, CLUSTER, ISSUER);
 
         assertEquals(first.getKeyId(), second.getKeyId());
         assertEquals(first.getPrivateKey(), second.getPrivateKey());
@@ -73,8 +74,8 @@ class EksOidcServiceTest {
 
     @Test
     void ensureKeyRotatesWhenTheIssuerChanges() {
-        ClusterOidcKey original = oidcService.ensureKey(CLUSTER, ISSUER);
-        ClusterOidcKey rotated = oidcService.ensureKey(CLUSTER,
+        ClusterOidcKey original = oidcService.ensureKey(REGION, CLUSTER, ISSUER);
+        ClusterOidcKey rotated = oidcService.ensureKey(REGION, CLUSTER,
                 "https://oidc.eks.us-east-1.amazonaws.com/id/0000000000000000000000000000BEEF");
 
         assertNotEquals(original.getPrivateKey(), rotated.getPrivateKey());
@@ -97,7 +98,7 @@ class EksOidcServiceTest {
             }
         }, new ObjectMapper());
 
-        service.ensureKeyForAccount("999999999999", CLUSTER, ISSUER);
+        service.ensureKeyForAccount("999999999999", REGION, CLUSTER, ISSUER);
 
         // The lookup runs outside any request context, so it resolves to the default account.
         assertTrue(service.findVerificationKey(ISSUER).isPresent());
@@ -105,7 +106,7 @@ class EksOidcServiceTest {
 
     @Test
     void findVerificationKeyResolvesOnlyKnownIssuers() {
-        oidcService.ensureKey(CLUSTER, ISSUER);
+        oidcService.ensureKey(REGION, CLUSTER, ISSUER);
 
         assertTrue(oidcService.findVerificationKey(ISSUER).isPresent());
         assertTrue(oidcService.findVerificationKey("https://accounts.google.com").isEmpty());
@@ -115,18 +116,18 @@ class EksOidcServiceTest {
 
     @Test
     void deleteKeyRemovesSigningMaterial() {
-        oidcService.ensureKey(CLUSTER, ISSUER);
-        oidcService.deleteKey(CLUSTER);
+        oidcService.ensureKey(REGION, CLUSTER, ISSUER);
+        oidcService.deleteKey(REGION, CLUSTER);
 
-        assertTrue(oidcService.findKeyByCluster(CLUSTER).isEmpty());
+        assertTrue(oidcService.findKeyByCluster(REGION, CLUSTER).isEmpty());
         assertTrue(oidcService.findVerificationKey(ISSUER).isEmpty());
     }
 
     @Test
     void mintedTokenCarriesKubernetesServiceAccountClaims() {
-        oidcService.ensureKey(CLUSTER, ISSUER);
+        oidcService.ensureKey(REGION, CLUSTER, ISSUER);
         String payload = decodePayload(oidcService.mintServiceAccountToken(
-                CLUSTER, ISSUER, "my-namespace", "my-service-account", null, null));
+                REGION, CLUSTER, ISSUER, "my-namespace", "my-service-account", null, null));
 
         assertTrue(payload.contains("\"sub\":\"system:serviceaccount:my-namespace:my-service-account\""));
         assertTrue(payload.contains("\"kubernetes.io\""));
@@ -136,25 +137,25 @@ class EksOidcServiceTest {
 
     @Test
     void mintRejectsMissingNamespaceOrServiceAccount() {
-        oidcService.ensureKey(CLUSTER, ISSUER);
+        oidcService.ensureKey(REGION, CLUSTER, ISSUER);
 
         assertThrows(AwsException.class, () -> oidcService.mintServiceAccountToken(
-                CLUSTER, ISSUER, null, "my-service-account", null, null));
+                REGION, CLUSTER, ISSUER, null, "my-service-account", null, null));
         assertThrows(AwsException.class, () -> oidcService.mintServiceAccountToken(
-                CLUSTER, ISSUER, "  ", "my-service-account", null, null));
+                REGION, CLUSTER, ISSUER, "  ", "my-service-account", null, null));
         assertThrows(AwsException.class, () -> oidcService.mintServiceAccountToken(
-                CLUSTER, ISSUER, "my-namespace", null, null, null));
+                REGION, CLUSTER, ISSUER, "my-namespace", null, null, null));
         assertThrows(AwsException.class, () -> oidcService.mintServiceAccountToken(
-                CLUSTER, ISSUER, "my-namespace", "  ", null, null));
+                REGION, CLUSTER, ISSUER, "my-namespace", "  ", null, null));
     }
 
     @Test
     void mintClampsLifetimeToTheMaximum() {
-        oidcService.ensureKey(CLUSTER, ISSUER);
+        oidcService.ensureKey(REGION, CLUSTER, ISSUER);
         long now = System.currentTimeMillis() / 1000;
 
         String payload = decodePayload(oidcService.mintServiceAccountToken(
-                CLUSTER, ISSUER, "my-namespace", "my-service-account", null, Integer.MAX_VALUE));
+                REGION, CLUSTER, ISSUER, "my-namespace", "my-service-account", null, Integer.MAX_VALUE));
 
         long exp = Long.parseLong(payload.replaceAll(".*\"exp\":(\\d+).*", "$1"));
         assertTrue(exp <= now + 604800, "expiry was not clamped to 7 days: " + exp);
@@ -163,9 +164,9 @@ class EksOidcServiceTest {
     @Test
     void namespaceWithControlCharactersStillProducesAParseableToken() {
         // Claims are serialized with Jackson, so a newline is escaped rather than breaking the JSON.
-        oidcService.ensureKey(CLUSTER, ISSUER);
+        oidcService.ensureKey(REGION, CLUSTER, ISSUER);
         String payload = decodePayload(oidcService.mintServiceAccountToken(
-                CLUSTER, ISSUER, "bad\nnamespace\"quote", "my-service-account", null, null));
+                REGION, CLUSTER, ISSUER, "bad\nnamespace\"quote", "my-service-account", null, null));
 
         assertFalse(payload.contains("\n"), "raw newline leaked into the JWT payload");
         assertTrue(payload.contains("\\n"));
@@ -173,7 +174,7 @@ class EksOidcServiceTest {
 
     @Test
     void exportSigningKeyPemProducesValidPkcs8MatchingClusterKey() throws Exception {
-        ClusterOidcKey key = oidcService.ensureKey(CLUSTER, ISSUER);
+        ClusterOidcKey key = oidcService.ensureKey(REGION, CLUSTER, ISSUER);
         String pem = oidcService.exportSigningKeyPem(key);
 
         assertTrue(pem.startsWith("-----BEGIN PRIVATE KEY-----\n"));
@@ -192,7 +193,7 @@ class EksOidcServiceTest {
 
     @Test
     void exportPublicKeyPemProducesValidX509MatchingClusterKey() throws Exception {
-        ClusterOidcKey key = oidcService.ensureKey(CLUSTER, ISSUER);
+        ClusterOidcKey key = oidcService.ensureKey(REGION, CLUSTER, ISSUER);
         String pem = oidcService.exportPublicKeyPem(key);
 
         assertTrue(pem.startsWith("-----BEGIN PUBLIC KEY-----\n"));
@@ -211,7 +212,7 @@ class EksOidcServiceTest {
 
     @Test
     void exportedKeyPairSignsAndVerifies() throws Exception {
-        ClusterOidcKey key = oidcService.ensureKey(CLUSTER, ISSUER);
+        ClusterOidcKey key = oidcService.ensureKey(REGION, CLUSTER, ISSUER);
         String signingPem = oidcService.exportSigningKeyPem(key);
         String publicPem = oidcService.exportPublicKeyPem(key);
 

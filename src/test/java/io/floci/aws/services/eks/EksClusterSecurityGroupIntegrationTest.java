@@ -203,7 +203,7 @@ class EksClusterSecurityGroupIntegrationTest {
             RequestScopes.runAs(nonDefaultAccount, () -> ec2Service.deleteSecurityGroup("us-east-1", backfilledSgId));
         } finally {
             RequestScopes.runAs(nonDefaultAccount, () -> ec2Service.deleteVpc("us-east-1", nonDefaultVpcId));
-            eksService.deleteClusterForAccount(nonDefaultAccount, "it-nondefault-cluster");
+            eksService.deleteClusterForAccount(nonDefaultAccount, "us-east-1", "it-nondefault-cluster");
         }
     }
 }

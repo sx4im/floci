@@ -473,7 +473,7 @@ class EksLaunchTemplateUserDataTest {
 
         // Delete nodegroup and cluster via deleteClusterForAccount, then recreate
         eksService.deleteNodeGroup(CLUSTER_NAME, "ng-acc");
-        eksService.deleteClusterForAccount(ACCOUNT, CLUSTER_NAME);
+        eksService.deleteClusterForAccount(ACCOUNT, REGION, CLUSTER_NAME);
 
         CreateClusterRequest clusterReq = new CreateClusterRequest();
         clusterReq.setName(CLUSTER_NAME);
