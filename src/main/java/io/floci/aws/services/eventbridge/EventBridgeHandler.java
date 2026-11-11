@@ -410,6 +410,10 @@ public class EventBridgeHandler {
                 if (!entryNode.path("Detail").isMissingNode()) {
                     entry.put("Detail", entryNode.path("Detail").asText(null));
                 }
+                if (!entryNode.path("Time").isMissingNode() && !entryNode.path("Time").isNull()) {
+                    JsonNode timeNode = entryNode.path("Time");
+                    entry.put("Time", timeNode.isNumber() ? timeNode.numberValue() : timeNode.asText(null));
+                }
                 if (!entryNode.path("Resources").isMissingNode()) {
                     entry.put("Resources", entryNode.path("Resources"));
                 }

@@ -353,6 +353,11 @@ public class EventBridgeInvoker {
                 // AWS keeps the originating account/region; blank falls back inside putEvents.
                 entry.put("Region", envelope.path("region").asText(""));
                 entry.put("Account", envelope.path("account").asText(""));
+                // The forwarded event keeps the original event's time instead
+                // of being re-stamped with the forward time.
+                if (envelope.hasNonNull("time")) {
+                    entry.put("Time", envelope.path("time").asText());
+                }
                 if (envelope.hasNonNull("resources") && envelope.get("resources").isArray()) {
                     entry.put("Resources", envelope.get("resources"));
                 }

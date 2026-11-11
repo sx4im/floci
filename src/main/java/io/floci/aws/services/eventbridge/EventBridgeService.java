@@ -51,6 +51,8 @@ import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.time.Instant;
+import java.time.format.DateTimeParseException;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -1490,7 +1492,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
             node.put("source", source);
             node.put("detail-type", detailType);
             node.put("account", envelopeAccount);
-            node.put("time", Instant.now().toString());
+            node.put("time", resolveEventTime(entry).toString());
             node.put("region", envelopeRegion);
             node.putArray("resources").addAll(resources);
             node.set("detail", objectMapper.readTree(detail));
@@ -1502,6 +1504,34 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
     }
 
     // ──────────────────────────── Helpers ────────────────────────────
+
+    /**
+     * The {@code time} a delivered event reports. AWS stamps whole-second
+     * ISO-8601, and a {@code PutEvents} entry's {@code Time} wins over the
+     * receive time, so a replayed or back-dated event keeps its original time.
+     * The entry carries {@code Time} as an ISO-8601 string from the JSON
+     * protocol, an epoch-seconds number from SDKs that send timestamps that
+     * way, or an {@link Instant} from in-process callers; anything
+     * unparseable falls back to the receive time rather than failing delivery.
+     */
+    private Instant resolveEventTime(Map<String, Object> entry) {
+        Object rawTime = entry.get("Time");
+        if (rawTime instanceof Instant instant) {
+            return instant.truncatedTo(ChronoUnit.SECONDS);
+        }
+        if (rawTime instanceof Number number) {
+            return Instant.ofEpochSecond(number.longValue());
+        }
+        if (rawTime instanceof String text && !text.isBlank()) {
+            try {
+                return Instant.parse(text).truncatedTo(ChronoUnit.SECONDS);
+            } catch (DateTimeParseException ignored) {
+                // An unparseable entry Time is not a delivery failure: fall
+                // through to the receive time stamped below.
+            }
+        }
+        return Instant.now().truncatedTo(ChronoUnit.SECONDS);
+    }
 
     private boolean isRuleEnabled(String ruleStoreKey) {
         return ruleStore.get(ruleStoreKey)

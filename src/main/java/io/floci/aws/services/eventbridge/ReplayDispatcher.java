@@ -85,6 +85,7 @@ public class ReplayDispatcher {
                             entry.put("DetailType", event.getDetailType());
                             entry.put("Detail", event.getDetail() != null ? event.getDetail() : "{}");
                             entry.put("EventBusName", destBusName);
+                            entry.put("Time", event.getEventTime());
                             eventSender.accept(List.of(entry));
                             progressUpdater.accept(event.getEventTime());
                         }
