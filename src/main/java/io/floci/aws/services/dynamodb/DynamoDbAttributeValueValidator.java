@@ -64,6 +64,8 @@ final class DynamoDbAttributeValueValidator {
         if (hasFalseNull(value)) {
             return FALSE_NULL;
         }
+        requireScalarMemberTypes(value);
+        typeOf(value);
         if (value.path("N").isTextual()) {
             String problem = DynamoDbNumberUtils.itemNumberProblem(value.get("N").asText());
             if (problem != null) {
@@ -80,6 +82,22 @@ final class DynamoDbAttributeValueValidator {
         }
         String problem = firstProblem(value.path("L"));
         return problem != null ? problem : firstProblem(value.path("M"));
+    }
+
+    // A scalar member must carry the JSON type AWS reads for it: S, N and B are
+    // strings and BOOL is a boolean. Anything else is a malformed payload.
+    private static void requireScalarMemberTypes(JsonNode value) {
+        if (!value.isObject()) {
+            return;
+        }
+        for (String member : List.of("S", "N", "B")) {
+            if (value.has(member) && !value.get(member).isTextual()) {
+                throw serializationEx("Unexpected value type in payload");
+            }
+        }
+        if (value.has("BOOL") && !value.get("BOOL").isBoolean()) {
+            throw serializationEx("Unexpected value type in payload");
+        }
     }
 
     // A number set is read in full before its members are compared by value.

@@ -2346,6 +2346,29 @@ class NativeDynamoDbJsonHandlerTest {
         assertEquals("1 validation error detected: " + problem, ex.getMessage());
     }
 
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', textBlock = """
+            {"pk":{"S":"a"},"m":{"M":{"S":{"0":"v"}}}} | ValidationException | Supplied AttributeValue is empty, must contain exactly one of the supported datatypes
+            {"pk":{"S":"a"},"m":{"S":{"0":"v"}}} | SerializationException | Unexpected value type in payload
+            {"pk":{"S":"a"},"l":{"L":[{"S":{"x":1}}]}} | SerializationException | Unexpected value type in payload
+            {"pk":{"S":"a"},"n":{"N":123}} | SerializationException | Unexpected value type in payload
+            {"pk":{"S":"a"},"b":{"BOOL":"true"}} | SerializationException | Unexpected value type in payload
+            {"pk":{"S":"a"},"m":{"M":{"inner":{"S":"v"}}}} | ResourceNotFoundException |
+            """)
+    void putItemRefusesAttributeValuesWithTheWrongMemberType(String item, String errorCode, String message)
+            throws Exception {
+        ObjectNode request = mapper.createObjectNode();
+        request.put("TableName", "Missing");
+        request.set("Item", mapper.readTree(item));
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("PutItem", request, "eu-west-1"));
+        assertEquals(errorCode, ex.getErrorCode());
+        if (message != null) {
+            assertEquals(message, ex.getMessage());
+        }
+    }
+
     @Test
     void aRepeatedStringIsQuotedAsRustsDebugFormatDoes() {
         String member = "a\"\\\t\r\n\0\u0001\u007f \u00a0\u00e9\u0301\u09be\u0903\u200b\ue000\uD83D\uDE00";
