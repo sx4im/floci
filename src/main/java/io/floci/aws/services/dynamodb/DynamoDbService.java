@@ -1638,29 +1638,27 @@ public class DynamoDbService {
             }
         }
 
-        // Apply ExclusiveStartKey offset
+        // Apply ExclusiveStartKey offset. The start key is a position in the
+        // order this query returns rows, not a pointer to an existing item: a
+        // deleted or re-keyed start key still resumes strictly after its
+        // position, and a start key past the end returns nothing.
+        // See floci-io/floci#7970.
         if (exclusiveStartKey != null) {
             String tablePkName = table.getPartitionKeyName();
             String tableSkName = table.getSortKeyName();
-            boolean hasTableKeys = exclusiveStartKey.has(tablePkName);
-
-            String startItemKey = hasTableKeys
-                    ? buildItemKeyFromNode(exclusiveStartKey, tablePkName, tableSkName)
-                    : buildItemKeyFromNode(exclusiveStartKey, pkName, sortKeyNames);
-
+            boolean forward = !Boolean.FALSE.equals(scanIndexForward);
             int startIdx = -1;
             for (int i = 0; i < results.size(); i++) {
-                String thisKey = hasTableKeys
-                        ? buildItemKeyFromNode(results.get(i), tablePkName, tableSkName)
-                        : buildItemKeyFromNode(results.get(i), pkName, sortKeyNames);
-                if (thisKey.equals(startItemKey)) {
+                int cmp = compareQueryPosition(results.get(i), exclusiveStartKey,
+                        sortKeyNames, tablePkName, tableSkName);
+                if (forward ? cmp > 0 : cmp < 0) {
                     startIdx = i;
                     break;
                 }
             }
-            if (startIdx >= 0) {
-                results = new ArrayList<>(results.subList(startIdx + 1, results.size()));
-            }
+            results = startIdx >= 0
+                    ? new ArrayList<>(results.subList(startIdx, results.size()))
+                    : new ArrayList<>();
         }
 
         List<JsonNode> evaluatedItems = results;
@@ -4792,6 +4790,35 @@ public class DynamoDbService {
                     + DynamoDbKeyValueErrors.emptyValueKind(type) + ".", 400);
         }
         return DynamoDbKeyValueErrors.emptyIndexKeyValue(type, indexName, attrName);
+    }
+
+    // Positions a row in the order a Query returns it: the access-path sort-key
+    // components in key-schema order, with the base table key breaking ties.
+    // Null sort values sort first, matching the sort in query(). The start key
+    // is validated to carry the paged key schema, so its sort components are
+    // present; a missing table key degrades to a sort-only comparison.
+    private int compareQueryPosition(JsonNode item, JsonNode startKey, List<String> sortKeyNames,
+                                     String tablePkName, String tableSkName) {
+        for (String name : sortKeyNames) {
+            JsonNode itemAttr = item.get(name);
+            JsonNode startAttr = startKey.get(name);
+            int cmp;
+            if (itemAttr == null && startAttr == null) {
+                cmp = 0;
+            } else if (itemAttr == null) {
+                cmp = -1;
+            } else if (startAttr == null) {
+                cmp = 1;
+            } else {
+                cmp = ExpressionEvaluator.compareAttributeValues(itemAttr, startAttr);
+            }
+            if (cmp != 0) {
+                return cmp;
+            }
+        }
+        if (startKey.get(tablePkName) == null) return 0;
+        return buildItemKeyFromNode(item, tablePkName, tableSkName)
+                .compareTo(buildItemKeyFromNode(startKey, tablePkName, tableSkName));
     }
 
     private String buildItemKeyFromNode(JsonNode item, String pkName, String skName) {
