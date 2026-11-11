@@ -359,6 +359,64 @@ class AutoScalingServiceTest {
         assertTrue(service.describeAutoScalingGroups(REGION, List.of("missing-image-asg")).isEmpty());
     }
 
+    @Test
+    void createAutoScalingGroupWithoutLaunchTemplateVersionUsesTheDefaultVersion() {
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        service.ec2Service = ec2Service;
+        LaunchTemplate latest = new LaunchTemplate();
+        latest.getData().setImageId(null);
+        LaunchTemplate defaultVersion = new LaunchTemplate();
+        defaultVersion.getData().setImageId("ami-11111111");
+        when(ec2Service.describeLaunchTemplateVersions(REGION, "lt-versioned", null, List.of()))
+                .thenReturn(List.of(latest));
+        when(ec2Service.describeLaunchTemplateVersions(REGION, "lt-versioned", null, List.of("$Default")))
+                .thenReturn(List.of(defaultVersion));
+
+        AutoScalingGroup group = service.createAutoScalingGroup(REGION,
+                "default-version-asg",
+                null,
+                "lt-versioned",
+                null,
+                null,
+                null,
+                0,
+                1,
+                0,
+                300,
+                List.of("us-east-1a"),
+                List.of(),
+                List.of(),
+                List.of(),
+                "EC2",
+                0,
+                List.of("Default"),
+                Map.of(), Map.of(), AsgOptionalFields.none());
+
+        assertEquals("$Default", group.getLaunchTemplateVersion());
+        assertEquals("$Default", service.describeAutoScalingGroups(REGION, List.of("default-version-asg"))
+                .getFirst().getLaunchTemplateVersion());
+        verify(ec2Service).describeLaunchTemplateVersions(REGION, "lt-versioned", null, List.of("$Default"));
+    }
+
+    @Test
+    void updateAutoScalingGroupWithoutLaunchTemplateVersionUsesTheDefaultVersion() {
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        service.ec2Service = ec2Service;
+        LaunchTemplate defaultVersion = new LaunchTemplate();
+        defaultVersion.getData().setImageId("ami-11111111");
+        when(ec2Service.describeLaunchTemplateVersions(REGION, "lt-versioned", null, List.of("$Default")))
+                .thenReturn(List.of(defaultVersion));
+
+        service.updateAutoScalingGroup(REGION, "test-asg", null, "lt-versioned", null, null, null,
+                null, null, null, null, null, null, null, null, null, AsgOptionalFields.none());
+
+        assertEquals("lt-versioned", service.describeAutoScalingGroups(REGION, List.of("test-asg"))
+                .getFirst().getLaunchTemplateId());
+        assertEquals("$Default", service.describeAutoScalingGroups(REGION, List.of("test-asg"))
+                .getFirst().getLaunchTemplateVersion());
+        verify(ec2Service).describeLaunchTemplateVersions(REGION, "lt-versioned", null, List.of("$Default"));
+    }
+
     static Stream<String> rejectedUserData() throws IOException {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         try (GZIPOutputStream gzip = new GZIPOutputStream(bytes)) {

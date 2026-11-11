@@ -402,8 +402,13 @@ public class AutoScalingService implements PassedRoleLookup {
                     "Valid requests must contain either LaunchTemplate, LaunchConfigurationName, "
                             + "InstanceId or MixedInstancesPolicy parameter.", 400);
         }
+        // A group naming a launch template without a version launches from the template's
+        // default version. Normalizing here, where the group is written, keeps the
+        // validation below and every later lookup on the default version.
+        String effectiveLaunchTemplateVersion = defaultLaunchTemplateVersion(launchTemplateId,
+                launchTemplateName, launchTemplateVersion);
         validateEffectiveLaunchImage(region, launchConfigName, launchTemplateId, launchTemplateName,
-                launchTemplateVersion, mixedInstancesPolicy);
+                effectiveLaunchTemplateVersion, mixedInstancesPolicy);
         validateOptionalFields(optionalFields);
         validateDesiredCapacityType(
                 optionalFields != null ? optionalFields.desiredCapacityType() : null,
@@ -417,7 +422,7 @@ public class AutoScalingService implements PassedRoleLookup {
         asg.setLaunchConfigurationName(launchConfigName);
         asg.setLaunchTemplateId(launchTemplateId);
         asg.setLaunchTemplateName(launchTemplateName);
-        asg.setLaunchTemplateVersion(launchTemplateVersion);
+        asg.setLaunchTemplateVersion(effectiveLaunchTemplateVersion);
         asg.setMixedInstancesPolicy(mixedInstancesPolicy);
         asg.setMinSize(minSize);
         asg.setMaxSize(maxSize);
@@ -467,10 +472,16 @@ public class AutoScalingService implements PassedRoleLookup {
                         "LaunchTemplateVersion requires a LaunchTemplateId or LaunchTemplateName.", 400);
             }
             validateOptionalFields(optionalFields);
+            // A group naming a launch template without a version launches from the template's
+            // default version. Normalizing here keeps the validation below and the stored
+            // group on the default version.
+            String effectiveLaunchTemplateVersion = defaultLaunchTemplateVersion(launchTemplateId,
+                    launchTemplateName, launchTemplateVersion);
             rejectDesiredConfigurationUpdateDuringActiveRefresh(region, name,
-                    launchConfigName, launchTemplateId, launchTemplateName, launchTemplateVersion, mixedInstancesPolicy);
+                    launchConfigName, launchTemplateId, launchTemplateName, effectiveLaunchTemplateVersion,
+                    mixedInstancesPolicy);
             LaunchIdentity effectiveIdentity = effectiveLaunchIdentity(asg, launchConfigName,
-                    launchTemplateId, launchTemplateName, launchTemplateVersion, mixedInstancesPolicy);
+                    launchTemplateId, launchTemplateName, effectiveLaunchTemplateVersion, mixedInstancesPolicy);
             validateEffectiveLaunchImage(region,
                     effectiveIdentity.launchConfigurationName(),
                     effectiveIdentity.launchTemplateId(),
@@ -495,7 +506,7 @@ public class AutoScalingService implements PassedRoleLookup {
                 asg.setLaunchConfigurationName(null);
                 asg.setLaunchTemplateId(launchTemplateId);
                 asg.setLaunchTemplateName(launchTemplateName);
-                asg.setLaunchTemplateVersion(launchTemplateVersion);
+                asg.setLaunchTemplateVersion(effectiveLaunchTemplateVersion);
                 asg.setMixedInstancesPolicy(null);
             }
             if (mixedInstancesPolicy != null) {
@@ -2062,6 +2073,22 @@ public class AutoScalingService implements PassedRoleLookup {
                     specification.getLaunchTemplateName(),
                     specification.getVersion());
         }
+    }
+
+    /**
+     * The version a group launches from when it names a launch template without one.
+     * The model's {@code LaunchTemplateSpecification.Version} defaults to {@code $Default},
+     * so an unnamed version means the template's default version, never the latest.
+     * Callers normalize at the write path and store the result, so validation, launch,
+     * and profile lookups all resolve the same version.
+     */
+    private static String defaultLaunchTemplateVersion(String launchTemplateId, String launchTemplateName,
+                                                        String launchTemplateVersion) {
+        if (isBlank(launchTemplateVersion)
+                && (!isBlank(launchTemplateId) || !isBlank(launchTemplateName))) {
+            return "$Default";
+        }
+        return launchTemplateVersion;
     }
 
     private void validateLaunchTemplateImage(String region, String launchTemplateId,
