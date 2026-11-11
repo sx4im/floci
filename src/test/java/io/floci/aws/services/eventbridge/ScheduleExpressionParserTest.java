@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 
 import java.time.DayOfWeek;
 import java.time.ZonedDateTime;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -223,5 +224,41 @@ class ScheduleExpressionParserTest {
         long delay = ScheduleExpressionParser.millisUntilNextFire("cron(0 * * * ? *)", from);
 
         assertTrue(delay >= 1000);
+    }
+
+    // ──────────────────────────── validate ────────────────────────────
+
+    @Test
+    void validateAcceptsSingularForOneAndPluralOtherwise() {
+        assertDoesNotThrow(() -> ScheduleExpressionParser.validate("rate(1 minute)"));
+        assertDoesNotThrow(() -> ScheduleExpressionParser.validate("rate(1 hour)"));
+        assertDoesNotThrow(() -> ScheduleExpressionParser.validate("rate(1 day)"));
+        assertDoesNotThrow(() -> ScheduleExpressionParser.validate("rate(1 week)"));
+        assertDoesNotThrow(() -> ScheduleExpressionParser.validate("rate(2 minutes)"));
+        assertDoesNotThrow(() -> ScheduleExpressionParser.validate("rate(5 hours)"));
+        assertDoesNotThrow(() -> ScheduleExpressionParser.validate("rate(2 days)"));
+        assertDoesNotThrow(() -> ScheduleExpressionParser.validate("rate(2 weeks)"));
+        assertDoesNotThrow(() -> ScheduleExpressionParser.validate("cron(0 10 * * ? *)"));
+    }
+
+    @Test
+    void validateRejectsSingularPluralMismatch() {
+        for (String expression : List.of("rate(1 minutes)", "rate(2 minute)",
+                "rate(1 hours)", "rate(5 hour)", "rate(1 days)", "rate(5 day)",
+                "rate(1 weeks)", "rate(2 week)")) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> ScheduleExpressionParser.validate(expression), expression);
+        }
+    }
+
+    @Test
+    void validateRejectsInvalidExpressions() {
+        for (String expression : List.of("rate(0 minutes)", "rate(5)", "garbage",
+                "cron(0 10 * * *)", "cron(invalid)")) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> ScheduleExpressionParser.validate(expression), expression);
+        }
+        assertThrows(IllegalArgumentException.class, () -> ScheduleExpressionParser.validate(null));
+        assertThrows(IllegalArgumentException.class, () -> ScheduleExpressionParser.validate("  "));
     }
 }

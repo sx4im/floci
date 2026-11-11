@@ -451,6 +451,30 @@ class EventBridgeServiceTest {
     }
 
     @Test
+    void putRuleRejectsRateWithWrongSingularPlural() {
+        for (String expression : List.of("rate(1 minutes)", "rate(2 minute)",
+                "rate(1 hours)", "rate(5 hour)", "rate(1 days)", "rate(5 day)")) {
+            AwsException error = assertThrows(AwsException.class, () ->
+                    service.putRule("bad-rule", null, null, expression, RuleState.ENABLED,
+                            null, null, null, REGION), expression);
+            assertEquals("ValidationException", error.getErrorCode());
+            assertEquals(400, error.getHttpStatus());
+            assertEquals("Parameter ScheduleExpression is not valid.", error.getMessage());
+        }
+        assertTrue(service.listRules(null, null, REGION).isEmpty());
+    }
+
+    @Test
+    void putRuleAcceptsRateWithCorrectSingularPlural() {
+        Rule one = service.putRule("ok-1", null, null, "rate(1 minute)", RuleState.ENABLED,
+                null, null, null, REGION);
+        assertEquals("rate(1 minute)", one.getScheduleExpression());
+        Rule many = service.putRule("ok-2", null, null, "rate(2 minutes)", RuleState.ENABLED,
+                null, null, null, REGION);
+        assertEquals("rate(2 minutes)", many.getScheduleExpression());
+    }
+
+    @Test
     void putRuleForNonExistentBusThrows() {
         assertThrows(AwsException.class, () ->
                 service.putRule("rule", "missing-bus", "{\"source\":[\"my.app\"]}", null, null,

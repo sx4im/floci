@@ -5,6 +5,7 @@ import com.cronutils.model.time.ExecutionTime;
 import com.cronutils.parser.CronParser;
 import io.floci.aws.core.common.AwsCronDefinitions;
 
+import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.regex.Matcher;
@@ -30,6 +31,43 @@ public final class ScheduleExpressionParser {
 
     public static boolean isCronExpression(String expression) {
         return expression != null && CRON_PATTERN.matcher(expression.trim()).matches();
+    }
+
+    /**
+     * Checks a schedule expression the way AWS validates it at PutRule time: a rate
+     * value of 1 takes the singular unit and any other value the plural, and a cron
+     * expression must parse as a six-field AWS cron. The fire-time parsers stay
+     * lenient, so rules persisted before this check still fire.
+     */
+    public static void validate(String expression) {
+        if (expression == null || expression.isBlank()) {
+            throw new IllegalArgumentException("Schedule expression cannot be null or blank");
+        }
+        String trimmed = expression.trim();
+        Matcher rateMatcher = RATE_PATTERN.matcher(trimmed);
+        if (rateMatcher.matches()) {
+            int value = Integer.parseInt(rateMatcher.group(1));
+            if (value < 1) {
+                throw new IllegalArgumentException("Rate value must be >= 1, got: " + value);
+            }
+            String unit = rateMatcher.group(2).toLowerCase();
+            boolean plural = unit.endsWith("s");
+            if ((value == 1) == plural) {
+                throw new IllegalArgumentException(
+                        "Rate unit must be singular for 1 and plural for values greater than 1");
+            }
+            return;
+        }
+        Matcher cronMatcher = CRON_PATTERN.matcher(trimmed);
+        if (cronMatcher.matches()) {
+            try {
+                getNextFireTime(trimmed, ZonedDateTime.now(ZoneOffset.UTC));
+            } catch (RuntimeException e) {
+                throw new IllegalArgumentException("Not a valid cron expression: " + expression, e);
+            }
+            return;
+        }
+        throw new IllegalArgumentException("Not a valid schedule expression: " + expression);
     }
 
     public static long parseRateToMillis(String expression) {
