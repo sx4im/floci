@@ -1638,29 +1638,21 @@ public class DynamoDbService {
             }
         }
 
-        // Apply ExclusiveStartKey offset
+        // Apply ExclusiveStartKey offset. The start key names a position in key order,
+        // not an existing item: a paged walk resumes strictly after that position even
+        // when the item there was deleted, never existed, or moved to a new index
+        // position since the previous page. An exact-match lookup would restart from
+        // the first item (or, for an index, resume after the item's new position
+        // instead of the named one). See floci-io/floci#7970.
         if (exclusiveStartKey != null) {
-            String tablePkName = table.getPartitionKeyName();
-            String tableSkName = table.getSortKeyName();
-            boolean hasTableKeys = exclusiveStartKey.has(tablePkName);
-
-            String startItemKey = hasTableKeys
-                    ? buildItemKeyFromNode(exclusiveStartKey, tablePkName, tableSkName)
-                    : buildItemKeyFromNode(exclusiveStartKey, pkName, sortKeyNames);
-
-            int startIdx = -1;
-            for (int i = 0; i < results.size(); i++) {
-                String thisKey = hasTableKeys
-                        ? buildItemKeyFromNode(results.get(i), tablePkName, tableSkName)
-                        : buildItemKeyFromNode(results.get(i), pkName, sortKeyNames);
-                if (thisKey.equals(startItemKey)) {
-                    startIdx = i;
-                    break;
-                }
+            boolean reverse = Boolean.FALSE.equals(scanIndexForward);
+            int firstAfter = 0;
+            while (firstAfter < results.size()
+                    && !isAfterStartKey(results.get(firstAfter), exclusiveStartKey,
+                            sortKeyNames, table, reverse)) {
+                firstAfter++;
             }
-            if (startIdx >= 0) {
-                results = new ArrayList<>(results.subList(startIdx + 1, results.size()));
-            }
+            results = new ArrayList<>(results.subList(firstAfter, results.size()));
         }
 
         List<JsonNode> evaluatedItems = results;
@@ -4974,6 +4966,54 @@ public class DynamoDbService {
             }
             default -> true;
         };
+    }
+
+    // True when the item sorts strictly after the ExclusiveStartKey position in the
+    // order the query returns rows in: the access path's sort-key components in
+    // key-schema order, with the base table key as the tie-break (several rows share
+    // one index sort key, ordered by their base key). The comparison uses the same
+    // attribute ordering as the result sort above, so it stays consistent with it.
+    private boolean isAfterStartKey(JsonNode item, JsonNode exclusiveStartKey,
+                                    List<String> sortKeyNames, TableDefinition table, boolean reverse) {
+        int cmp = compareStartKeyPosition(item, exclusiveStartKey, sortKeyNames, table);
+        return reverse ? cmp < 0 : cmp > 0;
+    }
+
+    private int compareStartKeyPosition(JsonNode item, JsonNode exclusiveStartKey,
+                                        List<String> sortKeyNames, TableDefinition table) {
+        for (String name : sortKeyNames) {
+            int cmp = compareStartKeyAttribute(item.get(name), exclusiveStartKey.get(name));
+            if (cmp != 0) {
+                return cmp;
+            }
+        }
+        int cmp = compareStartKeyAttribute(item.get(table.getPartitionKeyName()),
+                exclusiveStartKey.get(table.getPartitionKeyName()));
+        if (cmp != 0) {
+            return cmp;
+        }
+        String tableSkName = table.getSortKeyName();
+        if (tableSkName != null) {
+            cmp = compareStartKeyAttribute(item.get(tableSkName), exclusiveStartKey.get(tableSkName));
+            if (cmp != 0) {
+                return cmp;
+            }
+        }
+        return 0;
+    }
+
+    // Mirrors the result sort's null handling: a missing attribute sorts before any value.
+    private int compareStartKeyAttribute(JsonNode itemAttr, JsonNode startAttr) {
+        if (itemAttr == null && startAttr == null) {
+            return 0;
+        }
+        if (itemAttr == null) {
+            return -1;
+        }
+        if (startAttr == null) {
+            return 1;
+        }
+        return ExpressionEvaluator.compareAttributeValues(itemAttr, startAttr);
     }
 
     private void validateExclusiveStartKeyWithinQuery(JsonNode exclusiveStartKey, TableDefinition table,
