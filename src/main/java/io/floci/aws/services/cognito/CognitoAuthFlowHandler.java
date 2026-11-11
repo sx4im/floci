@@ -601,7 +601,18 @@ final class CognitoAuthFlowHandler {
         if (password == null) throw new AwsException("InvalidParameterException", "PASSWORD is required", 400);
         validateSecretHash(client, params, username);
 
-        CognitoUser user = verifyPassword(pool, client, username, password, clientMetadata, recordAuthEvent);
+        CognitoUser user;
+        try {
+            user = verifyPassword(pool, client, username, password, clientMetadata, recordAuthEvent);
+        } catch (AwsException exception) {
+            // AWS answers an unknown user as it answers a wrong password when the client prevents
+            // user existence errors, so the two cannot be told apart.
+            if ("UserNotFoundException".equals(exception.getErrorCode())
+                    && "ENABLED".equals(client.getPreventUserExistenceErrors())) {
+                throw new AwsException("NotAuthorizedException", INCORRECT_CREDENTIALS, 400);
+            }
+            throw exception;
+        }
         String authEventId = recordAuthEvent ? service.recordSignInEvent(pool, user, true) : null;
 
         if (user.isTemporaryPassword() || "FORCE_CHANGE_PASSWORD".equals(user.getUserStatus())) {

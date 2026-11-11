@@ -3295,6 +3295,72 @@ class CognitoServiceTest {
         assertEquals("UserNotFoundException", exception.getErrorCode());
     }
 
+    // =========================================================================
+    // Issue #8005: USER_PASSWORD_AUTH user-existence errors
+    // =========================================================================
+
+    /**
+     * With user existence errors prevented, USER_PASSWORD_AUTH answers an unknown user exactly as it
+     * answers a known user with a wrong password, so the two cannot be told apart.
+     */
+    @Test
+    void initiateAuthWithUserPasswordAuthHidesAnUnknownUserWhenPreventionIsEnabled() {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient client = openClient(service, pool.getId(), "c", false);
+        service.describeUserPoolClient(client.getClientId()).setPreventUserExistenceErrors("ENABLED");
+
+        AwsException unknown = assertThrows(AwsException.class, () -> service.initiateAuth(
+                client.getClientId(), "USER_PASSWORD_AUTH",
+                Map.of("USERNAME", "nobody", "PASSWORD", "WrongPass1!")));
+        assertEquals("NotAuthorizedException", unknown.getErrorCode());
+        assertEquals("Incorrect username or password", unknown.getMessage());
+
+        AwsException wrongPassword = assertThrows(AwsException.class, () -> service.initiateAuth(
+                client.getClientId(), "USER_PASSWORD_AUTH",
+                Map.of("USERNAME", "alice", "PASSWORD", "WrongPass1!")));
+        assertEquals("NotAuthorizedException", wrongPassword.getErrorCode());
+        assertEquals("Incorrect username or password", wrongPassword.getMessage());
+    }
+
+    @Test
+    void initiateAuthWithUserPasswordAuthKeepsUserNotFoundForLegacyClients() {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient client = openClient(service, pool.getId(), "c", false);
+        service.describeUserPoolClient(client.getClientId()).setPreventUserExistenceErrors("LEGACY");
+
+        AwsException exception = assertThrows(AwsException.class, () -> service.initiateAuth(
+                client.getClientId(), "USER_PASSWORD_AUTH",
+                Map.of("USERNAME", "nobody", "PASSWORD", "WrongPass1!")));
+
+        assertEquals("UserNotFoundException", exception.getErrorCode());
+    }
+
+    @Test
+    void initiateAuthWithUserPasswordAuthKeepsUserNotFoundWhenPreventionIsUnset() {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient client = openClient(service, pool.getId(), "c", false);
+
+        AwsException exception = assertThrows(AwsException.class, () -> service.initiateAuth(
+                client.getClientId(), "USER_PASSWORD_AUTH",
+                Map.of("USERNAME", "nobody", "PASSWORD", "WrongPass1!")));
+
+        assertEquals("UserNotFoundException", exception.getErrorCode());
+    }
+
+    @Test
+    void adminInitiateAuthWithUserPasswordAuthHidesAnUnknownUserWhenPreventionIsEnabled() {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient client = openClient(service, pool.getId(), "c", false);
+        service.describeUserPoolClient(client.getClientId()).setPreventUserExistenceErrors("ENABLED");
+
+        AwsException exception = assertThrows(AwsException.class, () -> service.adminInitiateAuth(
+                pool.getId(), client.getClientId(), "ADMIN_USER_PASSWORD_AUTH",
+                Map.of("USERNAME", "nobody", "PASSWORD", "WrongPass1!")));
+
+        assertEquals("NotAuthorizedException", exception.getErrorCode());
+        assertEquals("Incorrect username or password", exception.getMessage());
+    }
+
     @Test
     void respondToAuthChallengeRejectsASimulatedUserSessionAfterExpiry() {
         MutableClock clock = new MutableClock();
