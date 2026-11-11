@@ -21,8 +21,11 @@ import io.floci.aws.services.lambda.LambdaArnUtils;
 import io.floci.aws.services.lambda.durable.DurableTokens;
 import io.floci.aws.services.lambdamicrovms.LambdaMicrovmsService;
 import io.floci.aws.services.s3.S3ControlArnUtils;
+import io.floci.aws.services.s3.S3ObjectKeys;
 import io.floci.aws.services.secretsmanager.SecretsManagerService;
 import io.floci.aws.services.sqs.SqsService;
+import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
+import io.vertx.ext.web.RoutingContext;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
@@ -31,6 +34,7 @@ import jakarta.ws.rs.container.ContainerRequestContext;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -106,6 +110,13 @@ public class ResourceArnBuilder {
      * its service follows with a minted id, or by members its minted ARN does not hold, is stored under.
      */
     private final Instance<StoredResourceArns> storedResourceArns;
+    /**
+     * The request as Vert.x received it, whose path is the one the client sent: JAX-RS collapses
+     * consecutive slashes before {@code ResourceArnBuilder} sees the path, so an S3 key that starts
+     * with a slash needs this reading. Null outside a request, as in a unit test, where the
+     * request URI's raw path stands in for it.
+     */
+    private final CurrentVertxRequest currentVertxRequest;
 
     @Inject
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
@@ -113,7 +124,8 @@ public class ResourceArnBuilder {
                               Instance<LambdaMicrovmsService> microvmsService,
                               Instance<EksService> eksService,
                               Instance<KmsService> kmsService,
-                              Instance<StoredResourceArns> storedResourceArns) {
+                              Instance<StoredResourceArns> storedResourceArns,
+                              CurrentVertxRequest currentVertxRequest) {
         this.objectMapper = objectMapper;
         this.iamService = iamService;
         this.secretsManagerService = secretsManagerService;
@@ -121,6 +133,17 @@ public class ResourceArnBuilder {
         this.eksService = eksService;
         this.kmsService = kmsService;
         this.storedResourceArns = storedResourceArns;
+        this.currentVertxRequest = currentVertxRequest;
+    }
+
+    public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
+                              Instance<SecretsManagerService> secretsManagerService,
+                              Instance<LambdaMicrovmsService> microvmsService,
+                              Instance<EksService> eksService,
+                              Instance<KmsService> kmsService,
+                              Instance<StoredResourceArns> storedResourceArns) {
+        this(objectMapper, iamService, secretsManagerService, microvmsService, eksService, kmsService,
+                storedResourceArns, null);
     }
 
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
@@ -151,6 +174,11 @@ public class ResourceArnBuilder {
 
     ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService) {
         this(objectMapper, iamService, null);
+    }
+
+    /** Package-private for tests: a builder reading the raw request path from {@code currentVertxRequest}. */
+    ResourceArnBuilder(ObjectMapper objectMapper, CurrentVertxRequest currentVertxRequest) {
+        this(objectMapper, null, null, null, null, null, null, currentVertxRequest);
     }
 
     public ResourceArnBuilder() {
@@ -195,7 +223,7 @@ public class ResourceArnBuilder {
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
         }
-        String path = "s3".equals(credentialScope) ? ctx.getUriInfo().getPath()
+        String path = "s3".equals(credentialScope) ? s3Path(ctx)
                 : IamActionRegistry.decodedPath(ctx);
         return switch (credentialScope) {
             case "s3"             -> buildS3Resources(operation, path, region);
@@ -842,6 +870,43 @@ public class ResourceArnBuilder {
     // ── S3 ──────────────────────────────────────────────────────────────────────
     // Minted in the request's partition; IamEnforcementFilter re-mints an existing bucket's ARN
     // in the bucket's own partition through S3ResourcePolicyProvider before any policy sees it.
+
+    /**
+     * The path an s3-scope request names, read the way {@code S3Controller} and the IAM condition
+     * resolver read it: JAX-RS collapses consecutive slashes before {@code UriInfo.getPath()} sees
+     * the path, so a key that starts with a slash ({@code /email.txt}, sent as
+     * {@code /bucket//email.txt}) would be checked against the ARN of the key without it. The raw
+     * path the client sent still carries the slash, on the Vert.x request first and otherwise in
+     * the request URI; the bucket comes from the collapsed path, which the filter already
+     * rewrote for a virtual-hosted request. A path the raw reading names no key for (a
+     * bucket-level request, the root, an S3 Control route) falls back to the collapsed path, which
+     * {@link #buildS3Arn} reads as before.
+     */
+    private String s3Path(ContainerRequestContext ctx) {
+        String collapsed = ctx.getUriInfo().getPath();
+        String bucket = s3BucketName(collapsed);
+        URI requestUri = ctx.getUriInfo().getRequestUri();
+        RoutingContext current = currentVertxRequest == null ? null : currentVertxRequest.getCurrent();
+        String rawPath = current != null && current.request() != null ? current.request().path()
+                : requestUri == null ? null : requestUri.getRawPath();
+        String key = bucket == null || rawPath == null ? null
+                : S3ObjectKeys.fromRawPath(rawPath, requestUri == null ? null : requestUri.getPath(), bucket);
+        if (key == null || key.isEmpty()) {
+            return collapsed;
+        }
+        return "/" + bucket + "/" + key;
+    }
+
+    /** Path-style bucket, the same reading the IAM condition resolver applies to S3 paths. */
+    private static String s3BucketName(String path) {
+        String stripped = path.startsWith("/") ? path.substring(1) : path;
+        if (stripped.isEmpty()) {
+            return null;
+        }
+        int slash = stripped.indexOf('/');
+        return slash < 0 ? stripped : stripped.substring(0, slash);
+    }
+
     private String buildS3Arn(String path, String region) {
         // path: /bucket or /bucket/key
         String partition = AwsRegions.partitionFor(region);

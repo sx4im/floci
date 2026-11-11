@@ -20,6 +20,7 @@ import io.floci.aws.services.iam.model.ServerCertificate;
 import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.lambdamicrovms.LambdaMicrovmsService;
 import io.floci.aws.services.secretsmanager.SecretsManagerService;
+import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
 import jakarta.enterprise.inject.Instance;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MediaType;
@@ -48,6 +49,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
@@ -1766,6 +1768,58 @@ class ResourceArnBuilderTest {
         when(uriInfo.getPath()).thenReturn("/my-bucket/folder/");
         String arn = builder.build("s3", ctx, "us-east-1", "000000000000");
         assertEquals("arn:aws:s3:::my-bucket/folder/", arn);
+    }
+
+    /**
+     * A key that starts with a slash is a different object from the key without it, so the ARN
+     * keeps the double slash. JAX-RS collapses {@code /slash-demo//email.txt} to
+     * {@code /slash-demo/email.txt} in {@code UriInfo.getPath()}, so the key is read from the
+     * request URI's raw path, as {@code S3Controller} reads it.
+     */
+    @Test
+    void s3KeepsLeadingSlashOfAKeyInTheObjectArn() {
+        when(uriInfo.getPath()).thenReturn("/slash-demo/email.txt");
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost:4566/slash-demo//email.txt"));
+        String arn = builder.build("s3", ctx, "us-east-1", "000000000000");
+        assertEquals("arn:aws:s3:::slash-demo//email.txt", arn);
+    }
+
+    /**
+     * The same leading-slash key under virtual-hosted addressing: the filter rewrites the
+     * request URI to {@code /slash-demo/email.txt}, so the raw path on the wire is the only
+     * place the slash survives, and the builder reads it there.
+     */
+    @Test
+    void s3KeepsLeadingSlashOfAKeyForVirtualHostedRequests() {
+        CurrentVertxRequest currentVertxRequest = mock(CurrentVertxRequest.class, RETURNS_DEEP_STUBS);
+        when(currentVertxRequest.getCurrent().request().path()).thenReturn("//email.txt");
+        ResourceArnBuilder vertxBuilder = new ResourceArnBuilder(new ObjectMapper(), currentVertxRequest);
+        when(uriInfo.getPath()).thenReturn("/slash-demo/email.txt");
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost:4566/slash-demo/email.txt"));
+        String arn = vertxBuilder.build("s3", ctx, "us-east-1", "000000000000");
+        assertEquals("arn:aws:s3:::slash-demo//email.txt", arn);
+    }
+
+    /** A bucket-level request names the bucket even when the raw path is available to read. */
+    @Test
+    void s3BucketRequestWithRawPathKeepsTheBucketArn() {
+        when(uriInfo.getPath()).thenReturn("/slash-demo/");
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost:4566/slash-demo/"));
+        String arn = builder.build("s3", ctx, "us-east-1", "000000000000");
+        assertEquals("arn:aws:s3:::slash-demo", arn);
+    }
+
+    /**
+     * A tagging route naming an ARN keeps that ARN when the raw path is available: the key
+     * reading only rebuilds data-plane paths, never the ARN the route itself names.
+     */
+    @Test
+    void s3ControlTaggingWithRawPathKeepsTheNamedArn() {
+        when(uriInfo.getPath()).thenReturn("/v20180820/tags/arn:aws:s3:::repro-bucket");
+        when(uriInfo.getRequestUri())
+                .thenReturn(URI.create("http://localhost:4566/v20180820/tags/arn:aws:s3:::repro-bucket"));
+        assertEquals(List.of("arn:aws:s3:::repro-bucket"),
+                builder.buildResources("s3", "s3:TagResource", ctx, "us-east-1", ACCOUNT, "aws"));
     }
 
     // ── S3 Control ─────────────────────────────────────────────────────────────
