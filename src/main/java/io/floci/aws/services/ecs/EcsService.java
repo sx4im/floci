@@ -3212,12 +3212,11 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                     applyServicePlatform(svc, resolved, request.getPlatformVersion() != null
                             ? request.getPlatformVersion() : svc.getPlatformVersion());
                 } else if (request.getPlatformVersion() != null) {
-                    svc.setPlatformVersion(PLATFORM_VERSION_LATEST.equals(request.getPlatformVersion())
-                            ? DEFAULT_PLATFORM_VERSION : request.getPlatformVersion());
+                    svc.setPlatformVersion(request.getPlatformVersion());
                 }
                 // UpdateServiceRequest.platformVersion is documented as "This parameter triggers a new
-                // service deployment". Compared after resolution, so a request that asks for LATEST on a
-                // service already running the version LATEST resolves to is not a change.
+                // service deployment". Compared on the stored (requested) value, so a request that asks
+                // for LATEST on a service already at LATEST is not a change.
                 rollingChange |= !Objects.equals(platformVersionBefore, svc.getPlatformVersion());
                 if (taskDefChanged || forceNewDeployment || serviceConnectChanged || rollingChange) {
                     svc.setDeploymentId(newDeploymentId());
@@ -3337,7 +3336,12 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         return placementFor(strategy.getFirst().capacityProvider()).launchType();
     }
 
-    /** A Fargate service reports the platform its tasks run on; an EC2 service reports neither. */
+    /**
+     * A service keeps the platform version it was asked for: AWS reports {@code LATEST} as
+     * {@code LATEST} on the service and only its tasks report the resolved version. An omitted
+     * version defaults to {@code LATEST}, the version AWS reports. An EC2 service reports
+     * neither.
+     */
     private static void applyServicePlatform(EcsServiceModel svc, TaskDefinition taskDef, String platformVersion) {
         if (svc.getLaunchType() != LaunchType.FARGATE) {
             svc.setPlatformVersion(null);
@@ -3345,8 +3349,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             return;
         }
         svc.setPlatformVersion(platformVersion == null || platformVersion.isBlank()
-                || PLATFORM_VERSION_LATEST.equals(platformVersion)
-                ? DEFAULT_PLATFORM_VERSION : platformVersion);
+                ? PLATFORM_VERSION_LATEST : platformVersion);
         svc.setPlatformFamily(platformFamilyOf(taskDef));
     }
 

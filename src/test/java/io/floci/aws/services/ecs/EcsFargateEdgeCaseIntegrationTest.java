@@ -783,12 +783,12 @@ class EcsFargateEdgeCaseIntegrationTest {
                 "a changed network configuration must roll the deployment");
 
         // platformVersion is documented as triggering a deployment, but only where it changes:
-        // LATEST on a service already running the version LATEST resolves to is not a change.
+        // LATEST on a service already at LATEST is not a change.
         String rolled = deploymentId("edge-roll-svc");
         call("UpdateService", "{\"cluster\":\"" + CLUSTER + "\",\"service\":\"edge-roll-svc\","
                 + "\"platformVersion\":\"LATEST\"}", 200);
         assertEquals(rolled, deploymentId("edge-roll-svc"),
-                "LATEST on a service already at the resolved version must not roll the deployment");
+                "LATEST on a service already at LATEST must not roll the deployment");
 
         call("UpdateService", "{\"cluster\":\"" + CLUSTER + "\",\"service\":\"edge-roll-svc\","
                 + "\"platformVersion\":\"1.3.0\"}", 200)
@@ -1481,7 +1481,7 @@ class EcsFargateEdgeCaseIntegrationTest {
                 .body("services[0].events[0].createdAt", notNullValue())
                 // The deployment carries the placement the service runs under, not just its id.
                 .body("services[0].deployments[0].launchType", equalTo("FARGATE"))
-                .body("services[0].deployments[0].platformVersion", equalTo("1.4.0"))
+                .body("services[0].deployments[0].platformVersion", equalTo("LATEST"))
                 .body("services[0].deployments[0].platformFamily", equalTo("Linux"))
                 .body("services[0].deployments[0].networkConfiguration.awsvpcConfiguration.subnets",
                         hasSize(1));
@@ -1770,7 +1770,7 @@ class EcsFargateEdgeCaseIntegrationTest {
                 .then()
                 .body("serviceRevisions[0].taskDefinition", containsString(family))
                 .body("serviceRevisions[0].launchType", equalTo("FARGATE"))
-                .body("serviceRevisions[0].platformVersion", equalTo("1.4.0"))
+                .body("serviceRevisions[0].platformVersion", equalTo("LATEST"))
                 .body("serviceRevisions[0].platformFamily", equalTo("Linux"))
                 .body("serviceRevisions[0].networkConfiguration.awsvpcConfiguration.subnets",
                         hasSize(1))
