@@ -301,14 +301,15 @@ class Ec2LaunchTemplateVersionsIntegrationTest {
     }
 
     @Test
-    void internalLookupStillDefaultsToLatestAndAllowsMissingTemplates() {
+    void internalLookupDefaultsToDefaultVersionAndAllowsMissingTemplates() {
         String name = "versions-internal-6234-" + UUID.randomUUID();
         LaunchTemplate template = service.createLaunchTemplate(
                 "us-east-1", name, new LaunchTemplateData(), List.of());
         try {
             service.createLaunchTemplateVersion("us-east-1", template.getLaunchTemplateId(), null, null,
                     new LaunchTemplateData());
-            assertEquals(List.of("2"), service.describeLaunchTemplateVersions(
+            // An unnamed lookup resolves to the default version (1), not the latest (2).
+            assertEquals(List.of("1"), service.describeLaunchTemplateVersions(
                             "us-east-1", template.getLaunchTemplateId(), null, List.of()).stream()
                     .map(LaunchTemplate::getLatestVersionNumber).toList());
             assertEquals(List.of(), service.describeLaunchTemplateVersions("us-east-1", null, name + "-missing", List.of()));

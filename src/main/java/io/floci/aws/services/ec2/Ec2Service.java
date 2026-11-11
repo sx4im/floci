@@ -9677,6 +9677,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * Unknown ids and names yield an empty list here rather than the NotFound that
      * {@link #describeLaunchTemplates} raises: AutoScaling resolves a group's launch template
      * through this method and reports its own ValidationError when nothing comes back.
+     * With no version requested, the template's <em>default</em> version is returned, matching
+     * the model's documented default ("The default value is {@code $Default}") and
+     * {@link #resolveLaunchTemplateData}, which already defaults a blank version the same way.
+     * Callers naming no version (AutoScaling validation, launch, and the IAM profile lookup)
+     * therefore see the default version's data instead of the latest version's.
      */
     public List<LaunchTemplate> describeLaunchTemplateVersions(String region, String id, String name,
                                                                List<String> requestedVersions) {
@@ -9689,11 +9694,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         for (LaunchTemplate launchTemplate : templates) {
             synchronized (launchTemplate) {
                 List<String> effectiveVersions = requestedVersions == null || requestedVersions.isEmpty()
-                        ? List.of(launchTemplate.getLatestVersionNumber())
+                        ? List.of(defaultLaunchTemplateVersion(launchTemplate))
                         : requestedVersions;
                 for (String requestedVersion : effectiveVersions) {
                     String resolvedVersion = resolveLaunchTemplateVersion(
-                            launchTemplate, requestedVersion, launchTemplate.getLatestVersionNumber());
+                            launchTemplate, requestedVersion, defaultLaunchTemplateVersion(launchTemplate));
                     versions.add(copyForVersion(launchTemplate, resolvedVersion));
                 }
             }
@@ -9701,7 +9706,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return versions;
     }
 
-    /** API listing semantics; the four-argument internal lookup keeps its latest-version default. */
+    /** The version an unnamed lookup resolves to: the template's default, falling back to the latest. */
+    private static String defaultLaunchTemplateVersion(LaunchTemplate launchTemplate) {
+        return launchTemplate.getDefaultVersionNumber() != null
+                && !launchTemplate.getDefaultVersionNumber().isBlank()
+                ? launchTemplate.getDefaultVersionNumber()
+                : launchTemplate.getLatestVersionNumber();
+    }
+
+    /** API listing semantics; the four-argument internal lookup keeps its default-version default. */
     List<LaunchTemplate> describeLaunchTemplateVersions(String region, String id, String name,
                                                        List<String> requestedVersions, String minVersion, String maxVersion) {
         if ((requestedVersions != null && !requestedVersions.isEmpty())

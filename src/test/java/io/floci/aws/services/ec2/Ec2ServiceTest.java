@@ -3646,6 +3646,46 @@ class Ec2ServiceTest {
                 "us-east-1", null, "absent-template", List.of()).isEmpty());
     }
 
+    @Test
+    void internalLaunchTemplateLookupDefaultsToDefaultVersion() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+
+        // Version 1 (the default) carries an ImageId; version 2 (the latest) does not, mirroring
+        // the AutoScaling report where a group naming no version was refused for version 2's
+        // missing ImageId.
+        LaunchTemplateData first = new LaunchTemplateData();
+        first.setImageId("ami-11111111");
+        first.setInstanceType("t3.micro");
+        LaunchTemplate template = service.createLaunchTemplate(
+                "us-east-1", "default-version-template", first, List.of());
+        LaunchTemplateData second = new LaunchTemplateData();
+        second.setInstanceType("t3.small");
+        service.createLaunchTemplateVersion("us-east-1", template.getLaunchTemplateId(), null, null, second);
+
+        // No version requested: the model's default ($Default, version 1), not the latest.
+        List<LaunchTemplate> resolved = service.describeLaunchTemplateVersions(
+                "us-east-1", template.getLaunchTemplateId(), null, List.of());
+        assertEquals(List.of("1"), resolved.stream().map(LaunchTemplate::getLatestVersionNumber).toList());
+        assertEquals("ami-11111111", resolved.getFirst().getData().getImageId());
+
+        // Explicit aliases keep working: $Default is version 1, $Latest is version 2.
+        assertEquals("ami-11111111", service.describeLaunchTemplateVersions(
+                        "us-east-1", template.getLaunchTemplateId(), null, List.of("$Default")).getFirst()
+                .getData().getImageId());
+        assertNull(service.describeLaunchTemplateVersions(
+                        "us-east-1", template.getLaunchTemplateId(), null, List.of("$Latest")).getFirst()
+                .getData().getImageId());
+
+        // Moving the default moves the unnamed lookup with it.
+        service.modifyLaunchTemplate("us-east-1", template.getLaunchTemplateId(), null, "2");
+        assertNull(service.describeLaunchTemplateVersions(
+                        "us-east-1", template.getLaunchTemplateId(), null, List.of()).getFirst()
+                .getData().getImageId());
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"create", "modify"})
     void launchTemplateMutationCannotRestoreADeletedTemplate(String operation) throws Exception {

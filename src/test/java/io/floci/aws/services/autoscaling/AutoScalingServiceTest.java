@@ -1,8 +1,12 @@
 package io.floci.aws.services.autoscaling;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.InMemoryStorage;
+import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.core.storage.StorageBackedMap;
 import io.floci.aws.services.autoscaling.model.AsgInstance;
 import io.floci.aws.services.autoscaling.model.AsgOptionalFields;
@@ -17,6 +21,11 @@ import io.floci.aws.services.autoscaling.model.MixedInstancesPolicy;
 import io.floci.aws.services.autoscaling.model.ScalingActivity;
 import io.floci.aws.services.autoscaling.model.ScheduledAction;
 import io.floci.aws.services.autoscaling.model.WarmPoolConfiguration;
+import io.floci.aws.services.ec2.AmiImageResolver;
+import io.floci.aws.services.ec2.Ec2ContainerManager;
+import io.floci.aws.services.ec2.Ec2ImageCatalog;
+import io.floci.aws.services.ec2.Ec2InstanceTypeCatalog;
+import io.floci.aws.services.ec2.portforward.Ec2PortForwardManager;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.ec2.model.GroupIdentifier;
 import io.floci.aws.services.ec2.model.Instance;
@@ -357,6 +366,58 @@ class AutoScalingServiceTest {
         assertEquals(AutoScalingService.MISSING_LAUNCH_TEMPLATE_IMAGE_ID_MESSAGE, error.getMessage());
         assertEquals(400, error.getHttpStatus());
         assertTrue(service.describeAutoScalingGroups(REGION, List.of("missing-image-asg")).isEmpty());
+    }
+
+    @Test
+    void createAutoScalingGroupWithoutLaunchTemplateVersionUsesDefaultVersion() {
+        Ec2Service ec2Service = new Ec2Service(mockEc2Config(), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        // Version 1 (the default) carries an ImageId; version 2 (the latest) does not, so a group
+        // naming only the template must validate against version 1, not be refused for version 2.
+        LaunchTemplateData first = new LaunchTemplateData();
+        first.setImageId("ami-11111111");
+        first.setInstanceType("t3.micro");
+        LaunchTemplate template = ec2Service.createLaunchTemplate(REGION, "default-version-lt", first, List.of());
+        LaunchTemplateData second = new LaunchTemplateData();
+        second.setInstanceType("t3.small");
+        ec2Service.createLaunchTemplateVersion(REGION, template.getLaunchTemplateId(), null, null, second);
+
+        AutoScalingService groups = new AutoScalingService();
+        groups.regionResolver = new RegionResolver(REGION, "000000000000");
+        groups.ec2Service = ec2Service;
+        AutoScalingGroup group = groups.createAutoScalingGroup(REGION, "default-version-asg",
+                null, template.getLaunchTemplateId(), null, null, null,
+                0, 1, 0, 300, List.of("us-east-1a"), List.of(), List.of(), List.of(),
+                "EC2", 0, List.of("Default"), Map.of(), Map.of(), AsgOptionalFields.none());
+
+        assertEquals(template.getLaunchTemplateId(), group.getLaunchTemplateId());
+        assertNull(group.getLaunchTemplateVersion());
+    }
+
+    private static EmulatorConfig mockEc2Config() {
+        EmulatorConfig config = mock(EmulatorConfig.class);
+        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.Ec2ServiceConfig ec2 = mock(EmulatorConfig.Ec2ServiceConfig.class);
+        when(config.defaultAccountId()).thenReturn("000000000000");
+        when(config.services()).thenReturn(services);
+        when(services.ec2()).thenReturn(ec2);
+        when(ec2.mock()).thenReturn(true);
+        when(ec2.mockPublicAddresses()).thenReturn(EmulatorConfig.Ec2ServiceConfig.MockPublicAddresses.DOCUMENTATION);
+        when(ec2.mockPublicAddress()).thenReturn(Optional.empty());
+        return config;
+    }
+
+    private static final class InMemoryStorageFactory extends StorageFactory {
+        private InMemoryStorageFactory() {
+            super(null, null);
+        }
+
+        @Override
+        public <V> AccountAwareStorageBackend<V> create(String serviceName, String fileName,
+                                                         TypeReference<Map<String, V>> typeReference) {
+            return AccountAwareStorageBackend.inMemory("000000000000");
+        }
     }
 
     static Stream<String> rejectedUserData() throws IOException {
