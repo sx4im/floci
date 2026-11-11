@@ -260,16 +260,24 @@ public class SecretsManagerService implements ResourceProvider {
         String arn = buildSecretArn(region, name);
         Instant now = Instant.now();
 
-        String versionId = clientRequestToken != null ? clientRequestToken : UUID.randomUUID().toString();
-        SecretVersion version = new SecretVersion();
-        version.setVersionId(versionId);
-        version.setSecretString(secretString);
-        version.setSecretBinary(secretBinary);
-        version.setVersionStages(List.of(AWSCURRENT));
-        version.setCreatedDate(now);
-
+        // AWS creates an initial version only when the request carries a value: a secret
+        // created without SecretString or SecretBinary has no versions until the first
+        // PutSecretValue, so GetSecretValue fails for AWSCURRENT and DescribeSecret
+        // reports no VersionIdsToStages. Creating an empty AWSCURRENT version here
+        // would let GetSecretValue succeed with no value and hand a rotation an empty
+        // version to label AWSPREVIOUS.
         Map<String, SecretVersion> versions = new HashMap<>();
-        versions.put(versionId, version);
+        String versionId = null;
+        if (secretString != null || secretBinary != null) {
+            versionId = clientRequestToken != null ? clientRequestToken : UUID.randomUUID().toString();
+            SecretVersion version = new SecretVersion();
+            version.setVersionId(versionId);
+            version.setSecretString(secretString);
+            version.setSecretBinary(secretBinary);
+            version.setVersionStages(List.of(AWSCURRENT));
+            version.setCreatedDate(now);
+            versions.put(versionId, version);
+        }
 
         Secret secret = new Secret();
         secret.setName(name);

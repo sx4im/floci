@@ -53,6 +53,31 @@ class SecretsManagerServiceTest {
     }
 
     @Test
+    void createSecretWithoutValueCreatesNoVersion() {
+        // AWS creates an initial version only when the request carries a value (#8024):
+        // a secret created without one has no versions until the first PutSecretValue.
+        Secret secret = service.createSecret("no-value", null, null, null, null, null, REGION);
+
+        assertNull(secret.getCurrentVersionId());
+        assertNotNull(secret.getVersions());
+        assertTrue(secret.getVersions().isEmpty());
+        assertEquals("ResourceNotFoundException", assertThrows(AwsException.class, () ->
+                service.getSecretValue("no-value", null, null, REGION)).getErrorCode());
+    }
+
+    @Test
+    void createSecretWithoutValueThenPutSecretValueCreatesFirstVersion() {
+        service.createSecret("no-value", null, null, null, null, null, REGION);
+
+        SecretVersion first = service.putSecretValue("no-value", "first-value", null, null, REGION, null);
+
+        assertEquals("first-value", first.getSecretString());
+        assertTrue(first.getVersionStages().contains("AWSCURRENT"));
+        assertEquals("first-value", service.getSecretValue("no-value", null, null, REGION).getSecretString());
+        assertNotNull(service.describeSecret("no-value", REGION).getCurrentVersionId());
+    }
+
+    @Test
     void createSecretDuplicateThrows() {
         service.createSecret("my-secret", "value1", null, null, null, null, REGION);
         assertThrows(AwsException.class, () ->
