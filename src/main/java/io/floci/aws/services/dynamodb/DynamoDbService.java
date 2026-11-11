@@ -1617,22 +1617,14 @@ public class DynamoDbService {
         // order. Using only the first sort-key attribute would ignore the remaining components
         // (e.g. a "requestStateQuery RANGE, createdAt RANGE" index would never order by createdAt),
         // which in turn breaks ScanIndexForward=false. See floci-io/floci#1675.
-        if (!sortKeyNames.isEmpty()) {
+        // The base table key breaks ties between rows sharing an index key, so the order is a
+        // total order: the ExclusiveStartKey offset below can drop a leading run by position.
+        // A paginated read sorts even without a sort key, so the offset always sees that order.
+        if (!sortKeyNames.isEmpty() || exclusiveStartKey != null) {
             List<String> finalSortKeyNames = sortKeyNames;
+            TableDefinition finalTable = table;
             results = new ArrayList<>(results);
-            results.sort((a, b) -> {
-                for (String name : finalSortKeyNames) {
-                    JsonNode aAttr = a.get(name);
-                    JsonNode bAttr = b.get(name);
-                    int cmp;
-                    if (aAttr == null && bAttr == null) cmp = 0;
-                    else if (aAttr == null) cmp = -1;
-                    else if (bAttr == null) cmp = 1;
-                    else cmp = ExpressionEvaluator.compareAttributeValues(aAttr, bAttr);
-                    if (cmp != 0) return cmp;
-                }
-                return 0;
-            });
+            results.sort((a, b) -> compareQueryPosition(a, b, finalSortKeyNames, finalTable));
             if (Boolean.FALSE.equals(scanIndexForward)) {
                 Collections.reverse(results);
             }
@@ -1640,27 +1632,19 @@ public class DynamoDbService {
 
         // Apply ExclusiveStartKey offset
         if (exclusiveStartKey != null) {
-            String tablePkName = table.getPartitionKeyName();
-            String tableSkName = table.getSortKeyName();
-            boolean hasTableKeys = exclusiveStartKey.has(tablePkName);
-
-            String startItemKey = hasTableKeys
-                    ? buildItemKeyFromNode(exclusiveStartKey, tablePkName, tableSkName)
-                    : buildItemKeyFromNode(exclusiveStartKey, pkName, sortKeyNames);
-
-            int startIdx = -1;
-            for (int i = 0; i < results.size(); i++) {
-                String thisKey = hasTableKeys
-                        ? buildItemKeyFromNode(results.get(i), tablePkName, tableSkName)
-                        : buildItemKeyFromNode(results.get(i), pkName, sortKeyNames);
-                if (thisKey.equals(startItemKey)) {
-                    startIdx = i;
-                    break;
-                }
+            // ExclusiveStartKey is a position in key order, not a pointer to an existing item:
+            // a page resumes strictly after that position even when no item with that key exists
+            // any more (deleted, never existed, or re-keyed since the previous page). Looking
+            // the item up by exact key equality restarts the query from the first item in that
+            // case. See floci-io/floci#7970.
+            boolean forward = !Boolean.FALSE.equals(scanIndexForward);
+            int resumeIdx = 0;
+            while (resumeIdx < results.size()
+                    && !isStrictlyAfterStartKey(results.get(resumeIdx), exclusiveStartKey,
+                            sortKeyNames, table, forward)) {
+                resumeIdx++;
             }
-            if (startIdx >= 0) {
-                results = new ArrayList<>(results.subList(startIdx + 1, results.size()));
-            }
+            results = new ArrayList<>(results.subList(resumeIdx, results.size()));
         }
 
         List<JsonNode> evaluatedItems = results;
@@ -4792,6 +4776,39 @@ public class DynamoDbService {
                     + DynamoDbKeyValueErrors.emptyValueKind(type) + ".", 400);
         }
         return DynamoDbKeyValueErrors.emptyIndexKeyValue(type, indexName, attrName);
+    }
+
+    // Compares two items by query position: the access path's sort-key components first, then
+    // the base table key, which breaks ties between rows sharing an index key. Used both to
+    // order results and to place an ExclusiveStartKey, so the two agree on what "after" means.
+    // A null attribute sorts first, matching the sort this replaced.
+    private int compareQueryPosition(JsonNode a, JsonNode b, List<String> sortKeyNames,
+                                     TableDefinition table) {
+        for (String name : sortKeyNames) {
+            int cmp = compareKeyAttribute(a.get(name), b.get(name));
+            if (cmp != 0) return cmp;
+        }
+        int cmp = compareKeyAttribute(a.get(table.getPartitionKeyName()), b.get(table.getPartitionKeyName()));
+        if (cmp != 0) return cmp;
+        String tableSkName = table.getSortKeyName();
+        if (tableSkName != null) {
+            cmp = compareKeyAttribute(a.get(tableSkName), b.get(tableSkName));
+            if (cmp != 0) return cmp;
+        }
+        return 0;
+    }
+
+    private static int compareKeyAttribute(JsonNode a, JsonNode b) {
+        if (a == null && b == null) return 0;
+        if (a == null) return -1;
+        if (b == null) return 1;
+        return ExpressionEvaluator.compareAttributeValues(a, b);
+    }
+
+    private boolean isStrictlyAfterStartKey(JsonNode item, JsonNode startKey, List<String> sortKeyNames,
+                                            TableDefinition table, boolean forward) {
+        int cmp = compareQueryPosition(item, startKey, sortKeyNames, table);
+        return forward ? cmp > 0 : cmp < 0;
     }
 
     private String buildItemKeyFromNode(JsonNode item, String pkName, String skName) {
