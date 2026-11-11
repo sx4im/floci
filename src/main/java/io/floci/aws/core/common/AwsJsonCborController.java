@@ -4,8 +4,10 @@ import com.fasterxml.jackson.core.JacksonException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.BinaryNode;
 import com.fasterxml.jackson.databind.node.DecimalNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.databind.node.TextNode;
 import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
 import com.fasterxml.jackson.dataformat.cbor.CBORGenerator;
 import com.google.gson.JsonParseException;
@@ -24,6 +26,7 @@ import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.UriInfo;
 import org.jboss.logging.Logger;
 
 import java.io.ByteArrayInputStream;
@@ -31,6 +34,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.net.URI;
+import java.util.Base64;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
@@ -43,7 +48,9 @@ import java.util.zip.GZIPInputStream;
  * via either smithy-rpc-v2-cbor path routing or the legacy X-Amz-Target header.
  * <p>
  * Currently supported services: DynamoDB (incl. Streams), SQS, SNS, Kinesis,
- * Step Functions, CloudWatch Metrics, and EventBridge V2.
+ * Step Functions, CloudWatch Metrics, and EventBridge V2, plus every JSON 1.1
+ * service, which is reached through the shared {@link JsonServiceDispatcher}
+ * instead of one switch arm per service (floci-io/floci#7983).
  * <p>
  * Requests run on virtual threads, as in {@link AwsJsonController}, so a ReceiveMessage or
  * GetActivityTask long poll does not hold one of the shared request workers while it waits.
@@ -55,6 +62,20 @@ public class AwsJsonCborController {
     private static final ObjectMapper CBOR_MAPPER = new ObjectMapper(new CBORFactory());
     private static final String GENERIC_CBOR_MEDIA_TYPE = "application/cbor";
     private static final String AWS_CBOR_1_1_MEDIA_TYPE = "application/x-amz-cbor-1.1";
+
+    /**
+     * Timestamp members the newly-routed JSON services return under names
+     * {@link #isTimestampField} does not match, keyed by service external key.
+     * EventBridge V2 keeps its own declaration on the handler (see
+     * {@link #timestampMembers}); a service whose responses carry no such member
+     * needs no entry here.
+     */
+    static final Map<String, Set<String>> TIMESTAMP_MEMBERS_BY_SERVICE = Map.of(
+            "codepipeline", Set.of("created", "updated"),
+            "datasync", Set.of("CreationTime"),
+            "servicecatalog", Set.of("CreatedTime"),
+            "servicediscovery", Set.of("CreateDate"),
+            "transcribe", Set.of("CreationTime", "StartTime", "CompletionTime"));
 
     /** The RPC v2 path parameters {@link IamEnforcementFilter} authorizes, as this endpoint dispatches them. */
     static final String RPC_V2_SERVICE_PARAMETER = "serviceId";
@@ -72,6 +93,7 @@ public class AwsJsonCborController {
     private final CloudWatchMetricsJsonHandler cloudWatchMetricsJsonHandler;
     private final MarketplaceEntitlementController marketplaceEntitlementController;
     private final EventBridgeV2Handler eventBridgeV2Handler;
+    private final JsonServiceDispatcher jsonServiceDispatcher;
 
     @Inject
     public AwsJsonCborController(ObjectMapper objectMapper, ResolvedServiceCatalog catalog,
@@ -83,7 +105,8 @@ public class AwsJsonCborController {
                                  StepFunctionsJsonHandler sfnJsonHandler,
                                  CloudWatchMetricsJsonHandler cloudWatchMetricsJsonHandler,
                                  MarketplaceEntitlementController marketplaceEntitlementController,
-                                 EventBridgeV2Handler eventBridgeV2Handler) {
+                                 EventBridgeV2Handler eventBridgeV2Handler,
+                                 JsonServiceDispatcher jsonServiceDispatcher) {
         this.objectMapper = objectMapper;
         this.catalog = catalog;
         this.regionResolver = regionResolver;
@@ -96,6 +119,7 @@ public class AwsJsonCborController {
         this.cloudWatchMetricsJsonHandler = cloudWatchMetricsJsonHandler;
         this.marketplaceEntitlementController = marketplaceEntitlementController;
         this.eventBridgeV2Handler = eventBridgeV2Handler;
+        this.jsonServiceDispatcher = jsonServiceDispatcher;
     }
 
 
@@ -179,6 +203,9 @@ public class AwsJsonCborController {
             gen.writeEndArray();
         } else if (numberIsTimestamp && node.isNumber()) {
             writeCborTimestamp(gen, node, legacyDialect);
+        } else if (node instanceof BinaryNode binary) {
+            // A blob member is a CBOR byte string on the wire, never base64 text.
+            gen.writeBinary(binary.binaryValue());
         } else if (node.isTextual()) {
             gen.writeString(node.textValue());
         } else if (node.isDouble() || node.isFloat()) {
@@ -304,6 +331,66 @@ public class AwsJsonCborController {
     }
 
     /**
+     * Converts every CBOR byte string in a decoded smithy-rpc-v2-cbor request to the
+     * base64 text the JSON handlers already expect for blob members, so no handler
+     * needs a CBOR-specific blob reader (floci-io/floci#7983; the same conversion
+     * #7410 did per handler for Translate's Document.Content, done here once for
+     * every service: Textract's Document.Bytes, Kinesis Data, and the rest).
+     * <p>
+     * Mutates the given tree in place and returns it, for convenient chaining at the
+     * call site. Only the RPC v2 path normalizes: the legacy dialect keeps its own
+     * per-handler blob handling.
+     */
+    static JsonNode cborBlobsToBase64(JsonNode node) {
+        if (node.isObject()) {
+            ObjectNode object = (ObjectNode) node;
+            Iterator<Map.Entry<String, JsonNode>> fields = object.fields();
+            while (fields.hasNext()) {
+                Map.Entry<String, JsonNode> entry = fields.next();
+                JsonNode value = entry.getValue();
+                if (value instanceof BinaryNode binary) {
+                    object.set(entry.getKey(),
+                            TextNode.valueOf(Base64.getEncoder().encodeToString(binary.binaryValue())));
+                } else {
+                    cborBlobsToBase64(value);
+                }
+            }
+        } else if (node.isArray()) {
+            ArrayNode array = (ArrayNode) node;
+            for (int i = 0; i < array.size(); i++) {
+                JsonNode item = array.get(i);
+                if (item instanceof BinaryNode binary) {
+                    array.set(i, TextNode.valueOf(Base64.getEncoder().encodeToString(binary.binaryValue())));
+                } else {
+                    cborBlobsToBase64(item);
+                }
+            }
+        }
+        return node;
+    }
+
+    /**
+     * Turns a base64-text blob member of a generically-routed response back into raw
+     * bytes, so the CBOR serializer emits it as a byte string (the inverse of
+     * {@link #cborBlobsToBase64}). Only TranslateDocument returns a blob among the
+     * generically-routed services, so only it is converted; anything else a handler
+     * returns as a {@link BinaryNode} already takes the byte-string arm of
+     * {@link #writeNodeToCbor}. A new blob-returning service adds one entry here.
+     */
+    private void blobsToBinary(JsonNode responseNode, String serviceId, String operation) {
+        String externalKey = catalog.byCborSdkServiceId(serviceId)
+                .map(ServiceDescriptor::externalKey).orElse(null);
+        if (!"translate".equals(externalKey) || !"TranslateDocument".equals(operation)) {
+            return;
+        }
+        JsonNode document = responseNode.path("TranslatedDocument");
+        if (document instanceof ObjectNode documentNode && documentNode.path("Content").isTextual()) {
+            byte[] bytes = Base64.getDecoder().decode(documentNode.get("Content").textValue());
+            documentNode.set("Content", BinaryNode.valueOf(bytes));
+        }
+    }
+
+    /**
      * Handles AWS smithy-rpc-v2-cbor protocol requests:
      * POST /service/{serviceName}/operation/{operation} with a CBOR content type,
      * the smithy-protocol header, and no X-Amz-Target. The {serviceName} segment
@@ -319,15 +406,21 @@ public class AwsJsonCborController {
             @PathParam(RPC_V2_SERVICE_PARAMETER) String serviceId,
             @PathParam(RPC_V2_OPERATION_PARAMETER) String operation,
             @Context HttpHeaders httpHeaders,
+            @Context UriInfo uriInfo,
             byte[] body) {
 
         LOG.debugv("Smithy RPC v2 CBOR: service={0}, operation={1}", serviceId, operation);
 
         try {
-            JsonNode request = bodyToJson(httpHeaders, body);
+            JsonNode request = cborBlobsToBase64(bodyToJson(httpHeaders, body));
             String region = regionResolver.resolveRegion(httpHeaders);
+            String authorization = httpHeaders.getHeaderString("Authorization");
+            if (authorization == null || authorization.isBlank()) {
+                authorization = IamEnforcementFilter.requestAuthorization(null, uriInfo.getQueryParameters());
+            }
 
-            Response delegated = dispatchCbor(serviceId, operation, request, region);
+            Response delegated = dispatchCbor(serviceId, operation, request, region,
+                    authorization, uriInfo.getBaseUri());
             if (delegated == null) {
                 return Response.status(404).build();
             }
@@ -335,6 +428,7 @@ public class AwsJsonCborController {
             JsonNode responseNode = delegated.getEntity() instanceof JsonNode
                     ? (JsonNode) delegated.getEntity()
                     : objectMapper.valueToTree(delegated.getEntity());
+            blobsToBinary(responseNode, serviceId, operation);
             byte[] cborBytes = nodeToSmithyCbor(responseNode, timestampMembers(serviceId));
             String responseContentType = responseContentType(httpHeaders);
             return Response.status(delegated.getStatus())
@@ -496,8 +590,13 @@ public class AwsJsonCborController {
 
     /**
      * Dispatches a CBOR request to the appropriate service handler by SDK service ID.
+     * The eight services with their own arms predate the shared JSON 1.1 dispatch
+     * (their handlers live behind other protocols); every other JSON service falls
+     * through to {@link JsonServiceDispatcher}, the same dispatch JSON 1.1 requests
+     * go through, so no new service needs an arm here (floci-io/floci#7983).
      */
-    private Response dispatchCbor(String serviceId, String operation, JsonNode request, String region) throws Exception {
+    private Response dispatchCbor(String serviceId, String operation, JsonNode request, String region,
+                                 String authorization, URI baseUri) throws Exception {
         ServiceDescriptor descriptor = catalog.byCborSdkServiceId(serviceId).orElse(null);
         if (descriptor == null) {
             return null;
@@ -516,15 +615,28 @@ public class AwsJsonCborController {
             case "monitoring" -> cloudWatchMetricsJsonHandler.handle(operation, request, region);
             case "marketplace" -> marketplaceEntitlementController.handle(operation, request, region);
             case "eventsv2" -> eventBridgeV2Handler.handle(operation, request, region);
-            default -> null;
+            default -> jsonServiceDispatcher.dispatch(descriptor.externalKey(), operation, request, region,
+                    authorization, baseUri, targetPrefix(descriptor));
         };
+    }
+
+    /**
+     * The X-Amz-Target prefix the shared dispatch reads for the marketplace split
+     * (entitlement service vs metering service). Only that arm reads it, and the
+     * marketplace service never reaches the shared dispatch (its own arm above), so
+     * any of the descriptor's prefixes would do; the first is returned, or an empty
+     * prefix when the descriptor declares none.
+     */
+    private static String targetPrefix(ServiceDescriptor descriptor) {
+        return descriptor.targetPrefixes().stream().findFirst().orElse("");
     }
 
     /** The timestamp members a service's responses carry under names {@link #isTimestampField} does not match. */
     private Set<String> timestampMembers(String serviceId) {
         return catalog.byCborSdkServiceId(serviceId)
-                .filter(descriptor -> "eventsv2".equals(descriptor.externalKey()))
-                .map(descriptor -> EventBridgeV2Handler.TIMESTAMP_MEMBERS)
+                .map(descriptor -> TIMESTAMP_MEMBERS_BY_SERVICE.getOrDefault(descriptor.externalKey(),
+                        "eventsv2".equals(descriptor.externalKey())
+                                ? EventBridgeV2Handler.TIMESTAMP_MEMBERS : Set.of()))
                 .orElse(Set.of());
     }
 
