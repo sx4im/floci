@@ -1768,6 +1768,67 @@ class ResourceArnBuilderTest {
         assertEquals("arn:aws:s3:::my-bucket/folder/", arn);
     }
 
+    /**
+     * A key starting with a slash is a different object from the same name without it, so the
+     * ARN it is checked against keeps the double slash. JAX-RS collapses {@code //} in
+     * {@code UriInfo.getPath()}, but the request URI's raw path still carries it, and the
+     * object itself lands under {@code /email.txt} (issue #7945).
+     */
+    @Test
+    void s3KeepsLeadingSlashOfKeyInObjectArn() {
+        when(uriInfo.getPath()).thenReturn("/slash-demo/email.txt");
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost:4566/slash-demo//email.txt"));
+        String arn = builder.build("s3", ctx, "us-east-1", "000000000000");
+        assertEquals("arn:aws:s3:::slash-demo//email.txt", arn);
+    }
+
+    /**
+     * The same leading-slash key through the operation-carrying entry point, which is how the
+     * enforcement filter calls the builder for a PutObject.
+     */
+    @Test
+    void s3KeepsLeadingSlashOfKeyForPutObject() {
+        when(uriInfo.getPath()).thenReturn("/slash-demo/email.txt");
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost:4566/slash-demo//email.txt"));
+        assertEquals(List.of("arn:aws:s3:::slash-demo//email.txt"),
+                builder.buildResources("s3", "s3:PutObject", ctx, "us-east-1", ACCOUNT, "aws"));
+    }
+
+    /**
+     * A double slash deeper in the key is kept as well: only the leading slash of the
+     * request path is the bucket separator.
+     */
+    @Test
+    void s3KeepsDoubleSlashInsideKey() {
+        when(uriInfo.getPath()).thenReturn("/my-bucket/a/b.txt");
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost:4566/my-bucket//a/b.txt"));
+        String arn = builder.build("s3", ctx, "us-east-1", "000000000000");
+        assertEquals("arn:aws:s3:::my-bucket//a/b.txt", arn);
+    }
+
+    /**
+     * The raw path is decoded the way the collapsed path was: a key with an escape keeps
+     * the decoded character in its ARN rather than the escape.
+     */
+    @Test
+    void s3DecodesEscapesInRawPath() {
+        when(uriInfo.getPath()).thenReturn("/my-bucket/a b.txt");
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost:4566/my-bucket/a%20b.txt"));
+        String arn = builder.build("s3", ctx, "us-east-1", "000000000000");
+        assertEquals("arn:aws:s3:::my-bucket/a b.txt", arn);
+    }
+
+    /**
+     * A bucket-level request through the raw path still mints the bare bucket ARN.
+     */
+    @Test
+    void s3BuildsBucketArnFromRawPath() {
+        when(uriInfo.getPath()).thenReturn("/my-bucket/");
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost:4566/my-bucket/"));
+        String arn = builder.build("s3", ctx, "us-east-1", "000000000000");
+        assertEquals("arn:aws:s3:::my-bucket", arn);
+    }
+
     // ── S3 Control ─────────────────────────────────────────────────────────────
 
     /**

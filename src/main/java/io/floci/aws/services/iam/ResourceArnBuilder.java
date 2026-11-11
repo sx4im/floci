@@ -21,16 +21,19 @@ import io.floci.aws.services.lambda.LambdaArnUtils;
 import io.floci.aws.services.lambda.durable.DurableTokens;
 import io.floci.aws.services.lambdamicrovms.LambdaMicrovmsService;
 import io.floci.aws.services.s3.S3ControlArnUtils;
+import io.floci.aws.services.s3.S3ObjectKeys;
 import io.floci.aws.services.secretsmanager.SecretsManagerService;
 import io.floci.aws.services.sqs.SqsService;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.container.ContainerRequestContext;
+import jakarta.ws.rs.core.UriInfo;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -195,7 +198,7 @@ public class ResourceArnBuilder {
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
         }
-        String path = "s3".equals(credentialScope) ? ctx.getUriInfo().getPath()
+        String path = "s3".equals(credentialScope) ? s3RequestPath(ctx)
                 : IamActionRegistry.decodedPath(ctx);
         return switch (credentialScope) {
             case "s3"             -> buildS3Resources(operation, path, region);
@@ -842,6 +845,25 @@ public class ResourceArnBuilder {
     // ── S3 ──────────────────────────────────────────────────────────────────────
     // Minted in the request's partition; IamEnforcementFilter re-mints an existing bucket's ARN
     // in the bucket's own partition through S3ResourcePolicyProvider before any policy sees it.
+
+    /**
+     * The request path the S3 ARN is built from. JAX-RS collapses consecutive slashes in
+     * {@code UriInfo.getPath()}, so a key starting with a slash would be checked against the
+     * ARN of the same name without it; the request URI's raw path still carries the slash,
+     * which is the path the object itself lands under. Falls back to the collapsed path
+     * when there is no request URI, which also keeps existing callers that stub only
+     * {@code getPath()} on their previous behavior.
+     */
+    private static String s3RequestPath(ContainerRequestContext ctx) {
+        UriInfo uriInfo = ctx.getUriInfo();
+        URI requestUri = uriInfo.getRequestUri();
+        String rawPath = requestUri == null ? null : requestUri.getRawPath();
+        if (rawPath == null || rawPath.isEmpty()) {
+            return uriInfo.getPath();
+        }
+        return S3ObjectKeys.decodePath(rawPath);
+    }
+
     private String buildS3Arn(String path, String region) {
         // path: /bucket or /bucket/key
         String partition = AwsRegions.partitionFor(region);

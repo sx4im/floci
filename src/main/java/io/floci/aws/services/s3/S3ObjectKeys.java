@@ -42,7 +42,7 @@ public final class S3ObjectKeys {
     }
 
     /** Decodes a URL path, skipping the decoder when it holds no escape and no plus. */
-    static String decodePath(String raw) {
+    public static String decodePath(String raw) {
         return raw.indexOf('%') < 0 && raw.indexOf('+') < 0
                 ? raw : URLDecoder.decode(raw.replace("+", "%2B"), StandardCharsets.UTF_8);
     }
