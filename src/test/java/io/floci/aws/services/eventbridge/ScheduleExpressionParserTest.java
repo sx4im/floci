@@ -224,4 +224,56 @@ class ScheduleExpressionParserTest {
 
         assertTrue(delay >= 1000);
     }
+
+    // ──────────────────────────── validate ────────────────────────────
+
+    @Test
+    void validateAcceptsSingularUnitForOneAndPluralOtherwise() {
+        assertDoesNotThrow(() -> ScheduleExpressionParser.validate("rate(1 minute)"));
+        assertDoesNotThrow(() -> ScheduleExpressionParser.validate("rate(1 hour)"));
+        assertDoesNotThrow(() -> ScheduleExpressionParser.validate("rate(1 day)"));
+        assertDoesNotThrow(() -> ScheduleExpressionParser.validate("rate(2 minutes)"));
+        assertDoesNotThrow(() -> ScheduleExpressionParser.validate("rate(2 hours)"));
+        assertDoesNotThrow(() -> ScheduleExpressionParser.validate("rate(5 days)"));
+        assertDoesNotThrow(() -> ScheduleExpressionParser.validate("RATE(1 MINUTE)"));
+        assertDoesNotThrow(() -> ScheduleExpressionParser.validate("rate( 1 minute )"));
+    }
+
+    @Test
+    void validateRejectsMismatchedRateNumberAgreement() {
+        assertThrows(IllegalArgumentException.class, () ->
+                ScheduleExpressionParser.validate("rate(1 minutes)"));
+        assertThrows(IllegalArgumentException.class, () ->
+                ScheduleExpressionParser.validate("rate(2 minute)"));
+        assertThrows(IllegalArgumentException.class, () ->
+                ScheduleExpressionParser.validate("rate(1 hours)"));
+        assertThrows(IllegalArgumentException.class, () ->
+                ScheduleExpressionParser.validate("rate(2 hour)"));
+        assertThrows(IllegalArgumentException.class, () ->
+                ScheduleExpressionParser.validate("rate(1 days)"));
+        assertThrows(IllegalArgumentException.class, () ->
+                ScheduleExpressionParser.validate("rate(2 day)"));
+    }
+
+    @Test
+    void validateRejectsUnsupportedRateUnitsAndZeroValue() {
+        assertThrows(IllegalArgumentException.class, () ->
+                ScheduleExpressionParser.validate("rate(1 week)"));
+        assertThrows(IllegalArgumentException.class, () ->
+                ScheduleExpressionParser.validate("rate(2 weeks)"));
+        assertThrows(IllegalArgumentException.class, () ->
+                ScheduleExpressionParser.validate("rate(1 fortnight)"));
+        assertThrows(IllegalArgumentException.class, () ->
+                ScheduleExpressionParser.validate("rate(0 minutes)"));
+        assertThrows(IllegalArgumentException.class, () ->
+                ScheduleExpressionParser.validate("rate(5)"));
+    }
+
+    @Test
+    void validateIgnoresNonRateExpressions() {
+        assertDoesNotThrow(() -> ScheduleExpressionParser.validate(null));
+        assertDoesNotThrow(() -> ScheduleExpressionParser.validate("  "));
+        assertDoesNotThrow(() -> ScheduleExpressionParser.validate("cron(0 10 * * ? *)"));
+        assertDoesNotThrow(() -> ScheduleExpressionParser.validate("not an expression"));
+    }
 }

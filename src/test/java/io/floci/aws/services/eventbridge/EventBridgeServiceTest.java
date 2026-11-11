@@ -468,6 +468,26 @@ class EventBridgeServiceTest {
         assertTrue(service.listRules(null, null, REGION).isEmpty());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"rate(1 minutes)", "rate(2 minute)", "rate(1 hours)", "rate(2 day)"})
+    void putRuleRejectsRateExpressionsAwsRefuses(String scheduleExpression) {
+        AwsException error = assertThrows(AwsException.class, () ->
+                service.putRule("rule", null, null, scheduleExpression, RuleState.ENABLED, null, null, null, REGION));
+        assertEquals("ValidationException", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+        assertEquals("Parameter ScheduleExpression is not valid.", error.getMessage());
+        assertTrue(service.listRules(null, null, REGION).isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"rate(1 minute)", "rate(2 minutes)", "rate(1 hour)", "rate(5 days)"})
+    void putRuleAcceptsRateExpressionsAwsAccepts(String scheduleExpression) {
+        Rule rule = service.putRule("rule", null, null, scheduleExpression, RuleState.ENABLED,
+                null, null, null, REGION);
+
+        assertEquals(scheduleExpression, rule.getScheduleExpression());
+    }
+
     @Test
     void deleteRuleIsIdempotent() {
         service.putRule("my-rule", null, null, "rate(1 minute)", RuleState.ENABLED,

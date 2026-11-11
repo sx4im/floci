@@ -362,6 +362,9 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         if (eventPattern != null && !eventPattern.isBlank()) {
             validateEventPattern(eventPattern);
         }
+        if (scheduleExpression != null && !scheduleExpression.isBlank()) {
+            validateScheduleExpression(scheduleExpression);
+        }
         String effectiveBus = resolvedBusName(busName);
         ensureBusExists(effectiveBus, region);
 
@@ -1168,6 +1171,15 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
             entry.put("Region", event.get("region").asText());
         }
         return matchesPattern(entry, eventPattern);
+    }
+
+    private void validateScheduleExpression(String scheduleExpression) {
+        try {
+            ScheduleExpressionParser.validate(scheduleExpression);
+        } catch (IllegalArgumentException e) {
+            throw new AwsException("ValidationException",
+                    "Parameter ScheduleExpression is not valid.", 400);
+        }
     }
 
     private void validateEventPattern(String eventPattern) {

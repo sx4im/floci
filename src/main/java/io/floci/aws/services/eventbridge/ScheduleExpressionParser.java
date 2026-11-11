@@ -24,6 +24,39 @@ public final class ScheduleExpressionParser {
 
     private ScheduleExpressionParser() {}
 
+    /**
+     * Validates a schedule expression the way AWS PutRule does for rate expressions:
+     * the unit must be singular for a value of 1 and plural otherwise, and only
+     * minute, hour and day units are accepted. Non-rate expressions are left alone.
+     * Already persisted schedules keep parsing leniently through {@link #parseRateToMillis}.
+     */
+    public static void validate(String expression) {
+        if (expression == null || expression.isBlank()) {
+            return;
+        }
+        String trimmed = expression.trim();
+        if (!trimmed.regionMatches(true, 0, "rate(", 0, 5)) {
+            return;
+        }
+        Matcher rateMatcher = RATE_PATTERN.matcher(trimmed);
+        if (!rateMatcher.matches()) {
+            throw new IllegalArgumentException("Not a valid rate expression: " + expression);
+        }
+        int value = Integer.parseInt(rateMatcher.group(1));
+        if (value < 1) {
+            throw new IllegalArgumentException("Rate value must be >= 1, got: " + value);
+        }
+        String unit = rateMatcher.group(2).toLowerCase();
+        if (unit.equals("week") || unit.equals("weeks")) {
+            throw new IllegalArgumentException("Week-based rates are not supported by EventBridge rules: " + expression);
+        }
+        boolean plural = unit.endsWith("s");
+        if ((value == 1) == plural) {
+            throw new IllegalArgumentException(
+                    "Rate unit must be singular for 1 and plural for values greater than 1: " + expression);
+        }
+    }
+
     public static boolean isRateExpression(String expression) {
         return expression != null && RATE_PATTERN.matcher(expression.trim()).matches();
     }
