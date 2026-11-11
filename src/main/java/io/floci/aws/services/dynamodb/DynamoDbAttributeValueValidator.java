@@ -78,6 +78,10 @@ final class DynamoDbAttributeValueValidator {
                 }
             }
         }
+        // A value with no type member, or with more than one, is not an AttributeValue at all.
+        // The shape check skips members it does not know, so a map entry like {"0": "v"} reaches
+        // here unread, and only this check refuses it.
+        typeOf(value);
         String problem = firstProblem(value.path("L"));
         return problem != null ? problem : firstProblem(value.path("M"));
     }
