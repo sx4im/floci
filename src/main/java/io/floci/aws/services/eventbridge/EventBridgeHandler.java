@@ -413,6 +413,12 @@ public class EventBridgeHandler {
                 if (!entryNode.path("Resources").isMissingNode()) {
                     entry.put("Resources", entryNode.path("Resources"));
                 }
+                if (!entryNode.path("Time").isMissingNode()) {
+                    Instant time = parseTimestamp(entryNode.path("Time"));
+                    if (time != null) {
+                        entry.put("Time", time);
+                    }
+                }
                 entries.add(entry);
             }
         }

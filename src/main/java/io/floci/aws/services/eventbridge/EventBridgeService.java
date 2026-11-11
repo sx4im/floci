@@ -51,6 +51,7 @@ import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -1462,6 +1463,16 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
 
     // ──────────────────────────── Target Routing ────────────────────────────
 
+    /**
+     * The event's own time: the PutEvents entry's Time when present, otherwise
+     * the receive time. AWS delivers entry Time at second precision, so both
+     * paths truncate to whole seconds.
+     */
+    private Instant resolveEventTime(Map<String, Object> entry) {
+        Object time = entry.get("Time");
+        Instant eventTime = time instanceof Instant instant ? instant : Instant.now();
+        return eventTime.truncatedTo(ChronoUnit.SECONDS);
+    }
 
     private String buildEventEnvelope(Map<String, Object> entry, String busName, String eventId,
                                       String callRegion, String callAccountId) {
@@ -1490,7 +1501,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
             node.put("source", source);
             node.put("detail-type", detailType);
             node.put("account", envelopeAccount);
-            node.put("time", Instant.now().toString());
+            node.put("time", resolveEventTime(entry).toString());
             node.put("region", envelopeRegion);
             node.putArray("resources").addAll(resources);
             node.set("detail", objectMapper.readTree(detail));
@@ -2182,7 +2193,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
                         accountGet(archivedEventStore, accountId, evKey).orElse(new ArrayList<>()));
                 ArchivedEvent ae = new ArchivedEvent(
                         eventId,
-                        Instant.now(),
+                        resolveEventTime(entry),
                         (String) entry.get("Source"),
                         (String) entry.get("DetailType"),
                         (String) entry.get("Detail"),

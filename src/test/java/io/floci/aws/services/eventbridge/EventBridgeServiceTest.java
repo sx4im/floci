@@ -31,6 +31,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -901,6 +902,42 @@ class EventBridgeServiceTest {
         assertEquals(REGION, event.path("region").asText());
         assertEquals(0, event.path("resources").size());
         assertEquals("WAITING", event.path("detail").path("state").asText());
+    }
+
+    @Test
+    void putEventsDeliversTheEntryTimeTruncatedToSeconds() throws Exception {
+        Rule rule = service.putRule("time-rule", null, "{\"source\":[\"repro.app\"]}", null, RuleState.ENABLED,
+                null, null, null, REGION);
+        Target target = new Target("t1", "arn:aws:sqs:us-east-1:000000000000:time-repro", null, null);
+        service.putTargets("time-rule", null, List.of(target), REGION);
+
+        Map<String, Object> entry = new HashMap<>();
+        entry.put("Source", "repro.app");
+        entry.put("DetailType", "with-time");
+        entry.put("Detail", "{}");
+        entry.put("Time", Instant.parse("2026-01-02T03:04:05.678Z"));
+        service.putEvents(List.of(entry), REGION);
+
+        ArgumentCaptor<String> eventJson = ArgumentCaptor.forClass(String.class);
+        verify(dispatcherMock).dispatch(eq(rule.getArn()), eq(target), eventJson.capture(), eq(REGION), any());
+        JsonNode event = OBJECT_MAPPER.readTree(eventJson.getValue());
+        assertEquals("2026-01-02T03:04:05Z", event.path("time").asText());
+    }
+
+    @Test
+    void putEventsStampsReceiveTimeWithWholeSecondPrecision() throws Exception {
+        Rule rule = service.putRule("time-rule", null, "{\"source\":[\"repro.app\"]}", null, RuleState.ENABLED,
+                null, null, null, REGION);
+        Target target = new Target("t1", "arn:aws:sqs:us-east-1:000000000000:time-repro", null, null);
+        service.putTargets("time-rule", null, List.of(target), REGION);
+
+        service.putEvents(List.of(Map.of("Source", "repro.app", "DetailType", "no-time", "Detail", "{}")), REGION);
+
+        ArgumentCaptor<String> eventJson = ArgumentCaptor.forClass(String.class);
+        verify(dispatcherMock).dispatch(eq(rule.getArn()), eq(target), eventJson.capture(), eq(REGION), any());
+        JsonNode event = OBJECT_MAPPER.readTree(eventJson.getValue());
+        assertTrue(event.path("time").asText().matches("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z"),
+                "delivered time must be whole-second ISO-8601, got: " + event.path("time").asText());
     }
 
     @Test
