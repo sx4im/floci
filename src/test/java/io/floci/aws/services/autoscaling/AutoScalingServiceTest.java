@@ -359,6 +359,85 @@ class AutoScalingServiceTest {
         assertTrue(service.describeAutoScalingGroups(REGION, List.of("missing-image-asg")).isEmpty());
     }
 
+    @Test
+    void createAutoScalingGroupWithoutLaunchTemplateVersionValidatesAgainstDefaultVersion() {
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        service.ec2Service = ec2Service;
+        LaunchTemplate defaultVersion = new LaunchTemplate();
+        defaultVersion.getData().setImageId("ami-11111111");
+        when(ec2Service.describeLaunchTemplateVersions(REGION, "lt-default", null, List.of("$Default")))
+                .thenReturn(List.of(defaultVersion));
+
+        assertDoesNotThrow(() -> service.createAutoScalingGroup(REGION,
+                "default-version-asg",
+                null,
+                "lt-default",
+                null,
+                null,
+                null,
+                0,
+                1,
+                1,
+                300,
+                List.of("us-east-1a"),
+                List.of(),
+                List.of(),
+                List.of(),
+                "EC2",
+                0,
+                List.of("Default"),
+                Map.of(), Map.of(), AsgOptionalFields.none()));
+
+        verify(ec2Service).describeLaunchTemplateVersions(REGION, "lt-default", null, List.of("$Default"));
+        assertFalse(service.describeAutoScalingGroups(REGION, List.of("default-version-asg")).isEmpty());
+    }
+
+    @Test
+    void createAutoScalingGroupWithoutLaunchTemplateVersionRejectsDefaultVersionWithoutImageId() {
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        service.ec2Service = ec2Service;
+        LaunchTemplate defaultVersion = new LaunchTemplate();
+        defaultVersion.getData().setImageId(null);
+        when(ec2Service.describeLaunchTemplateVersions(REGION, "lt-no-image", null, List.of("$Default")))
+                .thenReturn(List.of(defaultVersion));
+
+        AwsException error = assertThrows(AwsException.class, () -> service.createAutoScalingGroup(REGION,
+                "missing-image-asg",
+                null,
+                "lt-no-image",
+                null,
+                null,
+                null,
+                0,
+                1,
+                1,
+                300,
+                List.of("us-east-1a"),
+                List.of(),
+                List.of(),
+                List.of(),
+                "EC2",
+                0,
+                List.of("Default"),
+                Map.of(), Map.of(), AsgOptionalFields.none()));
+
+        assertEquals("ValidationError", error.getErrorCode());
+        assertEquals(AutoScalingService.MISSING_LAUNCH_TEMPLATE_IMAGE_ID_MESSAGE, error.getMessage());
+        assertEquals(400, error.getHttpStatus());
+        assertTrue(service.describeAutoScalingGroups(REGION, List.of("missing-image-asg")).isEmpty());
+    }
+
+    @Test
+    void launchTemplateInstanceProfileWithoutVersionResolvesDefaultVersion() {
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        service.ec2Service = ec2Service;
+        when(ec2Service.describeLaunchTemplateVersions(REGION, "lt-profile", null, List.of("$Default")))
+                .thenReturn(List.of(withProfile("default-profile")));
+
+        assertEquals(Optional.of("default-profile"),
+                service.launchTemplateInstanceProfile("lt-profile", null, null, REGION));
+    }
+
     static Stream<String> rejectedUserData() throws IOException {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         try (GZIPOutputStream gzip = new GZIPOutputStream(bytes)) {

@@ -960,11 +960,12 @@ public class AutoScalingReconciler {
 
         LaunchTemplate launchTemplate = resolveLaunchTemplate(asg);
         if (launchTemplate != null) {
+            // No version named means the template's default version, not its latest.
             LaunchTemplate version = ec2Service.describeLaunchTemplateVersions(
                     asg.getRegion(),
                     launchTemplate.getLaunchTemplateId(),
                     null,
-                    asg.getLaunchTemplateVersion() == null ? List.of() : List.of(asg.getLaunchTemplateVersion()))
+                    asg.getLaunchTemplateVersion() == null ? List.of("$Default") : List.of(asg.getLaunchTemplateVersion()))
                     .getFirst();
             String resolvedVersion = version.getLatestVersionNumber() != null
                     ? version.getLatestVersionNumber()
@@ -993,11 +994,12 @@ public class AutoScalingReconciler {
         if (specification != null) {
             LaunchTemplate mixedLaunchTemplate = resolveMixedInstancesLaunchTemplate(asg, specification);
             if (mixedLaunchTemplate != null) {
+                // No version named means the template's default version, not its latest.
                 LaunchTemplate version = ec2Service.describeLaunchTemplateVersions(
                         asg.getRegion(),
                         mixedLaunchTemplate.getLaunchTemplateId(),
                         null,
-                        specification.getVersion() == null ? List.of() : List.of(specification.getVersion()))
+                        specification.getVersion() == null ? List.of("$Default") : List.of(specification.getVersion()))
                         .getFirst();
                 String resolvedVersion = version.getLatestVersionNumber() != null
                         ? version.getLatestVersionNumber()

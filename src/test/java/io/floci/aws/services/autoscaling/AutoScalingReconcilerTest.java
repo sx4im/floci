@@ -623,6 +623,94 @@ class AutoScalingReconcilerTest {
     }
 
     @Test
+    void scaleOutWithoutLaunchTemplateVersionLaunchesFromDefaultVersion() {
+        AutoScalingService asgService = scalingService();
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        ElbV2Service elbV2Service = mock(ElbV2Service.class);
+        AutoScalingReconciler reconciler = new AutoScalingReconciler(asgService, ec2Service, elbV2Service);
+        AutoScalingGroup asg = new AutoScalingGroup();
+        asg.setRegion("us-east-1");
+        asg.setAutoScalingGroupName("app-asg");
+        when(asgService.saveAutoScalingGroupIfPresent(asg)).thenReturn(true);
+        asg.setDesiredCapacity(1);
+        asg.setLaunchTemplateId("lt-123");
+        asg.setLaunchTemplateVersion(null);
+
+        LaunchTemplate launchTemplate = new LaunchTemplate();
+        launchTemplate.setLaunchTemplateId("lt-123");
+        LaunchTemplate version = new LaunchTemplate();
+        version.setLatestVersionNumber("1");
+        version.getData().setImageId("ami-version-1");
+        version.getData().setInstanceType("t3.micro");
+        when(ec2Service.describeLaunchTemplates("us-east-1", List.of("lt-123"), List.of(), Map.of()))
+                .thenReturn(List.of(launchTemplate));
+        when(ec2Service.describeLaunchTemplateVersions("us-east-1", "lt-123", null, List.of("$Default")))
+                .thenReturn(List.of(version));
+        Instance ec2Instance = new Instance();
+        ec2Instance.setInstanceId("i-launched");
+        Reservation reservation = new Reservation();
+        reservation.setInstances(List.of(ec2Instance));
+        when(ec2Service.runInstances(eq("us-east-1"), eq("ami-version-1"), eq("t3.micro"),
+                eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
+                onlyGroupNameTag("app-asg"), eq(null), eq(null), eq(null),
+                isNull(), eq(0), isNull(), isNull(), isNull(), any(),
+                anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull())).thenReturn(reservation);
+
+        reconciler.reconcile(asg);
+
+        assertNull(asg.getLaunchTemplateVersion());
+        assertEquals("1", asg.getInstances().getFirst().getLaunchTemplateVersion());
+    }
+
+    @Test
+    void scaleOutWithoutMixedInstancesLaunchTemplateVersionLaunchesFromDefaultVersion() {
+        AutoScalingService asgService = scalingService();
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        ElbV2Service elbV2Service = mock(ElbV2Service.class);
+        AutoScalingReconciler reconciler = new AutoScalingReconciler(asgService, ec2Service, elbV2Service);
+        AutoScalingGroup asg = new AutoScalingGroup();
+        asg.setRegion("us-east-1");
+        asg.setAutoScalingGroupName("app-asg");
+        when(asgService.saveAutoScalingGroupIfPresent(asg)).thenReturn(true);
+        asg.setDesiredCapacity(1);
+        MixedInstancesPolicy policy = new MixedInstancesPolicy();
+        MixedInstancesPolicy.LaunchTemplate launchTemplatePolicy =
+                new MixedInstancesPolicy.LaunchTemplate();
+        MixedInstancesPolicy.LaunchTemplateSpecification specification =
+                new MixedInstancesPolicy.LaunchTemplateSpecification();
+        specification.setLaunchTemplateId("lt-123");
+        specification.setVersion(null);
+        launchTemplatePolicy.setLaunchTemplateSpecification(specification);
+        policy.setLaunchTemplate(launchTemplatePolicy);
+        asg.setMixedInstancesPolicy(policy);
+
+        LaunchTemplate launchTemplate = new LaunchTemplate();
+        launchTemplate.setLaunchTemplateId("lt-123");
+        LaunchTemplate version = new LaunchTemplate();
+        version.setLatestVersionNumber("1");
+        version.getData().setImageId("ami-version-1");
+        version.getData().setInstanceType("t3.micro");
+        when(ec2Service.describeLaunchTemplates("us-east-1", List.of("lt-123"), List.of(), Map.of()))
+                .thenReturn(List.of(launchTemplate));
+        when(ec2Service.describeLaunchTemplateVersions("us-east-1", "lt-123", null, List.of("$Default")))
+                .thenReturn(List.of(version));
+        Instance ec2Instance = new Instance();
+        ec2Instance.setInstanceId("i-launched");
+        Reservation reservation = new Reservation();
+        reservation.setInstances(List.of(ec2Instance));
+        when(ec2Service.runInstances(eq("us-east-1"), eq("ami-version-1"), eq("t3.micro"),
+                eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
+                onlyGroupNameTag("app-asg"), eq(null), eq(null), eq(null),
+                isNull(), eq(0), isNull(), isNull(), isNull(), any(),
+                anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull())).thenReturn(reservation);
+
+        reconciler.reconcile(asg);
+
+        assertEquals(1, asg.getInstances().size());
+        assertEquals("1", asg.getInstances().getFirst().getLaunchTemplateVersion());
+    }
+
+    @Test
     void scaleOutUsesMixedInstancesLaunchTemplateSpecification() {
         AutoScalingService asgService = scalingService();
         Ec2Service ec2Service = mock(Ec2Service.class);
