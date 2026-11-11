@@ -662,6 +662,26 @@ class EksClusterManagerTest {
         }
 
         @Test
+        void adoptsAPreRegionContainerForAClusterWithARegionArn() {
+            // A cluster created before Region-qualified naming ran under the region-free name,
+            // so its survivor lives under "floci-eks-demo" even though the cluster's current
+            // Region-qualified name is "floci-aws-eks-eu-west-1.demo". Only one cluster per
+            // name per account could exist then, so the survivor is this cluster's.
+            Cluster cluster = cluster();
+            cluster.setArn("arn:aws:eks:eu-west-1:000000000000:cluster/demo");
+            when(lifecycleManager.findByName("floci-eks-demo"))
+                    .thenReturn(Optional.of(survivingContainer("cid-1")));
+            when(lifecycleManager.adopt("cid-1", List.of(6443), Optional.empty()))
+                    .thenReturn(new ContainerInfo("cid-1", Map.of(), Map.of(6443, 6512)));
+
+            manager.restoreCluster(cluster);
+
+            assertEquals("cid-1", cluster.getContainerId());
+            assertEquals("floci-eks-demo", cluster.getDockerName());
+            verify(lifecycleManager, never()).create(any());
+        }
+
+        @Test
         void restoreClusterPreservesPreUpgradeLocalStorageWhenContainerSurvives() {
             when(lifecycleManager.findByName("floci-eks-demo"))
                     .thenReturn(Optional.of(survivingContainer("cid-pre-upgrade")));
@@ -2390,7 +2410,7 @@ class EksClusterManagerTest {
 
             String issuer = "https://oidc.eks.us-east-1.amazonaws.com/id/TESTISSUER";
             ClusterOidcKey key = new ClusterOidcKey(issuer, "kid-1", "pubKeyBase64", "privKeyBase64");
-            when(oidcService.ensureKeyForAccount(anyString(), anyString(), anyString())).thenReturn(key);
+            when(oidcService.ensureKeyForAccount(anyString(), anyString(), anyString(), anyString())).thenReturn(key);
             when(oidcService.exportSigningKeyPem(key)).thenReturn("-----BEGIN PRIVATE KEY-----\npriv\n-----END PRIVATE KEY-----\n");
             when(oidcService.exportPublicKeyPem(key)).thenReturn("-----BEGIN PUBLIC KEY-----\npub\n-----END PUBLIC KEY-----\n");
 
@@ -2536,7 +2556,7 @@ class EksClusterManagerTest {
 
             String issuer = "https://oidc.eks.us-east-1.amazonaws.com/id/TESTISSUER";
             ClusterOidcKey key = new ClusterOidcKey(issuer, "kid-1", "pubKeyBase64", "privKeyBase64");
-            when(oidcService.ensureKeyForAccount(anyString(), anyString(), anyString())).thenReturn(key);
+            when(oidcService.ensureKeyForAccount(anyString(), anyString(), anyString(), anyString())).thenReturn(key);
             when(oidcService.exportSigningKeyPem(key)).thenReturn("-----BEGIN PRIVATE KEY-----\npriv\n-----END PRIVATE KEY-----\n");
             when(oidcService.exportPublicKeyPem(key)).thenReturn("-----BEGIN PUBLIC KEY-----\npub\n-----END PUBLIC KEY-----\n");
 
@@ -2565,7 +2585,7 @@ class EksClusterManagerTest {
 
             String issuer = "https://oidc.eks.us-east-1.amazonaws.com/id/TESTISSUER";
             ClusterOidcKey key = new ClusterOidcKey(issuer, "kid-1", "pubKeyBase64", "privKeyBase64");
-            when(oidcService.ensureKeyForAccount(anyString(), anyString(), anyString())).thenReturn(key);
+            when(oidcService.ensureKeyForAccount(anyString(), anyString(), anyString(), anyString())).thenReturn(key);
 
             // Must not throw despite file write failure
             manager.startCluster(cluster);
@@ -2579,7 +2599,7 @@ class EksClusterManagerTest {
 
             String issuer = "https://oidc.eks.us-east-1.amazonaws.com/id/TESTISSUER";
             ClusterOidcKey key = new ClusterOidcKey(issuer, "kid-1", "pubKeyBase64", "privKeyBase64");
-            when(oidcService.ensureKeyForAccount(anyString(), anyString(), anyString())).thenReturn(key);
+            when(oidcService.ensureKeyForAccount(anyString(), anyString(), anyString(), anyString())).thenReturn(key);
             when(oidcService.exportSigningKeyPem(key)).thenReturn("-----BEGIN PRIVATE KEY-----\npriv\n-----END PRIVATE KEY-----\n");
             when(oidcService.exportPublicKeyPem(key)).thenReturn("-----BEGIN PUBLIC KEY-----\npub\n-----END PUBLIC KEY-----\n");
 
@@ -3129,7 +3149,7 @@ class EksClusterManagerTest {
 
             String issuer = "https://oidc.eks.us-east-1.amazonaws.com/id/TESTISSUER";
             ClusterOidcKey key = new ClusterOidcKey(issuer, "kid-1", "pubKeyBase64", "privKeyBase64");
-            when(oidcService.ensureKeyForAccount(anyString(), anyString(), anyString())).thenReturn(key);
+            when(oidcService.ensureKeyForAccount(anyString(), anyString(), anyString(), anyString())).thenReturn(key);
             when(oidcService.exportSigningKeyPem(key)).thenReturn("-----BEGIN PRIVATE KEY-----\npriv\n-----END PRIVATE KEY-----\n");
             when(oidcService.exportPublicKeyPem(key)).thenReturn("-----BEGIN PUBLIC KEY-----\npub\n-----END PUBLIC KEY-----\n");
 

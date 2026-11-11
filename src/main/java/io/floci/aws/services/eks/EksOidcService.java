@@ -72,10 +72,11 @@ public class EksOidcService implements OidcIssuerKeyLookup {
 
     /**
      * Generates and stores the cluster's signing keypair if absent, returning the stored material.
-     * Keyed by cluster name so {@code DeleteCluster} can drop it.
+     * Keys are Region-qualified, so same-named clusters in different Regions hold different keys
+     * and DeleteCluster drops only its own Region's.
      */
-    public synchronized ClusterOidcKey ensureKey(String clusterName, String issuer) {
-        return ensureKey(null, clusterName, issuer);
+    public synchronized ClusterOidcKey ensureKey(String region, String clusterName, String issuer) {
+        return ensureKey(null, region, clusterName, issuer);
     }
 
     /**
@@ -83,13 +84,13 @@ public class EksOidcService implements OidcIssuerKeyLookup {
      * without a request context must pass the owning account from the cluster record, since the
      * request-scoped store would otherwise resolve to the default account.
      */
-    public synchronized ClusterOidcKey ensureKeyForAccount(String accountId, String clusterName,
+    public synchronized ClusterOidcKey ensureKeyForAccount(String accountId, String region, String clusterName,
                                                            String issuer) {
-        return ensureKey(accountId, clusterName, issuer);
+        return ensureKey(accountId, region, clusterName, issuer);
     }
 
-    private ClusterOidcKey ensureKey(String accountId, String clusterName, String issuer) {
-        Optional<ClusterOidcKey> existing = readKey(accountId, clusterName);
+    private ClusterOidcKey ensureKey(String accountId, String region, String clusterName, String issuer) {
+        Optional<ClusterOidcKey> existing = readKey(accountId, region, clusterName);
         if (existing.isPresent() && issuer.equals(existing.get().getIssuer())) {
             return existing.get();
         }
@@ -104,7 +105,7 @@ public class EksOidcService implements OidcIssuerKeyLookup {
                     UUID.randomUUID().toString(),
                     Base64.getEncoder().encodeToString(keyPair.getPublic().getEncoded()),
                     Base64.getEncoder().encodeToString(keyPair.getPrivate().getEncoded()));
-            writeKey(accountId, clusterName, key);
+            writeKey(accountId, region, clusterName, key);
             LOG.debugv("Generated IRSA OIDC signing key for EKS cluster {0}", clusterName);
             return key;
         } catch (NoSuchAlgorithmException e) {
@@ -113,27 +114,108 @@ public class EksOidcService implements OidcIssuerKeyLookup {
         }
     }
 
-    private Optional<ClusterOidcKey> readKey(String accountId, String clusterName) {
-        if (accountId != null && keyStore instanceof AccountAwareStorageBackend<ClusterOidcKey> aware) {
-            return aware.getForAccount(accountId, clusterName);
+    private Optional<ClusterOidcKey> readKey(String accountId, String region, String clusterName) {
+        if (region == null) {
+            return readKeyAt(accountId, clusterName);
         }
-        return keyStore.get(clusterName);
+        Optional<ClusterOidcKey> qualified = readKeyAt(accountId, EksStorageKeys.clusterKey(region, clusterName));
+        if (qualified.isPresent()) {
+            return qualified;
+        }
+        Optional<ClusterOidcKey> legacy = readKeyAt(accountId, clusterName);
+        if (legacy.isEmpty() && accountId != null
+                && keyStore instanceof AccountAwareStorageBackend<ClusterOidcKey> aware) {
+            // A pre-multi-account key is stored under the bare name with no account prefix; it
+            // belongs to the default account, which only the backend knows. Migrate it into this
+            // account's Region-qualified key when its issuer names this Region.
+            aware.migrateLegacyEntries(accountId, key -> key.equals(clusterName),
+                    value -> EksStorageKeys.clusterKey(region, clusterName),
+                    value -> {
+                        String keyRegion = regionFromIssuer(value.getIssuer());
+                        return keyRegion == null || keyRegion.equals(region);
+                    });
+            return readKeyAt(accountId, EksStorageKeys.clusterKey(region, clusterName));
+        }
+        if (legacy.isEmpty()) {
+            return Optional.empty();
+        }
+        ClusterOidcKey key = legacy.get();
+        String legacyRegion = regionFromIssuer(key.getIssuer());
+        if (legacyRegion != null && !legacyRegion.equals(region)) {
+            return Optional.empty();
+        }
+        writeKeyAt(accountId, EksStorageKeys.clusterKey(region, clusterName), key);
+        deleteKeyAt(accountId, clusterName);
+        return legacy;
     }
 
-    private void writeKey(String accountId, String clusterName, ClusterOidcKey key) {
+    private Optional<ClusterOidcKey> readKeyAt(String accountId, String key) {
         if (accountId != null && keyStore instanceof AccountAwareStorageBackend<ClusterOidcKey> aware) {
-            aware.putForAccount(accountId, clusterName, key);
+            return aware.getForAccount(accountId, key);
+        }
+        return keyStore.get(key);
+    }
+
+    private void writeKey(String accountId, String region, String clusterName, ClusterOidcKey key) {
+        writeKeyAt(accountId, region != null ? EksStorageKeys.clusterKey(region, clusterName) : clusterName, key);
+    }
+
+    private void writeKeyAt(String accountId, String key, ClusterOidcKey value) {
+        if (accountId != null && keyStore instanceof AccountAwareStorageBackend<ClusterOidcKey> aware) {
+            aware.putForAccount(accountId, key, value);
             return;
         }
-        keyStore.put(clusterName, key);
+        keyStore.put(key, value);
     }
 
-    public void deleteKey(String clusterName) {
-        keyStore.delete(clusterName);
+    private void deleteKeyAt(String accountId, String key) {
+        if (accountId != null && keyStore instanceof AccountAwareStorageBackend<ClusterOidcKey> aware) {
+            aware.deleteForAccount(accountId, key);
+            return;
+        }
+        keyStore.delete(key);
     }
 
-    public Optional<ClusterOidcKey> findKeyByCluster(String clusterName) {
-        return keyStore.get(clusterName);
+    public void deleteKey(String region, String clusterName) {
+        deleteKeyAt(null, EksStorageKeys.clusterKey(region, clusterName));
+        readKeyAt(null, clusterName).ifPresent(bare -> {
+            String bareRegion = regionFromIssuer(bare.getIssuer());
+            if (bareRegion == null || bareRegion.equals(region)) {
+                deleteKeyAt(null, clusterName);
+            }
+        });
+    }
+
+    /**
+     * The signing key for an issuer URL. Issuers are globally unique, so the lookup scans every
+     * account and Region rather than keying off a cluster name that may exist in several Regions.
+     */
+    public Optional<ClusterOidcKey> findKeyByIssuer(String issuer) {
+        if (issuer == null || issuer.isBlank()) {
+            return Optional.empty();
+        }
+        return allKeys().stream()
+                .filter(key -> issuer.equals(key.getIssuer()))
+                .findFirst();
+    }
+
+    /**
+     * The Region an OIDC issuer URL names, or null when the issuer is not AWS-shaped. The issuer
+     * URL embeds the Region ({@code https://oidc.eks.<region>.amazonaws.com/id/<id>}), so a token
+     * mint carries its cluster's Region with it.
+     */
+    static String regionFromIssuer(String issuer) {
+        if (issuer == null) {
+            return null;
+        }
+        String host = issuer.startsWith("https://") ? issuer.substring("https://".length()) : issuer;
+        String prefix = "oidc.eks.";
+        if (!host.startsWith(prefix)) {
+            return null;
+        }
+        String rest = host.substring(prefix.length());
+        int dot = rest.indexOf('.');
+        return dot <= 0 ? null : rest.substring(0, dot);
     }
 
     @Override
@@ -173,7 +255,7 @@ public class EksOidcService implements OidcIssuerKeyLookup {
         int lifetime = resolveLifetime(lifetimeSeconds);
         String aud = audience == null || audience.isBlank() ? STS_AUDIENCE : audience;
 
-        ClusterOidcKey key = ensureKey(clusterName, issuer);
+        ClusterOidcKey key = ensureKey(regionFromIssuer(issuer), clusterName, issuer);
         long now = Instant.now().getEpochSecond();
         long exp = now + lifetime;
         String subject = "system:serviceaccount:" + namespace + ":" + serviceAccount;

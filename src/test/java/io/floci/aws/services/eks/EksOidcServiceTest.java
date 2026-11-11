@@ -32,6 +32,8 @@ class EksOidcServiceTest {
 
     private static final String ISSUER =
             "https://oidc.eks.us-east-1.amazonaws.com/id/ABCDEF0123456789ABCDEF0123456789";
+    private static final String ISSUER_EU =
+            "https://oidc.eks.eu-west-1.amazonaws.com/id/ABCDEF0123456789ABCDEF0123456789";
     private static final String CLUSTER = "irsa-test-cluster";
 
     private EksOidcService oidcService;
@@ -64,8 +66,8 @@ class EksOidcServiceTest {
 
     @Test
     void ensureKeyIsIdempotentForTheSameIssuer() {
-        ClusterOidcKey first = oidcService.ensureKey(CLUSTER, ISSUER);
-        ClusterOidcKey second = oidcService.ensureKey(CLUSTER, ISSUER);
+        ClusterOidcKey first = oidcService.ensureKey("us-east-1", CLUSTER, ISSUER);
+        ClusterOidcKey second = oidcService.ensureKey("us-east-1", CLUSTER, ISSUER);
 
         assertEquals(first.getKeyId(), second.getKeyId());
         assertEquals(first.getPrivateKey(), second.getPrivateKey());
@@ -73,12 +75,74 @@ class EksOidcServiceTest {
 
     @Test
     void ensureKeyRotatesWhenTheIssuerChanges() {
-        ClusterOidcKey original = oidcService.ensureKey(CLUSTER, ISSUER);
-        ClusterOidcKey rotated = oidcService.ensureKey(CLUSTER,
+        ClusterOidcKey original = oidcService.ensureKey("us-east-1", CLUSTER, ISSUER);
+        ClusterOidcKey rotated = oidcService.ensureKey("us-east-1", CLUSTER,
                 "https://oidc.eks.us-east-1.amazonaws.com/id/0000000000000000000000000000BEEF");
 
         assertNotEquals(original.getPrivateKey(), rotated.getPrivateKey());
         assertTrue(oidcService.findVerificationKey(ISSUER).isEmpty());
+    }
+
+    @Test
+    void sameNameClustersInTwoRegionsHoldDifferentKeys() {
+        ClusterOidcKey usKey = oidcService.ensureKey("us-east-1", CLUSTER, ISSUER);
+        ClusterOidcKey euKey = oidcService.ensureKey("eu-west-1", CLUSTER, ISSUER_EU);
+
+        assertNotEquals(usKey.getKeyId(), euKey.getKeyId());
+        assertNotEquals(usKey.getPrivateKey(), euKey.getPrivateKey());
+        assertTrue(oidcService.findVerificationKey(ISSUER).isPresent());
+        assertTrue(oidcService.findVerificationKey(ISSUER_EU).isPresent());
+        // Re-reading one Region's key never returns the other's.
+        assertEquals(usKey.getKeyId(), oidcService.ensureKey("us-east-1", CLUSTER, ISSUER).getKeyId());
+        assertEquals(euKey.getKeyId(), oidcService.ensureKey("eu-west-1", CLUSTER, ISSUER_EU).getKeyId());
+    }
+
+    @Test
+    void deleteKeyRemovesOnlyItsOwnRegion() {
+        oidcService.ensureKey("us-east-1", CLUSTER, ISSUER);
+        oidcService.ensureKey("eu-west-1", CLUSTER, ISSUER_EU);
+
+        oidcService.deleteKey("us-east-1", CLUSTER);
+
+        assertTrue(oidcService.findKeyByIssuer(ISSUER).isEmpty());
+        assertTrue(oidcService.findVerificationKey(ISSUER).isEmpty());
+        assertTrue(oidcService.findKeyByIssuer(ISSUER_EU).isPresent());
+        assertTrue(oidcService.findVerificationKey(ISSUER_EU).isPresent());
+    }
+
+    @Test
+    void findKeyByIssuerResolvesOnlyKnownIssuers() {
+        oidcService.ensureKey("us-east-1", CLUSTER, ISSUER);
+
+        assertTrue(oidcService.findKeyByIssuer(ISSUER).isPresent());
+        assertTrue(oidcService.findKeyByIssuer("https://accounts.google.com").isEmpty());
+        assertTrue(oidcService.findKeyByIssuer(null).isEmpty());
+        assertTrue(oidcService.findKeyByIssuer("").isEmpty());
+    }
+
+    @Test
+    void legacyBareKeyMigratesToItsRegionOnRead() {
+        StorageBackend<String, ClusterOidcKey> raw = new InMemoryStorage<>();
+        AccountAwareStorageBackend<ClusterOidcKey> accountAware = new AccountAwareStorageBackend<>(raw, null, "000000000000");
+        EksOidcService service = new EksOidcService(new StorageFactory(null, null) {
+            @Override
+            @SuppressWarnings("unchecked")
+            public <V> AccountAwareStorageBackend<V> create(String serviceName, String fileName,
+                    TypeReference<Map<String, V>> typeReference) {
+                return (AccountAwareStorageBackend<V>) accountAware;
+            }
+        }, new ObjectMapper());
+
+        ClusterOidcKey legacy = new ClusterOidcKey(ISSUER, "legacy-kid", "legacy-public", "legacy-private");
+        accountAware.putForAccount("000000000000", CLUSTER, legacy);
+
+        ClusterOidcKey found = service.ensureKey("us-east-1", CLUSTER, ISSUER);
+
+        assertEquals("legacy-kid", found.getKeyId());
+        assertEquals("legacy-public", found.getPublicKey());
+        // Migrated: the bare key is gone and the qualified key holds the same material.
+        assertTrue(accountAware.getForAccount("000000000000", CLUSTER).isEmpty());
+        assertTrue(accountAware.getForAccount("000000000000", "us-east-1/" + CLUSTER).isPresent());
     }
 
     @Test
@@ -97,7 +161,7 @@ class EksOidcServiceTest {
             }
         }, new ObjectMapper());
 
-        service.ensureKeyForAccount("999999999999", CLUSTER, ISSUER);
+        service.ensureKeyForAccount("999999999999", "us-east-1", CLUSTER, ISSUER);
 
         // The lookup runs outside any request context, so it resolves to the default account.
         assertTrue(service.findVerificationKey(ISSUER).isPresent());
@@ -105,7 +169,7 @@ class EksOidcServiceTest {
 
     @Test
     void findVerificationKeyResolvesOnlyKnownIssuers() {
-        oidcService.ensureKey(CLUSTER, ISSUER);
+        oidcService.ensureKey("us-east-1", CLUSTER, ISSUER);
 
         assertTrue(oidcService.findVerificationKey(ISSUER).isPresent());
         assertTrue(oidcService.findVerificationKey("https://accounts.google.com").isEmpty());
@@ -115,16 +179,16 @@ class EksOidcServiceTest {
 
     @Test
     void deleteKeyRemovesSigningMaterial() {
-        oidcService.ensureKey(CLUSTER, ISSUER);
-        oidcService.deleteKey(CLUSTER);
+        oidcService.ensureKey("us-east-1", CLUSTER, ISSUER);
+        oidcService.deleteKey("us-east-1", CLUSTER);
 
-        assertTrue(oidcService.findKeyByCluster(CLUSTER).isEmpty());
+        assertTrue(oidcService.findKeyByIssuer(ISSUER).isEmpty());
         assertTrue(oidcService.findVerificationKey(ISSUER).isEmpty());
     }
 
     @Test
     void mintedTokenCarriesKubernetesServiceAccountClaims() {
-        oidcService.ensureKey(CLUSTER, ISSUER);
+        oidcService.ensureKey("us-east-1", CLUSTER, ISSUER);
         String payload = decodePayload(oidcService.mintServiceAccountToken(
                 CLUSTER, ISSUER, "my-namespace", "my-service-account", null, null));
 
@@ -136,7 +200,7 @@ class EksOidcServiceTest {
 
     @Test
     void mintRejectsMissingNamespaceOrServiceAccount() {
-        oidcService.ensureKey(CLUSTER, ISSUER);
+        oidcService.ensureKey("us-east-1", CLUSTER, ISSUER);
 
         assertThrows(AwsException.class, () -> oidcService.mintServiceAccountToken(
                 CLUSTER, ISSUER, null, "my-service-account", null, null));
@@ -150,7 +214,7 @@ class EksOidcServiceTest {
 
     @Test
     void mintClampsLifetimeToTheMaximum() {
-        oidcService.ensureKey(CLUSTER, ISSUER);
+        oidcService.ensureKey("us-east-1", CLUSTER, ISSUER);
         long now = System.currentTimeMillis() / 1000;
 
         String payload = decodePayload(oidcService.mintServiceAccountToken(
@@ -163,7 +227,7 @@ class EksOidcServiceTest {
     @Test
     void namespaceWithControlCharactersStillProducesAParseableToken() {
         // Claims are serialized with Jackson, so a newline is escaped rather than breaking the JSON.
-        oidcService.ensureKey(CLUSTER, ISSUER);
+        oidcService.ensureKey("us-east-1", CLUSTER, ISSUER);
         String payload = decodePayload(oidcService.mintServiceAccountToken(
                 CLUSTER, ISSUER, "bad\nnamespace\"quote", "my-service-account", null, null));
 
@@ -173,7 +237,7 @@ class EksOidcServiceTest {
 
     @Test
     void exportSigningKeyPemProducesValidPkcs8MatchingClusterKey() throws Exception {
-        ClusterOidcKey key = oidcService.ensureKey(CLUSTER, ISSUER);
+        ClusterOidcKey key = oidcService.ensureKey("us-east-1", CLUSTER, ISSUER);
         String pem = oidcService.exportSigningKeyPem(key);
 
         assertTrue(pem.startsWith("-----BEGIN PRIVATE KEY-----\n"));
@@ -192,7 +256,7 @@ class EksOidcServiceTest {
 
     @Test
     void exportPublicKeyPemProducesValidX509MatchingClusterKey() throws Exception {
-        ClusterOidcKey key = oidcService.ensureKey(CLUSTER, ISSUER);
+        ClusterOidcKey key = oidcService.ensureKey("us-east-1", CLUSTER, ISSUER);
         String pem = oidcService.exportPublicKeyPem(key);
 
         assertTrue(pem.startsWith("-----BEGIN PUBLIC KEY-----\n"));
@@ -211,7 +275,7 @@ class EksOidcServiceTest {
 
     @Test
     void exportedKeyPairSignsAndVerifies() throws Exception {
-        ClusterOidcKey key = oidcService.ensureKey(CLUSTER, ISSUER);
+        ClusterOidcKey key = oidcService.ensureKey("us-east-1", CLUSTER, ISSUER);
         String signingPem = oidcService.exportSigningKeyPem(key);
         String publicPem = oidcService.exportPublicKeyPem(key);
 

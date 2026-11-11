@@ -69,7 +69,13 @@ class EksOidcIdentityIntegrationTest {
     void describeClusterNeverExposesSigningMaterial() {
         // Asserted against the actual stored key rather than a list of guessed field names, so this
         // fails if key material is ever surfaced under any property.
-        ClusterOidcKey stored = oidcService.findKeyByCluster(CLUSTER).orElseThrow();
+        String issuer = given()
+        .when()
+            .get("/clusters/" + CLUSTER)
+        .then()
+            .statusCode(200)
+            .extract().path("cluster.identity.oidc.issuer");
+        ClusterOidcKey stored = oidcService.findKeyByIssuer(issuer).orElseThrow();
 
         String body = given()
         .when()

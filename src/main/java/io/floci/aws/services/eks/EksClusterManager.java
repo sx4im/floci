@@ -733,7 +733,8 @@ public class EksClusterManager
             try {
                 String accountId = resolveClusterAccountId(cluster);
                 String issuer = resolveClusterIssuer(cluster);
-                ClusterOidcKey oidcKey = oidcService.ensureKeyForAccount(accountId, cluster.getName(), issuer);
+                ClusterOidcKey oidcKey = oidcService.ensureKeyForAccount(accountId, clusterRegion(cluster),
+                        cluster.getName(), issuer);
                 signingKeyFiles = writeSigningKeyFiles(cluster, oidcKey);
                 if (signingKeyFiles != null) {
                     serverArgs.addAll(buildIrsaServerArgs(oidcKey.getIssuer()));
@@ -1405,17 +1406,20 @@ public class EksClusterManager
 
     /**
      * Account-qualified Docker name for a cluster. Cluster names are unique only within an
-     * account, so a non-default account's cluster is qualified with its account ID — otherwise
-     * two accounts' same-named clusters would resolve to the same container and data volume,
-     * letting one account reach (or, via startCluster's stale-container removal, destroy) the
-     * other's workloads. The default account keeps the historical unqualified name so existing
-     * containers, volumes, and {@code endpoint-mode=network} DNS names keep working.
+     * account and a Region, so a cluster is qualified with its Region as well as its account
+     * ID. Otherwise two Regions' same-named clusters would resolve to the same container
+     * and data volume, letting one Region reach (or, via startCluster's stale-container
+     * removal, destroy) the other's workloads. A cluster with no ARN carries no Region, so
+     * it keeps the historical region-free name. The default account keeps the historical
+     * unqualified name so existing containers, volumes, and {@code endpoint-mode=network}
+     * DNS names keep working.
      *
      * <p>The qualifier separator is a dot: EksService validates cluster names against the AWS
-     * charset ({@code [0-9A-Za-z][A-Za-z0-9\-_]*}), which admits no dot, so no default-account
-     * cluster name can spell out {@code <accountId>.<name>} and collide with another account's
-     * qualified name — a dash separator would (cluster "999999999999-demo" vs account
-     * 999999999999's "demo"). Dots are valid in Docker container and volume names.
+     * charset ({@code [0-9A-Za-z][A-Za-z0-9\-_]*}), which admits no dot, and Region IDs admit
+     * none either, so no default-account cluster name can spell out
+     * {@code <region>.<name>} and collide with another Region's qualified name. A dash
+     * separator would (cluster "999999999999-demo" vs account 999999999999's "demo"). Dots
+     * are valid in Docker container and volume names.
      *
      * <p>The record's accountId is set before every call path reaches here (createCluster on
      * create; the startup account rehydration on restore/stop); a null falls back to the
@@ -1426,9 +1430,21 @@ public class EksClusterManager
     }
 
     private String accountQualifiedClusterName(Cluster cluster) {
+        return accountQualifiedClusterName(cluster, AwsArnUtils.regionOrDefault(cluster.getArn(), null));
+    }
+
+    private String accountQualifiedClusterName(Cluster cluster, String region) {
         String accountId = cluster.getAccountId();
         boolean defaultAccount = accountId == null || accountId.equals(config.defaultAccountId());
-        return defaultAccount ? cluster.getName() : accountId + "." + cluster.getName();
+        if (region == null || region.isBlank()) {
+            return defaultAccount ? cluster.getName() : accountId + "." + cluster.getName();
+        }
+        return defaultAccount ? region + "." + cluster.getName()
+                : accountId + "." + region + "." + cluster.getName();
+    }
+
+    private String accountQualifiedClusterNameWithoutRegion(Cluster cluster) {
+        return accountQualifiedClusterName(cluster, null);
     }
 
     /**
@@ -1447,6 +1463,13 @@ public class EksClusterManager
     private String resolveRestoredDockerName(Cluster cluster) {
         String qualified = accountQualifiedName(cluster);
 
+        // The cluster's own container under its current name wins outright: a survivor under
+        // a legacy name can only be this cluster's when no current-name container exists, and
+        // two same-named clusters in different Regions share the legacy name.
+        if (lifecycleManager.findByName(qualified).isPresent()) {
+            return qualified;
+        }
+
         // A cluster created after account qualification but before the floci-aws- rename lives
         // under the qualified name with the old prefix. Nothing else about it changed, so adopt
         // it outright rather than putting it through the ownership check below.
@@ -1456,6 +1479,25 @@ public class EksClusterManager
             LOG.infov("EKS cluster {0} keeps its pre-rename Docker name {1}",
                     cluster.getName(), prefixLegacyQualified);
             return prefixLegacyQualified;
+        }
+
+        // Clusters created before Region-qualified naming used the region-free name. Only one
+        // cluster per name per account could exist then (the second CreateCluster failed), so a
+        // survivor under that name is this cluster's, and it is adopted outright like the
+        // pre-rename name above.
+        String preRegionQualified = ContainerStorageHelper.resourceName(config, "eks", null,
+                accountQualifiedClusterNameWithoutRegion(cluster));
+        String preRegionLegacy = ContainerStorageHelper.legacyDockerName(config, preRegionQualified);
+        if (!preRegionLegacy.equals(preRegionQualified)
+                && lifecycleManager.findByName(preRegionLegacy).isPresent()) {
+            LOG.infov("EKS cluster {0} keeps its pre-region Docker name {1}",
+                    cluster.getName(), preRegionLegacy);
+            return preRegionLegacy;
+        }
+        if (lifecycleManager.findByName(preRegionQualified).isPresent()) {
+            LOG.infov("EKS cluster {0} keeps its pre-region Docker name {1}",
+                    cluster.getName(), preRegionQualified);
+            return preRegionQualified;
         }
 
         // Clusters predating account qualification used the unqualified name, which also predates
@@ -2107,7 +2149,8 @@ public class EksClusterManager
         try {
             String accountId = resolveClusterAccountId(cluster);
             String issuer = resolveClusterIssuer(cluster);
-            ClusterOidcKey oidcKey = oidcService.ensureKeyForAccount(accountId, cluster.getName(), issuer);
+            ClusterOidcKey oidcKey = oidcService.ensureKeyForAccount(accountId, clusterRegion(cluster),
+                    cluster.getName(), issuer);
             SigningKeyFiles keyFiles = writeSigningKeyFiles(cluster, oidcKey);
             if (keyFiles != null) {
                 copySigningKeysIntoContainer(containerId, keyFiles, cluster.getName());
@@ -2709,16 +2752,24 @@ public class EksClusterManager
         if (nodeGroupStorage == null || cluster == null || cluster.getName() == null) {
             return List.of();
         }
-        String prefix = cluster.getName() + "/";
+        String region = clusterRegion(cluster);
+        String qualifiedPrefix = EksStorageKeys.clusterKeyPrefix(region, cluster.getName());
+        String legacyPrefix = cluster.getName() + "/";
         String accountId = resolveClusterAccountId(cluster);
         List<Nodegroup> groups;
         if (nodeGroupStorage instanceof AccountAwareStorageBackend<Nodegroup> aware) {
-            groups = aware.scanAllAccountEntries(key -> key.startsWith(prefix)).stream()
+            groups = aware.scanAllAccountEntries(key -> key.startsWith(qualifiedPrefix) || key.startsWith(legacyPrefix))
+                    .stream()
                     .filter(entry -> accountId == null || accountId.equals(entry.accountId()))
+                    .filter(entry -> entry.key().startsWith(qualifiedPrefix)
+                            || nodeGroupInRegion(entry.value(), region))
                     .map(AccountAwareStorageBackend.AccountEntry::value)
                     .toList();
         } else {
-            groups = nodeGroupStorage.scan(key -> key.startsWith(prefix));
+            groups = nodeGroupStorage.scan(key -> key.startsWith(qualifiedPrefix) || key.startsWith(legacyPrefix))
+                    .stream()
+                    .filter(group -> nodeGroupInRegion(group, region))
+                    .toList();
         }
         return groups.stream()
                 .filter(g -> g.getStatus() == null || g.getStatus() == NodegroupStatus.ACTIVE)
@@ -2727,6 +2778,11 @@ public class EksClusterManager
                         .thenComparing(Nodegroup::getNodegroupName,
                                 Comparator.nullsLast(Comparator.naturalOrder())))
                 .toList();
+    }
+
+    private static boolean nodeGroupInRegion(Nodegroup group, String region) {
+        String groupRegion = AwsArnUtils.regionOrDefault(group.getNodegroupArn(), null);
+        return groupRegion == null || groupRegion.equals(region);
     }
 
     Nodegroup selectFirstNodegroup(Cluster cluster) {

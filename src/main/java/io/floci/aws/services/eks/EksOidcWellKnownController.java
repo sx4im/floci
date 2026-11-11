@@ -70,8 +70,8 @@ public class EksOidcWellKnownController {
     @GET
     @Path("keys")
     public Response keys(@PathParam("name") String clusterName) {
-        requireIssuer(clusterName);
-        ClusterOidcKey key = oidcService.findKeyByCluster(clusterName)
+        String issuer = requireIssuer(clusterName);
+        ClusterOidcKey key = oidcService.findKeyByIssuer(issuer)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "No OIDC signing key for cluster: " + clusterName, 404));
 

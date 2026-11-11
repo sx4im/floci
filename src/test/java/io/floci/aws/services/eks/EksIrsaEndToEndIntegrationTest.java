@@ -112,7 +112,7 @@ class EksIrsaEndToEndIntegrationTest {
     }
 
     private PrivateKey clusterSigningKey() throws Exception {
-        String encoded = oidcService.ensureKey(CLUSTER, issuer).getPrivateKey();
+        String encoded = oidcService.ensureKey(EksOidcService.regionFromIssuer(issuer), CLUSTER, issuer).getPrivateKey();
         return KeyFactory.getInstance("RSA")
                 .generatePrivate(new PKCS8EncodedKeySpec(Base64.getDecoder().decode(encoded)));
     }

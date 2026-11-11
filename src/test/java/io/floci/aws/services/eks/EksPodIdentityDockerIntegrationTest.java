@@ -139,7 +139,7 @@ class EksPodIdentityDockerIntegrationTest {
         cluster.setIdentity(new ClusterIdentity(new OidcIdentity(issuer)));
         eksService.putClusterForAccount("000000000000", cluster);
 
-        ClusterOidcKey key = oidcService.ensureKeyForAccount("000000000000", clusterName, issuer);
+        ClusterOidcKey key = oidcService.ensureKeyForAccount("000000000000", "us-east-1", clusterName, issuer);
         assertNotNull(key);
 
         associationService.create(cluster, new CreatePodIdentityAssociationRequest(

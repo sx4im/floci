@@ -84,7 +84,7 @@ class EksPodIdentityAccountIntegrationTest {
         cluster.setStatus(ClusterStatus.ACTIVE);
         String issuer = oidcService.newIssuerUrl("us-east-1");
         cluster.setIdentity(new ClusterIdentity(new OidcIdentity(issuer)));
-        oidcService.ensureKeyForAccount(account, name, issuer);
+        oidcService.ensureKeyForAccount(account, "us-east-1", name, issuer);
         eksService.putClusterForAccount(account, cluster);
         // Persisted clusters lose this @JsonIgnore field; the ARN still names the owner.
         cluster.setAccountId(null);
@@ -143,7 +143,7 @@ class EksPodIdentityAccountIntegrationTest {
                 RequestScopes.runAs(account, () -> {
                     associationService.deleteClusterAssociations(cluster);
                     addonService.deleteClusterAddons(cluster);
-                    oidcService.deleteKey(name);
+                    oidcService.deleteKey("us-east-1", name);
                     iamService.findRole(account, roleName).ifPresent(role -> iamService.deleteRole(roleName));
                 }));
         eksService.deleteClusterForAccount(account, name);

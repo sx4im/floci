@@ -47,6 +47,43 @@ class EksRegionScopingIntegrationTest {
         }
     }
 
+    @Test
+    void sameNameClustersCoexistInTwoRegions() {
+        String name = "same-name-two-regions";
+        given().header("Authorization", auth("eu-west-1")).contentType("application/json")
+                .body(Map.of("name", name, "roleArn", "arn:aws:iam::" + ACCOUNT + ":role/cluster"))
+                .post("/clusters").then().statusCode(200)
+                .body("cluster.arn", equalTo("arn:aws:eks:eu-west-1:" + ACCOUNT + ":cluster/" + name));
+        given().header("Authorization", auth("eu-central-1")).contentType("application/json")
+                .body(Map.of("name", name, "roleArn", "arn:aws:iam::" + ACCOUNT + ":role/cluster"))
+                .post("/clusters").then().statusCode(200)
+                .body("cluster.arn", equalTo("arn:aws:eks:eu-central-1:" + ACCOUNT + ":cluster/" + name));
+
+        try {
+            given().header("Authorization", auth("eu-west-1")).get("/clusters/" + name)
+                    .then().statusCode(200)
+                    .body("cluster.arn", equalTo("arn:aws:eks:eu-west-1:" + ACCOUNT + ":cluster/" + name));
+            given().header("Authorization", auth("eu-central-1")).get("/clusters/" + name)
+                    .then().statusCode(200)
+                    .body("cluster.arn", equalTo("arn:aws:eks:eu-central-1:" + ACCOUNT + ":cluster/" + name));
+            given().header("Authorization", auth("eu-west-1")).get("/clusters")
+                    .then().statusCode(200).body("clusters", hasItem(name));
+            given().header("Authorization", auth("eu-central-1")).get("/clusters")
+                    .then().statusCode(200).body("clusters", hasItem(name));
+
+            // Deleting one Region's cluster leaves the other's untouched.
+            given().header("Authorization", auth("eu-west-1")).delete("/clusters/" + name)
+                    .then().statusCode(200);
+            given().header("Authorization", auth("eu-west-1")).get("/clusters/" + name)
+                    .then().statusCode(404);
+            given().header("Authorization", auth("eu-central-1")).get("/clusters/" + name)
+                    .then().statusCode(200)
+                    .body("cluster.arn", equalTo("arn:aws:eks:eu-central-1:" + ACCOUNT + ":cluster/" + name));
+        } finally {
+            given().header("Authorization", auth("eu-central-1")).delete("/clusters/" + name);
+        }
+    }
+
     private static String auth(String region) {
         return "AWS4-HMAC-SHA256 Credential=" + ACCOUNT + "/20261110/" + region
                 + "/eks/aws4_request, SignedHeaders=host, Signature=abc";

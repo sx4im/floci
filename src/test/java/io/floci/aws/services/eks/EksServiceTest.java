@@ -308,8 +308,98 @@ class EksServiceTest {
                 mock(EksAccessEntryService.class), mock(EksPodIdentityAssociationService.class));
         restarted.init();
 
-        String issuer = clusterStore.get("eu-legacy-cluster").orElseThrow().getIdentity().getOidc().getIssuer();
+        // The record migrated to its Region-qualified key under the owning (default) account.
+        String issuer = clusterStore.get("000000000000/eu-west-1/eu-legacy-cluster")
+                .orElseThrow().getIdentity().getOidc().getIssuer();
         assertTrue(issuer.startsWith("https://oidc.eks.eu-west-1.amazonaws.com/id/"), issuer);
+    }
+
+    @Test
+    void sameNameClustersCoexistInTwoRegions() {
+        Map<String, AccountAwareStorageBackend<?>> stores = new HashMap<>();
+        StorageFactory sharedFactory = cachingStorageFactory(stores);
+        EksService usService = serviceWithRegion(sharedFactory, "us-east-1");
+        EksService euService = serviceWithRegion(sharedFactory, "eu-west-1");
+
+        Cluster usCluster = usService.createCluster(clusterRequest("shared-name"));
+        Cluster euCluster = euService.createCluster(clusterRequest("shared-name"));
+
+        assertTrue(usCluster.getArn().contains(":us-east-1:"));
+        assertTrue(euCluster.getArn().contains(":eu-west-1:"));
+        assertNotEquals(usCluster.getArn(), euCluster.getArn());
+
+        assertEquals(usCluster.getArn(), usService.describeCluster("shared-name").getArn());
+        assertEquals(euCluster.getArn(), euService.describeCluster("shared-name").getArn());
+        assertEquals(List.of("shared-name"), usService.listClusters());
+        assertEquals(List.of("shared-name"), euService.listClusters());
+
+        // Deleting one Region's cluster leaves the other's untouched.
+        usService.deleteCluster("shared-name");
+        assertThrows(AwsException.class, () -> usService.describeCluster("shared-name"));
+        assertEquals(euCluster.getArn(), euService.describeCluster("shared-name").getArn());
+        assertTrue(usService.listClusters().isEmpty());
+        assertEquals(List.of("shared-name"), euService.listClusters());
+    }
+
+    @Test
+    void legacyBareRecordForAnotherRegionIsInvisibleFromThisRegion() {
+        StorageBackend<String, Cluster> clusterStore = new InMemoryStorage<>();
+        Cluster legacy = new Cluster();
+        legacy.setName("eu-only-cluster");
+        legacy.setArn("arn:aws:eks:eu-west-1:000000000000:cluster/eu-only-cluster");
+        legacy.setStatus(ClusterStatus.ACTIVE);
+        clusterStore.put("eu-only-cluster", legacy);
+
+        EksService service = serviceWithRegion(fixedStorageFactory(clusterStore), "us-east-1");
+
+        // The record predates Region-qualified keys, but its ARN attributes it to eu-west-1,
+        // so a us-east-1 describe must not see it.
+        assertThrows(AwsException.class, () -> service.describeCluster("eu-only-cluster"));
+        assertTrue(service.listClusters().isEmpty());
+    }
+
+    @Test
+    void legacyBareRecordMigratesToItsOwnRegionOnRead() {
+        StorageBackend<String, Cluster> clusterStore = new InMemoryStorage<>();
+        Cluster legacy = new Cluster();
+        legacy.setName("eu-legacy-cluster");
+        legacy.setArn("arn:aws:eks:eu-west-1:000000000000:cluster/eu-legacy-cluster");
+        legacy.setStatus(ClusterStatus.ACTIVE);
+        clusterStore.put("eu-legacy-cluster", legacy);
+
+        EksService service = serviceWithRegion(fixedStorageFactory(clusterStore), "eu-west-1");
+
+        assertEquals("eu-legacy-cluster", service.describeCluster("eu-legacy-cluster").getName());
+        // Migrated: the bare key is gone and the Region-qualified key holds the record
+        // under the owning (default) account.
+        assertTrue(clusterStore.get("eu-legacy-cluster").isEmpty());
+        assertTrue(clusterStore.get("000000000000/eu-west-1/eu-legacy-cluster").isPresent());
+    }
+
+    private StorageFactory cachingStorageFactory(Map<String, AccountAwareStorageBackend<?>> stores) {
+        return new StorageFactory(null, null) {
+            @Override
+            @SuppressWarnings("unchecked")
+            public <V> AccountAwareStorageBackend<V> create(String serviceName, String fileName,
+                    TypeReference<Map<String, V>> typeReference) {
+                return (AccountAwareStorageBackend<V>) stores.computeIfAbsent(fileName,
+                        name -> AccountAwareStorageBackend.inMemory("000000000000"));
+            }
+        };
+    }
+
+    private EksService serviceWithRegion(StorageFactory factory, String region) {
+        return new EksService(factory, testConfig(),
+                new RegionResolver(region, "000000000000"), null, ec2Service,
+                new EksOidcService(factory, new ObjectMapper()),
+                mock(EksAccessEntryService.class), mock(EksPodIdentityAssociationService.class));
+    }
+
+    private CreateClusterRequest clusterRequest(String name) {
+        CreateClusterRequest request = new CreateClusterRequest();
+        request.setName(name);
+        request.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        return request;
     }
 
     @Test
@@ -359,7 +449,7 @@ class EksServiceTest {
         new EksService(fixedStorageFactory(clusterStore), testConfig(),
                 new RegionResolver("us-east-1", "000000000000"), null, null, oidcService, mock(EksAccessEntryService.class)).init();
 
-        Cluster migrated = clusterStore.getForAccount(otherAccount, "legacy-cluster").orElseThrow();
+        Cluster migrated = clusterStore.getForAccount(otherAccount, "us-east-1/legacy-cluster").orElseThrow();
         String issuer = migrated.getIdentity().getOidc().getIssuer();
         assertNotNull(issuer);
         // The owner rehydrated from the storage key sticks to the record for later puts.
@@ -367,7 +457,7 @@ class EksServiceTest {
         // No duplicate stranded under the default account.
         assertTrue(clusterStore.getForAccount("000000000000", "legacy-cluster").isEmpty());
         // The signing key is stored under the owner too, and is still resolvable by issuer.
-        assertTrue(keyStore.getForAccount(otherAccount, "legacy-cluster").isPresent());
+        assertTrue(keyStore.getForAccount(otherAccount, "us-east-1/legacy-cluster").isPresent());
         assertTrue(oidcService.findVerificationKey(issuer).isPresent());
     }
 
@@ -436,7 +526,7 @@ class EksServiceTest {
             restarted.init();
 
             verify(clusterManager).restoreCluster(persisted);
-            Cluster restored = clusterStore.getForAccount(otherAccount, "persisted-cluster").orElseThrow();
+            Cluster restored = clusterStore.getForAccount(otherAccount, "us-east-1/persisted-cluster").orElseThrow();
             assertEquals(ClusterStatus.CREATING, restored.getStatus());
             // Rehydrated from the storage key, so the readiness poller's later put also lands
             // under the owner.
@@ -1159,9 +1249,9 @@ class EksServiceTest {
         Nodegroup group = service.createNodeGroup("kept-during-swap", nodeGroupRequest("first"));
 
         assertEquals(NodegroupStatus.ACTIVE, group.getStatus());
-        Cluster stored = (Cluster) createdStorage("eks-clusters.json").get("kept-during-swap").orElseThrow();
+        Cluster stored = (Cluster) createdStorage("eks-clusters.json").get("us-east-1/kept-during-swap").orElseThrow();
         assertTrue(stored.isFinalizePending());
-        assertTrue(createdStorage("eks-nodegroups.json").get("kept-during-swap/first").isPresent());
+        assertTrue(createdStorage("eks-nodegroups.json").get("us-east-1/kept-during-swap/first").isPresent());
     }
 
     private static Cluster activeClusterWithRunningNode(EksService service, String name) {
@@ -1931,7 +2021,7 @@ class EksServiceTest {
 
         assertDoesNotThrow(service::init);
 
-        Cluster described = clusterStore.getForAccount(nonDefaultAccount, "non-default-eks")
+        Cluster described = clusterStore.getForAccount(nonDefaultAccount, "us-east-1/non-default-eks")
                 .orElseThrow();
         String sgId = described.getResourcesVpcConfig().getClusterSecurityGroupId();
         assertNotNull(sgId);
