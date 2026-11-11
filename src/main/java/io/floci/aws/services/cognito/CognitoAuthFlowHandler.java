@@ -201,7 +201,7 @@ final class CognitoAuthFlowHandler {
         return switch (authFlow) {
             case "USER_PASSWORD_AUTH" -> {
                 requireFlowEnabled(client, authFlow, "ALLOW_USER_PASSWORD_AUTH", "USER_PASSWORD_AUTH");
-                yield authenticateWithPassword(pool, client, authParameters, clientMetadata, true);
+                yield authenticateWithPassword(pool, client, authParameters, clientMetadata, true, true);
             }
             case "REFRESH_TOKEN_AUTH", "REFRESH_TOKEN" -> {
                 requireRefreshEnabled(client, authFlow);
@@ -244,16 +244,16 @@ final class CognitoAuthFlowHandler {
         return switch (authFlow) {
             case "ADMIN_USER_PASSWORD_AUTH" -> {
                 requireFlowEnabled(client, authFlow, "ALLOW_ADMIN_USER_PASSWORD_AUTH", "ADMIN_NO_SRP_AUTH");
-                yield authenticateWithPassword(pool, client, authParameters, clientMetadata, true);
+                yield authenticateWithPassword(pool, client, authParameters, clientMetadata, true, false);
             }
             case "ADMIN_NO_SRP_AUTH" -> {
                 requireFlowEnabled(client, authFlow, "ALLOW_ADMIN_USER_PASSWORD_AUTH", "ADMIN_NO_SRP_AUTH");
-                yield authenticateWithPassword(pool, client, authParameters, clientMetadata, true);
+                yield authenticateWithPassword(pool, client, authParameters, clientMetadata, true, false);
             }
             case "USER_PASSWORD_AUTH" -> {
                 requireFlowEnabled(client, authFlow, "ALLOW_USER_PASSWORD_AUTH", "USER_PASSWORD_AUTH",
                         "ALLOW_ADMIN_USER_PASSWORD_AUTH", "ADMIN_NO_SRP_AUTH");
-                yield authenticateWithPassword(pool, client, authParameters, clientMetadata, true);
+                yield authenticateWithPassword(pool, client, authParameters, clientMetadata, true, false);
             }
             case "REFRESH_TOKEN_AUTH", "REFRESH_TOKEN" -> {
                 requireRefreshEnabled(client, authFlow);
@@ -506,7 +506,7 @@ final class CognitoAuthFlowHandler {
         }
         if ("PASSWORD".equals(challengeName)) {
             rejectSimulatedUser(consumeUserAuthSession(pool, client, session, "PASSWORD"));
-            return authenticateWithPassword(pool, client, responses, clientMetadata, false);
+            return authenticateWithPassword(pool, client, responses, clientMetadata, false, false);
         }
         if ("PASSWORD_SRP".equals(challengeName)) {
             rejectSimulatedUser(consumeUserAuthSession(pool, client, session, "PASSWORD_SRP"));
@@ -591,17 +591,20 @@ final class CognitoAuthFlowHandler {
 
     // ──────────────────────────── USER_PASSWORD / REFRESH ────────────────────────────
 
-    /** @param recordAuthEvent whether this is one of the flows that record a sign-in event, not USER_AUTH's PASSWORD */
+    /** @param recordAuthEvent whether this is one of the flows that record a sign-in event, not USER_AUTH's PASSWORD
+     * @param maskUnknownUser whether an unknown username answers like a wrong password when the client
+     *     has PreventUserExistenceErrors enabled, instead of leaking that the user does not exist */
     private Map<String, Object> authenticateWithPassword(UserPool pool, UserPoolClient client,
                                                           Map<String, String> params, Map<String, String> clientMetadata,
-                                                          boolean recordAuthEvent) {
+                                                          boolean recordAuthEvent, boolean maskUnknownUser) {
         String username = params.get("USERNAME");
         String password = params.get("PASSWORD");
         if (username == null) throw new AwsException("InvalidParameterException", "USERNAME is required", 400);
         if (password == null) throw new AwsException("InvalidParameterException", "PASSWORD is required", 400);
         validateSecretHash(client, params, username);
 
-        CognitoUser user = verifyPassword(pool, client, username, password, clientMetadata, recordAuthEvent);
+        CognitoUser user = verifyPassword(pool, client, username, password, clientMetadata, recordAuthEvent,
+                maskUnknownUser);
         String authEventId = recordAuthEvent ? service.recordSignInEvent(pool, user, true) : null;
 
         if (user.isTemporaryPassword() || "FORCE_CHANGE_PASSWORD".equals(user.getUserStatus())) {
@@ -618,7 +621,7 @@ final class CognitoAuthFlowHandler {
      * and it refuses a user who would get a challenge, because the sign-in page answers none.
      */
     CognitoUser authenticateManagedLogin(UserPool pool, UserPoolClient client, String username, String password) {
-        CognitoUser user = verifyPassword(pool, client, username, password, Map.of(), false);
+        CognitoUser user = verifyPassword(pool, client, username, password, Map.of(), false, false);
         if (user.isTemporaryPassword() || "FORCE_CHANGE_PASSWORD".equals(user.getUserStatus())) {
             throw new AwsException("NotAuthorizedException", MANAGED_LOGIN_NEW_PASSWORD, 400);
         }
@@ -724,7 +727,8 @@ final class CognitoAuthFlowHandler {
      * sign in, and compares the password.
      */
     private CognitoUser verifyPassword(UserPool pool, UserPoolClient client, String username, String password,
-                                       Map<String, String> clientMetadata, boolean recordAuthEvent) {
+                                       Map<String, String> clientMetadata, boolean recordAuthEvent,
+                                       boolean maskUnknownUser) {
         CognitoUser user;
         try {
             user = service.adminGetUser(pool.getId(), username);
@@ -732,7 +736,12 @@ final class CognitoAuthFlowHandler {
             if (!"UserNotFoundException".equals(ae.getErrorCode())) throw ae;
             user = tryUserMigration(pool, client, username, password, null, clientMetadata,
                     "UserMigration_Authentication");
-            if (user == null) throw ae;
+            if (user == null) {
+                if (maskUnknownUser && "ENABLED".equals(client.getPreventUserExistenceErrors())) {
+                    throw new AwsException("NotAuthorizedException", INCORRECT_CREDENTIALS, 400);
+                }
+                throw ae;
+            }
         }
 
         firePreAuthentication(pool, client, user, null, clientMetadata, false);
@@ -1120,7 +1129,7 @@ final class CognitoAuthFlowHandler {
         List<String> advertised = advertiseAvailable ? available : null;
         return switch (challenge) {
             case "PASSWORD" -> params.containsKey("PASSWORD")
-                    ? authenticateWithPassword(pool, client, params, clientMetadata, false)
+                    ? authenticateWithPassword(pool, client, params, clientMetadata, false, false)
                     : userAuthChallengeResponse(pool, client, user, "PASSWORD", advertised,
                             Map.of("USERNAME", user.getUsername()));
             case "PASSWORD_SRP" -> params.containsKey("SRP_A")

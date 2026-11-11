@@ -3295,6 +3295,59 @@ class CognitoServiceTest {
         assertEquals("UserNotFoundException", exception.getErrorCode());
     }
 
+    /**
+     * With user existence errors prevented, an unknown username answers USER_PASSWORD_AUTH exactly
+     * as a known user with a wrong password does, so the two cannot be told apart.
+     */
+    @Test
+    void initiateAuthWithUserPasswordAuthHidesAnUnknownUserWhenPreventionIsEnabled() {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient client = openClient(service, pool.getId(), "c", false);
+        service.describeUserPoolClient(client.getClientId()).setPreventUserExistenceErrors("ENABLED");
+
+        AwsException unknownUser = assertThrows(AwsException.class, () -> service.initiateAuth(
+                client.getClientId(), "USER_PASSWORD_AUTH",
+                Map.of("USERNAME", "nobody", "PASSWORD", "whatever1!")));
+        AwsException wrongPassword = assertThrows(AwsException.class, () -> service.initiateAuth(
+                client.getClientId(), "USER_PASSWORD_AUTH",
+                Map.of("USERNAME", "alice", "PASSWORD", "WrongPass1!")));
+
+        assertEquals("NotAuthorizedException", unknownUser.getErrorCode());
+        assertEquals("Incorrect username or password", unknownUser.getMessage());
+        assertEquals(unknownUser.getErrorCode(), wrongPassword.getErrorCode());
+        assertEquals(unknownUser.getMessage(), wrongPassword.getMessage());
+    }
+
+    @Test
+    void initiateAuthWithUserPasswordAuthKeepsUserNotFoundForLegacyClients() {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient client = openClient(service, pool.getId(), "c", false);
+        service.describeUserPoolClient(client.getClientId()).setPreventUserExistenceErrors("LEGACY");
+
+        AwsException exception = assertThrows(AwsException.class, () -> service.initiateAuth(
+                client.getClientId(), "USER_PASSWORD_AUTH",
+                Map.of("USERNAME", "nobody", "PASSWORD", "whatever1!")));
+
+        assertEquals("UserNotFoundException", exception.getErrorCode());
+    }
+
+    /**
+     * Admin APIs are trusted, so AdminInitiateAuth keeps distinguishing an unknown user even
+     * when the client prevents user existence errors for unauthenticated sign-in.
+     */
+    @Test
+    void adminInitiateAuthWithUserPasswordAuthKeepsUserNotFoundWhenPreventionIsEnabled() {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient client = openClient(service, pool.getId(), "c", false);
+        service.describeUserPoolClient(client.getClientId()).setPreventUserExistenceErrors("ENABLED");
+
+        AwsException exception = assertThrows(AwsException.class, () -> service.adminInitiateAuth(
+                pool.getId(), client.getClientId(), "ADMIN_USER_PASSWORD_AUTH",
+                Map.of("USERNAME", "nobody", "PASSWORD", "whatever1!")));
+
+        assertEquals("UserNotFoundException", exception.getErrorCode());
+    }
+
     @Test
     void respondToAuthChallengeRejectsASimulatedUserSessionAfterExpiry() {
         MutableClock clock = new MutableClock();
