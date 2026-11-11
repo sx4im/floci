@@ -883,6 +883,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
         Map<String, Object> req = new HashMap<>();
         req.put("integrationType", ctx.resolveOptional(props, "IntegrationType"));
         req.put("integrationUri", ctx.resolveOptional(props, "IntegrationUri"));
+        req.put("description", ctx.resolveOptional(props, "Description"));
         req.put("payloadFormatVersion", ctx.resolveOrDefault(props, "PayloadFormatVersion", "2.0"));
         String connectionType = ctx.resolveOptional(props, "ConnectionType");
         String connectionId = ctx.resolveOptional(props, "ConnectionId");

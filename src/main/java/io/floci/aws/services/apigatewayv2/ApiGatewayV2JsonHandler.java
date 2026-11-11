@@ -646,6 +646,9 @@ public class ApiGatewayV2JsonHandler {
         if (i.getCredentialsArn() != null) {
             node.put("CredentialsArn", i.getCredentialsArn());
         }
+        if (i.getDescription() != null) {
+            node.put("Description", i.getDescription());
+        }
         if (i.getIntegrationUri() != null) node.put("IntegrationUri", i.getIntegrationUri());
         if (i.getRequestTemplates() != null) {
             ObjectNode requestTemplates = node.putObject("RequestTemplates");

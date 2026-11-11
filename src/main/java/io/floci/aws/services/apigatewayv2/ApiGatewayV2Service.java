@@ -754,6 +754,7 @@ public class ApiGatewayV2Service {
         integration.setIntegrationId(shortId(8));
         integration.setIntegrationType((String) request.get("integrationType"));
         integration.setCredentialsArn((String) request.get("credentialsArn"));
+        integration.setDescription((String) request.get("description"));
         integration.setIntegrationUri((String) request.get("integrationUri"));
         integration.setConnectionType((String) request.get("connectionType"));
         integration.setPayloadFormatVersion((String) request.getOrDefault("payloadFormatVersion", "2.0"));
@@ -811,6 +812,9 @@ public class ApiGatewayV2Service {
 
         if (request.get("credentialsArn") != null) {
             integration.setCredentialsArn((String) request.get("credentialsArn"));
+        }
+        if (request.containsKey("description") && request.get("description") != null) {
+            integration.setDescription((String) request.get("description"));
         }
         if (request.containsKey("integrationType") && request.get("integrationType") != null) {
             integration.setIntegrationType((String) request.get("integrationType"));
