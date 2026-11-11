@@ -7,9 +7,12 @@ import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
 import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.command.ExecStartCmd;
+import com.github.dockerjava.api.command.InspectContainerCmd;
+import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.ListContainersCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.AccessMode;
+import com.github.dockerjava.api.model.ContainerConfig;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.MountType;
@@ -2450,6 +2453,67 @@ class ContainerLauncherTest {
         inOrder.verify(lifecycleManager).startCreated(eq("container-123"), any());
         inOrder.verify(dockerClient).copyArchiveFromContainerCmd("container-123", "/opt/extensions");
         inOrder.verify(dockerClient, atLeastOnce()).execCreateCmd("container-123");
+    }
+
+    /** Builds a tar archive holding a single directory entry, as the Docker archive API
+     *  returns it for that directory: the directory itself as the leading entry. */
+    private static byte[] tarOfDir(String name, int mode) throws IOException {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        try (TarArchiveOutputStream tar = new TarArchiveOutputStream(bos)) {
+            TarArchiveEntry dir = new TarArchiveEntry(name + "/");
+            dir.setMode(mode);
+            tar.putArchiveEntry(dir);
+            tar.closeArchiveEntry();
+        }
+        return bos.toByteArray();
+    }
+
+    /** Stubs the container's effective working directory (as Docker reports it after
+     *  create) and the archive entries the workdir check reads for each path component. */
+    private void stubImageWorkdir(String workdir, Map<String, Integer> pathModes) throws IOException {
+        ContainerConfig containerConfig = mock(ContainerConfig.class);
+        when(containerConfig.getWorkingDir()).thenReturn(workdir);
+        InspectContainerResponse inspect = mock(InspectContainerResponse.class);
+        when(inspect.getConfig()).thenReturn(containerConfig);
+        InspectContainerCmd inspectCmd = mock(InspectContainerCmd.class);
+        when(inspectCmd.exec()).thenReturn(inspect);
+        when(dockerClient.inspectContainerCmd("container-123")).thenReturn(inspectCmd);
+        for (Map.Entry<String, Integer> entry : pathModes.entrySet()) {
+            String path = entry.getKey();
+            String baseName = path.substring(path.lastIndexOf('/') + 1);
+            CopyArchiveFromContainerCmd copyCmd = mock(CopyArchiveFromContainerCmd.class);
+            when(copyCmd.exec()).thenReturn(new ByteArrayInputStream(tarOfDir(baseName, entry.getValue())));
+            when(dockerClient.copyArchiveFromContainerCmd("container-123", path)).thenReturn(copyCmd);
+        }
+    }
+
+    @Test
+    void launchFunction_failsInitWhenImageWorkdirRefusesDefaultUser() throws Exception {
+        stubImageWorkdir("/home/nonroot", Map.of("/home", 040755, "/home/nonroot", 040700));
+
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("workdir-repro");
+        fn.setPackageType("Image");
+        fn.setImageUri("workdir-repro:latest");
+
+        WorkdirNotAccessibleException thrown =
+                assertThrows(WorkdirNotAccessibleException.class, () -> launcher.launch(fn));
+        assertEquals("/home/nonroot", thrown.blockedDirectory());
+        verify(lifecycleManager, never()).startCreated(eq("container-123"), any());
+    }
+
+    @Test
+    void launchFunction_startsWhenImageWorkdirIsEnterable() throws Exception {
+        stubImageWorkdir("/home/nonroot", Map.of("/home", 040755, "/home/nonroot", 040755));
+
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("workdir-ok");
+        fn.setPackageType("Image");
+        fn.setImageUri("workdir-ok:latest");
+
+        launcher.launch(fn);
+
+        verify(lifecycleManager).startCreated(eq("container-123"), any());
     }
 
     /**

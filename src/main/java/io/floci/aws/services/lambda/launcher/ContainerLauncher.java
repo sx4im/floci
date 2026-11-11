@@ -2,6 +2,7 @@ package io.floci.aws.services.lambda.launcher;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.ExecCreateCmd;
+import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.exception.NotFoundException;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
@@ -414,6 +415,14 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // Copy code into container via Docker API tar stream (works inside Docker too).
         // Hot-reload functions skip the tar-copy — the bind-mount already wires the host path.
         DockerClient dockerClient = lifecycleManager.getDockerClient();
+        // Image functions only: AWS runs the image as its own default non-root user, so a
+        // working directory the image's user can enter may still refuse that user (a distroless
+        // nonroot image whose /home/nonroot is 0700 is the reported case). Check before the
+        // runtime starts, while the container exists but is not running, and fail init the
+        // way AWS does when the directory is not enterable.
+        if ("Image".equals(fn.getPackageType())) {
+            verifyImageWorkdirAccessible(dockerClient, containerId, fn.getFunctionName());
+        }
         if (!fn.isHotReload() && fn.getCodeLocalPath() != null) {
             Path codePath = Path.of(fn.getCodeLocalPath());
 
@@ -1575,6 +1584,84 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     EXTENSIONS_DIR, functionName, e.getMessage());
             return List.of();
         }
+    }
+
+    /**
+     * Reads the effective working directory of a created (not yet started) image container
+     * and checks that AWS Lambda's default non-root user could enter every directory on
+     * its path, using the Docker archive API the same way {@link #listExtensionBinaries}
+     * does, so minimal images without shell utilities still work. Throws
+     * {@link WorkdirNotAccessibleException} when a directory refuses that user. A probe
+     * failure degrades to skipping the check rather than failing the launch.
+     */
+    private void verifyImageWorkdirAccessible(DockerClient dockerClient, String containerId,
+                                              String functionName) {
+        String workdir;
+        try {
+            InspectContainerResponse inspect = dockerClient.inspectContainerCmd(containerId).exec();
+            if (inspect.getConfig() == null) {
+                return;
+            }
+            workdir = inspect.getConfig().getWorkingDir();
+        } catch (Exception e) {
+            LOG.debugv("Could not read working directory for function {0} ({1}); skipping workdir check",
+                    functionName, e.getMessage());
+            return;
+        }
+        Optional<WorkdirAccessChecker.BlockedDir> blocked =
+                WorkdirAccessChecker.firstBlockedDirectory(workdir,
+                        path -> statContainerPath(dockerClient, containerId, path));
+        if (blocked.isPresent()) {
+            WorkdirAccessChecker.BlockedDir dir = blocked.get();
+            throw new WorkdirNotAccessibleException(functionName, dir.path(), dir.mode());
+        }
+    }
+
+    /**
+     * Reads one directory entry inside a created container through the Docker archive API,
+     * returning empty when the path is absent. Only the entry for the requested path itself
+     * is read; the archive is closed before its contents are streamed, so a working
+     * directory holding many files costs one small read per path component. A probe failure
+     * returns empty as well, so the caller treats the directory as enterable rather than
+     * failing a launch over a daemon hiccup.
+     */
+    private Optional<WorkdirAccessChecker.DirEntry> statContainerPath(DockerClient dockerClient,
+                                                                      String containerId, String path) {
+        try (InputStream tarStream = dockerClient.copyArchiveFromContainerCmd(containerId, path).exec();
+             TarArchiveInputStream tar = new TarArchiveInputStream(tarStream)) {
+            String baseName = path.substring(path.lastIndexOf('/') + 1);
+            TarArchiveEntry first = null;
+            TarArchiveEntry entry;
+            int seen = 0;
+            while ((entry = tar.getNextEntry()) != null && seen < 64) {
+                if (first == null) {
+                    first = entry;
+                }
+                seen++;
+                if (entry.getName().equals(baseName) || entry.getName().equals(baseName + "/")) {
+                    return Optional.of(toDirEntry(entry));
+                }
+            }
+            if (first == null) {
+                return Optional.empty();
+            }
+            return Optional.of(toDirEntry(first));
+        } catch (NotFoundException expected) {
+            // A missing path is not an error: Docker creates a missing working directory at
+            // container creation, so the caller treats it as enterable.
+            return Optional.empty();
+        } catch (Exception e) {
+            LOG.debugv("Could not read directory mode for {0} in function container ({1}); "
+                            + "assuming it is enterable",
+                    path, e.getMessage());
+            return Optional.empty();
+        }
+    }
+
+    private static WorkdirAccessChecker.DirEntry toDirEntry(TarArchiveEntry entry) {
+        return new WorkdirAccessChecker.DirEntry(entry.getMode(), (int) entry.getUserId(),
+                (int) entry.getGroupId(), entry.isDirectory(), entry.isSymbolicLink(),
+                entry.getLinkName());
     }
 
     private static String extractRegionFromArn(String arn, String defaultRegion) {

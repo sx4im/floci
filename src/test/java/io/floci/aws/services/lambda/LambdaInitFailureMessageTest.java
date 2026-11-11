@@ -1,5 +1,6 @@
 package io.floci.aws.services.lambda;
 
+import io.floci.aws.services.lambda.launcher.WorkdirNotAccessibleException;
 import org.junit.jupiter.api.Test;
 
 import java.net.SocketException;
@@ -42,5 +43,28 @@ class LambdaInitFailureMessageTest {
 
         assertThat(LambdaExecutorService.initFailureMessage(e, false),
                 equalTo("Failed to start Lambda container: connect failed"));
+    }
+
+    @Test
+    void workdirFailureReportsInvalidEntrypoint() {
+        Exception e = new WorkdirNotAccessibleException("workdir-repro", "/home/nonroot", 0700);
+
+        assertThat(LambdaExecutorService.initFailureErrorType(e),
+                equalTo("Runtime.InvalidEntrypoint"));
+    }
+
+    @Test
+    void wrappedWorkdirFailureReportsInvalidEntrypoint() {
+        Exception e = new IllegalStateException("launch failed",
+                new WorkdirNotAccessibleException("workdir-repro", "/home/nonroot", 0700));
+
+        assertThat(LambdaExecutorService.initFailureErrorType(e),
+                equalTo("Runtime.InvalidEntrypoint"));
+    }
+
+    @Test
+    void otherFailuresReportInitError() {
+        assertThat(LambdaExecutorService.initFailureErrorType(new IllegalStateException("image pull failed")),
+                equalTo("Lambda.InitError"));
     }
 }

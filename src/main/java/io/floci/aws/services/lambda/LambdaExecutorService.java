@@ -7,6 +7,7 @@ import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.Resettable;
 import io.floci.aws.services.lambda.launcher.ContainerHandle;
+import io.floci.aws.services.lambda.launcher.WorkdirNotAccessibleException;
 import io.floci.aws.services.lambda.model.FunctionEventInvokeConfig;
 import io.floci.aws.services.lambda.model.InvocationType;
 import io.floci.aws.services.lambda.model.InvokeResult;
@@ -372,6 +373,19 @@ public class LambdaExecutorService implements Resettable {
         return "Failed to start Lambda container: " + e.getMessage();
     }
 
+    /**
+     * A launch that failed because the image working directory refuses the Lambda default
+     * user fails init the way AWS reports it, not as a generic container-start failure.
+     */
+    static String initFailureErrorType(Exception e) {
+        for (Throwable cause = e; cause != null; cause = cause.getCause()) {
+            if (cause instanceof WorkdirNotAccessibleException) {
+                return "Runtime.InvalidEntrypoint";
+            }
+        }
+        return "Lambda.InitError";
+    }
+
     private InvokeResult executeSync(LambdaFunction fn, byte[] payload, String requestId,
                                      String clientContext, String invokedQualifier,
                                      ResponseStreamListener listener) {
@@ -384,7 +398,7 @@ public class LambdaExecutorService implements Resettable {
         } catch (Exception e) {
             LOG.warnv("Failed to acquire container for function {0}: {1}", fn.getFunctionName(), e.getMessage());
             return new InvokeResult(200, "Unhandled",
-                    buildErrorPayload(initFailureMessage(e, dockerExecutor), "Lambda.InitError"),
+                    buildErrorPayload(initFailureMessage(e, dockerExecutor), initFailureErrorType(e)),
                     null, requestId);
         }
         long deadlineMs = System.currentTimeMillis() + (long) fn.getTimeout() * 1000;
