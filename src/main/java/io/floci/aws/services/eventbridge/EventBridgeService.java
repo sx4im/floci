@@ -51,6 +51,8 @@ import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.time.Instant;
+import java.time.format.DateTimeParseException;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -1490,7 +1492,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
             node.put("source", source);
             node.put("detail-type", detailType);
             node.put("account", envelopeAccount);
-            node.put("time", Instant.now().toString());
+            node.put("time", eventTime(entry).toString());
             node.put("region", envelopeRegion);
             node.putArray("resources").addAll(resources);
             node.set("detail", objectMapper.readTree(detail));
@@ -1499,6 +1501,30 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         } catch (Exception e) {
             return "{}";
         }
+    }
+
+    /**
+     * The {@code time} a delivered event reports: the PutEvents entry's {@code Time} when one was
+     * supplied, otherwise the receive time. AWS reports whole-second precision either way, so the
+     * value is truncated to seconds. The handler stores {@code Time} as an {@link Instant}; a
+     * {@link Number} is epoch seconds and a {@link String} is ISO-8601, both accepted so entries
+     * built by other callers resolve the same way.
+     */
+    private static Instant eventTime(Map<String, Object> entry) {
+        Object raw = entry.get("Time");
+        Instant eventTime = null;
+        if (raw instanceof Instant instant) {
+            eventTime = instant;
+        } else if (raw instanceof Number number) {
+            eventTime = Instant.ofEpochSecond(number.longValue());
+        } else if (raw instanceof String text && !text.isBlank()) {
+            try {
+                eventTime = Instant.parse(text);
+            } catch (DateTimeParseException expected) {
+                eventTime = null;
+            }
+        }
+        return (eventTime == null ? Instant.now() : eventTime).truncatedTo(ChronoUnit.SECONDS);
     }
 
     // ──────────────────────────── Helpers ────────────────────────────

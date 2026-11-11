@@ -31,6 +31,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -857,6 +858,70 @@ class EventBridgeServiceTest {
         service.putTargets("my-rule", null, List.of(second), REGION);
         assertEquals(List.of("t1", "t2"),
                 currentTargets.getValue().get().stream().map(Target::getId).toList());
+    }
+
+    @Test
+    void putEventsUsesTheEntryTimeTruncatedToSeconds() throws Exception {
+        Rule rule = service.putRule("my-rule", null, "{\"source\":[\"my.app\"]}", null, RuleState.ENABLED,
+                null, null, null, REGION);
+        Target target = new Target("t1", "arn:aws:sqs:us-east-1:000000000000:queue-1", null, null);
+        service.putTargets("my-rule", null, List.of(target), REGION);
+
+        Map<String, Object> entry = new HashMap<>();
+        entry.put("Source", "my.app");
+        entry.put("DetailType", "Test");
+        entry.put("Detail", "{}");
+        entry.put("Time", Instant.parse("2026-01-02T03:04:05.678Z"));
+        service.putEvents(List.of(entry), REGION);
+
+        ArgumentCaptor<String> eventJson = ArgumentCaptor.forClass(String.class);
+        verify(dispatcherMock).dispatch(eq(rule.getArn()), eq(target), eventJson.capture(), eq(REGION), any());
+        JsonNode event = OBJECT_MAPPER.readTree(eventJson.getValue());
+        assertEquals("2026-01-02T03:04:05Z", event.path("time").asText());
+    }
+
+    @Test
+    void putEventsAcceptsEpochSecondsAndIsoStringEntryTimes() throws Exception {
+        Rule rule = service.putRule("my-rule", null, "{\"source\":[\"my.app\"]}", null, RuleState.ENABLED,
+                null, null, null, REGION);
+        Target target = new Target("t1", "arn:aws:sqs:us-east-1:000000000000:queue-1", null, null);
+        service.putTargets("my-rule", null, List.of(target), REGION);
+
+        long epochSeconds = Instant.parse("2026-01-02T03:04:05Z").getEpochSecond();
+        Map<String, Object> epochEntry = new HashMap<>();
+        epochEntry.put("Source", "my.app");
+        epochEntry.put("DetailType", "Test");
+        epochEntry.put("Detail", "{}");
+        epochEntry.put("Time", epochSeconds);
+        Map<String, Object> stringEntry = new HashMap<>();
+        stringEntry.put("Source", "my.app");
+        stringEntry.put("DetailType", "Test");
+        stringEntry.put("Detail", "{}");
+        stringEntry.put("Time", "2026-01-02T03:04:05.678Z");
+        service.putEvents(List.of(epochEntry, stringEntry), REGION);
+
+        ArgumentCaptor<String> eventJson = ArgumentCaptor.forClass(String.class);
+        verify(dispatcherMock, Mockito.times(2)).dispatch(eq(rule.getArn()), eq(target),
+                eventJson.capture(), eq(REGION), any());
+        for (String json : eventJson.getAllValues()) {
+            assertEquals("2026-01-02T03:04:05Z", OBJECT_MAPPER.readTree(json).path("time").asText());
+        }
+    }
+
+    @Test
+    void putEventsStampsWholeSecondTimeWhenTheEntryHasNoTime() throws Exception {
+        Rule rule = service.putRule("my-rule", null, "{\"source\":[\"my.app\"]}", null, RuleState.ENABLED,
+                null, null, null, REGION);
+        Target target = new Target("t1", "arn:aws:sqs:us-east-1:000000000000:queue-1", null, null);
+        service.putTargets("my-rule", null, List.of(target), REGION);
+
+        service.putEvents(List.of(Map.of("Source", "my.app", "DetailType", "Test", "Detail", "{}")), REGION);
+
+        ArgumentCaptor<String> eventJson = ArgumentCaptor.forClass(String.class);
+        verify(dispatcherMock).dispatch(eq(rule.getArn()), eq(target), eventJson.capture(), eq(REGION), any());
+        JsonNode event = OBJECT_MAPPER.readTree(eventJson.getValue());
+        assertTrue(event.path("time").asText().matches("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z"),
+                "delivered time must carry whole-second precision, was: " + event.path("time").asText());
     }
 
     @Test
