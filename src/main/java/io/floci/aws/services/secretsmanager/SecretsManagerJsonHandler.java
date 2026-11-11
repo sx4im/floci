@@ -234,7 +234,10 @@ public class SecretsManagerJsonHandler {
         ObjectNode response = objectMapper.createObjectNode();
         response.put("ARN", secret.getArn());
         response.put("Name", secret.getName());
-        response.put("VersionId", secret.getCurrentVersionId());
+        // A secret created without a value has no version yet, and AWS omits VersionId then.
+        if (secret.getCurrentVersionId() != null) {
+            response.put("VersionId", secret.getCurrentVersionId());
+        }
         if (!replicaRegions.isEmpty()) {
             response.set("ReplicationStatus", replicationStatusNode(secret));
         }
@@ -392,7 +395,11 @@ public class SecretsManagerJsonHandler {
             response.set("ReplicationStatus", replicationStatusNode(secret));
         }
         response.set("Tags", tagsNode(secret));
-        response.set("VersionIdsToStages", versionStagesNode(secret));
+        // AWS returns only fields that have a value: a secret with no versions yet carries
+        // no VersionIdsToStages entry.
+        if (secret.getVersions() != null && !secret.getVersions().isEmpty()) {
+            response.set("VersionIdsToStages", versionStagesNode(secret));
+        }
         return Response.ok(response).build();
     }
 
@@ -602,7 +609,11 @@ public class SecretsManagerJsonHandler {
                 node.set("ReplicationStatus", replicationStatusNode(secret));
             }
             node.set("Tags", tagsNode(secret));
-            node.set("SecretVersionsToStages", versionStagesNode(secret));
+            // AWS returns only fields that have a value: a secret with no versions yet carries
+            // no SecretVersionsToStages entry.
+            if (secret.getVersions() != null && !secret.getVersions().isEmpty()) {
+                node.set("SecretVersionsToStages", versionStagesNode(secret));
+            }
             secretList.add(node);
         }
         response.set("SecretList", secretList);

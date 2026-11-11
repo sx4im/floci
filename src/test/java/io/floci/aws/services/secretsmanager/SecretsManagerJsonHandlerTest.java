@@ -154,6 +154,48 @@ class SecretsManagerJsonHandlerTest {
     }
 
     @Test
+    void createSecretWithoutValueOmitsVersionId() {
+        // AWS omits VersionId from the CreateSecret response when no version exists.
+        ObjectNode createReq = MAPPER.createObjectNode();
+        createReq.put("Name", "no-value");
+        Response response = handler.handle("CreateSecret", createReq, REGION);
+
+        assertThat(response.getStatus(), is(200));
+        ObjectNode body = (ObjectNode) response.getEntity();
+        assertThat(body.has("VersionId"), is(false));
+    }
+
+    @Test
+    void describeSecretWithoutValueOmitsVersionIdsToStages() {
+        ObjectNode createReq = MAPPER.createObjectNode();
+        createReq.put("Name", "no-value");
+        handler.handle("CreateSecret", createReq, REGION);
+
+        ObjectNode describeReq = MAPPER.createObjectNode();
+        describeReq.put("SecretId", "no-value");
+        ObjectNode described = (ObjectNode) handler
+                .handle("DescribeSecret", describeReq, REGION)
+                .getEntity();
+
+        assertThat(described.has("VersionIdsToStages"), is(false));
+    }
+
+    @Test
+    void listSecretsWithoutValueOmitsSecretVersionsToStages() {
+        ObjectNode createReq = MAPPER.createObjectNode();
+        createReq.put("Name", "no-value");
+        handler.handle("CreateSecret", createReq, REGION);
+
+        ObjectNode listed = (ObjectNode) ((ObjectNode) handler
+                .handle("ListSecrets", MAPPER.createObjectNode(), REGION)
+                .getEntity())
+                .path("SecretList")
+                .path(0);
+
+        assertThat(listed.has("SecretVersionsToStages"), is(false));
+    }
+
+    @Test
     void targetAttachmentOwnershipIsNotExposedByPublicResponses() {
         ObjectNode createReq = MAPPER.createObjectNode();
         createReq.put("Name", "attached-secret");
@@ -297,6 +339,9 @@ class SecretsManagerJsonHandlerTest {
     private void createSecret(String name) {
         ObjectNode req = MAPPER.createObjectNode();
         req.put("Name", name);
+        // A version exists only when CreateSecret carries a value, so fixtures that assert
+        // version behavior create with one; valueless creates are covered by their own tests.
+        req.put("SecretString", "value");
         handler.handle("CreateSecret", req, REGION);
     }
 
