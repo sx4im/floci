@@ -143,7 +143,7 @@ class EksPodIdentityAccountIntegrationTest {
                 RequestScopes.runAs(account, () -> {
                     associationService.deleteClusterAssociations(cluster);
                     addonService.deleteClusterAddons(cluster);
-                    oidcService.deleteKey(name);
+                    oidcService.deleteKey("us-east-1", name);
                     iamService.findRole(account, roleName).ifPresent(role -> iamService.deleteRole(roleName));
                 }));
         eksService.deleteClusterForAccount(account, name);

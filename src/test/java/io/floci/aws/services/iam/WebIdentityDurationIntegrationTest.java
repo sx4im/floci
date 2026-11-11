@@ -96,8 +96,8 @@ class WebIdentityDurationIntegrationTest {
                     }
                 } finally {
                     try {
-                        oidc.deleteKey(keyName);
-                        assertTrue(oidc.findKeyByCluster(keyName).isEmpty());
+                        oidc.deleteKey("us-east-1", keyName);
+                        assertTrue(oidc.findKeyByCluster("us-east-1", keyName).isEmpty());
                     } finally {
                         admin.deleteRole(b -> b.roleName(keyName));
                     }

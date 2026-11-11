@@ -116,9 +116,9 @@ class EksOidcServiceTest {
     @Test
     void deleteKeyRemovesSigningMaterial() {
         oidcService.ensureKey(CLUSTER, ISSUER);
-        oidcService.deleteKey(CLUSTER);
+        oidcService.deleteKey("us-east-1", CLUSTER);
 
-        assertTrue(oidcService.findKeyByCluster(CLUSTER).isEmpty());
+        assertTrue(oidcService.findKeyByCluster("us-east-1", CLUSTER).isEmpty());
         assertTrue(oidcService.findVerificationKey(ISSUER).isEmpty());
     }
 

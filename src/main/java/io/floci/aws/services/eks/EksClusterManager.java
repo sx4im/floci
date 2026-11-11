@@ -1405,11 +1405,13 @@ public class EksClusterManager
 
     /**
      * Account-qualified Docker name for a cluster. Cluster names are unique only within an
-     * account, so a non-default account's cluster is qualified with its account ID — otherwise
-     * two accounts' same-named clusters would resolve to the same container and data volume,
-     * letting one account reach (or, via startCluster's stale-container removal, destroy) the
-     * other's workloads. The default account keeps the historical unqualified name so existing
-     * containers, volumes, and {@code endpoint-mode=network} DNS names keep working.
+     * account and a region, so a non-default account's cluster is qualified with its account ID
+     * and every cluster with its region — otherwise two accounts' or two regions' same-named
+     * clusters would resolve to the same container and data volume, letting one reach (or, via
+     * startCluster's stale-container removal, destroy) the other's workloads. Clusters created
+     * before region qualification keep their historical name through
+     * {@link #resolveRestoredDockerName}, so existing containers, volumes, and
+     * {@code endpoint-mode=network} DNS names keep working.
      *
      * <p>The qualifier separator is a dot: EksService validates cluster names against the AWS
      * charset ({@code [0-9A-Za-z][A-Za-z0-9\-_]*}), which admits no dot, so no default-account
@@ -1428,7 +1430,11 @@ public class EksClusterManager
     private String accountQualifiedClusterName(Cluster cluster) {
         String accountId = cluster.getAccountId();
         boolean defaultAccount = accountId == null || accountId.equals(config.defaultAccountId());
-        return defaultAccount ? cluster.getName() : accountId + "." + cluster.getName();
+        // Cluster names are unique per region, so the region is part of the name since #7966:
+        // two same-named clusters in different regions would otherwise resolve to the same
+        // container and data volume.
+        String qualified = clusterRegion(cluster) + "." + cluster.getName();
+        return defaultAccount ? qualified : accountId + "." + qualified;
     }
 
     /**
@@ -1438,7 +1444,8 @@ public class EksClusterManager
      * that name when its own container survived there, or the upgrade would recreate the
      * cluster under the qualified name and orphan the historical workloads. The legacy
      * container is claimed only when its {@code io.floci.account} label matches the owning
-     * account; another account's container — or one with no verifiable owner — is left
+     * account and its {@code io.floci.region} label (when present) matches the cluster's region;
+     * another account's or region's container — or one with no verifiable owner — is left
      * untouched and the cluster starts fresh under the qualified name. A surviving legacy
      * volume without its container carries no ownership label and is deliberately not claimed —
      * it is reported via {@link #warnUnclaimedLegacyState} so the operator can migrate the data
@@ -1468,7 +1475,11 @@ public class EksClusterManager
         if (legacySurvivor.isPresent()) {
             var labels = legacySurvivor.get().getLabels();
             String owner = labels != null ? labels.get("io.floci.account") : null;
-            if (cluster.getAccountId() != null && cluster.getAccountId().equals(owner)) {
+            // Containers carry their region label too: a legacy container for the same name in
+            // another region is a different cluster's, even under the same account (#7966).
+            String legacyRegion = labels != null ? labels.get(ContainerStorageHelper.REGION_LABEL) : null;
+            if (cluster.getAccountId() != null && cluster.getAccountId().equals(owner)
+                    && (legacyRegion == null || legacyRegion.equals(clusterRegion(cluster)))) {
                 LOG.infov("EKS cluster {0} (account {1}) keeps its pre-upgrade Docker name {2}",
                         cluster.getName(), cluster.getAccountId(), legacy);
                 return legacy;

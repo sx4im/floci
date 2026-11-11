@@ -31,6 +31,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Owns the RSA signing material behind each EKS cluster's IRSA OIDC issuer, mints service-account
@@ -49,6 +51,10 @@ public class EksOidcService implements OidcIssuerKeyLookup {
     public static final String STS_AUDIENCE = "sts.amazonaws.com"; // partition-literal: web-identity audience; no source outside the commercial partition (P9)
     private static final int DEFAULT_TOKEN_LIFETIME_SECONDS = 86400;
     private static final int MAX_TOKEN_LIFETIME_SECONDS = 604800;
+
+    /** The region label in an OIDC issuer host ({@code oidc.eks.<region>.<dns-suffix>}). */
+    private static final Pattern ISSUER_REGION_PATTERN =
+            Pattern.compile("oidc\\.eks\\.([a-z]{2,4}-[a-z-]+-\\d+)\\.");
 
     private final StorageBackend<String, ClusterOidcKey> keyStore;
     private final ObjectMapper objectMapper;
@@ -72,7 +78,10 @@ public class EksOidcService implements OidcIssuerKeyLookup {
 
     /**
      * Generates and stores the cluster's signing keypair if absent, returning the stored material.
-     * Keyed by cluster name so {@code DeleteCluster} can drop it.
+     * Keyed by region and cluster name since #7966, so same-named clusters in different regions
+     * keep distinct signing keys: the issuer URL carries the region, and the key for one region's
+     * cluster must never overwrite another's. An issuer with no region in it keeps the historical
+     * bare cluster-name key.
      */
     public synchronized ClusterOidcKey ensureKey(String clusterName, String issuer) {
         return ensureKey(null, clusterName, issuer);
@@ -89,7 +98,8 @@ public class EksOidcService implements OidcIssuerKeyLookup {
     }
 
     private ClusterOidcKey ensureKey(String accountId, String clusterName, String issuer) {
-        Optional<ClusterOidcKey> existing = readKey(accountId, clusterName);
+        String region = regionFromIssuer(issuer);
+        Optional<ClusterOidcKey> existing = readKey(accountId, region, clusterName);
         if (existing.isPresent() && issuer.equals(existing.get().getIssuer())) {
             return existing.get();
         }
@@ -104,7 +114,7 @@ public class EksOidcService implements OidcIssuerKeyLookup {
                     UUID.randomUUID().toString(),
                     Base64.getEncoder().encodeToString(keyPair.getPublic().getEncoded()),
                     Base64.getEncoder().encodeToString(keyPair.getPrivate().getEncoded()));
-            writeKey(accountId, clusterName, key);
+            writeKey(accountId, region, clusterName, key);
             LOG.debugv("Generated IRSA OIDC signing key for EKS cluster {0}", clusterName);
             return key;
         } catch (NoSuchAlgorithmException e) {
@@ -113,27 +123,95 @@ public class EksOidcService implements OidcIssuerKeyLookup {
         }
     }
 
-    private Optional<ClusterOidcKey> readKey(String accountId, String clusterName) {
-        if (accountId != null && keyStore instanceof AccountAwareStorageBackend<ClusterOidcKey> aware) {
-            return aware.getForAccount(accountId, clusterName);
+    /** The region an issuer URL names, or null when it carries none. */
+    static String regionFromIssuer(String issuer) {
+        if (issuer == null) {
+            return null;
         }
-        return keyStore.get(clusterName);
+        Matcher matcher = ISSUER_REGION_PATTERN.matcher(issuer);
+        return matcher.find() ? matcher.group(1) : null;
     }
 
-    private void writeKey(String accountId, String clusterName, ClusterOidcKey key) {
+    /** Storage key for a cluster's signing key: region-qualified when the region is known. */
+    private static String oidcKey(String region, String clusterName) {
+        return region == null ? clusterName : region + "/" + clusterName;
+    }
+
+    /**
+     * The signing key for {@code clusterName} in {@code region}: the region-qualified record
+     * first, then a key stored under the bare name before #7966. A legacy hit whose issuer
+     * names this region is migrated to the qualified key on read; a legacy key for another
+     * region belongs to the same-named cluster there and is not visible here.
+     */
+    private Optional<ClusterOidcKey> readKey(String accountId, String region, String clusterName) {
+        if (region != null) {
+            Optional<ClusterOidcKey> qualified = readKeyAt(accountId, oidcKey(region, clusterName));
+            if (qualified.isPresent()) {
+                return qualified;
+            }
+            Optional<ClusterOidcKey> legacy = readKeyAt(accountId, clusterName);
+            if (legacy.isPresent() && region.equals(regionFromIssuer(legacy.get().getIssuer()))) {
+                writeKeyAt(accountId, oidcKey(region, clusterName), legacy.get());
+                deleteKeyAt(accountId, clusterName);
+                return legacy;
+            }
+            return Optional.empty();
+        }
+        return readKeyAt(accountId, clusterName);
+    }
+
+    private Optional<ClusterOidcKey> readKeyAt(String accountId, String key) {
         if (accountId != null && keyStore instanceof AccountAwareStorageBackend<ClusterOidcKey> aware) {
-            aware.putForAccount(accountId, clusterName, key);
+            return aware.getForAccount(accountId, key);
+        }
+        return keyStore.get(key);
+    }
+
+    private void writeKey(String accountId, String region, String clusterName, ClusterOidcKey key) {
+        writeKeyAt(accountId, oidcKey(region, clusterName), key);
+        if (region != null) {
+            // A same-region legacy bare key is this cluster's old key: drop it once the
+            // region-qualified record exists, so no stale copy survives the rotation.
+            Optional<ClusterOidcKey> legacy = readKeyAt(accountId, clusterName);
+            if (legacy.isPresent() && region.equals(regionFromIssuer(legacy.get().getIssuer()))) {
+                deleteKeyAt(accountId, clusterName);
+            }
+        }
+    }
+
+    private void writeKeyAt(String accountId, String key, ClusterOidcKey value) {
+        if (accountId != null && keyStore instanceof AccountAwareStorageBackend<ClusterOidcKey> aware) {
+            aware.putForAccount(accountId, key, value);
             return;
         }
-        keyStore.put(clusterName, key);
+        keyStore.put(key, value);
     }
 
-    public void deleteKey(String clusterName) {
-        keyStore.delete(clusterName);
+    private void deleteKeyAt(String accountId, String key) {
+        if (accountId != null && keyStore instanceof AccountAwareStorageBackend<ClusterOidcKey> aware) {
+            aware.deleteForAccount(accountId, key);
+            return;
+        }
+        keyStore.delete(key);
     }
 
-    public Optional<ClusterOidcKey> findKeyByCluster(String clusterName) {
-        return keyStore.get(clusterName);
+    /**
+     * Drops the signing key for {@code clusterName} in {@code region}. The legacy bare key is
+     * removed only when it names a key for this region: a bare key from another region is a
+     * different cluster's key that still restores.
+     */
+    public void deleteKey(String region, String clusterName) {
+        keyStore.delete(oidcKey(region, clusterName));
+        if (region != null) {
+            Optional<ClusterOidcKey> legacy = keyStore.get(clusterName);
+            if (legacy.isPresent() && region.equals(regionFromIssuer(legacy.get().getIssuer()))) {
+                keyStore.delete(clusterName);
+            }
+        }
+    }
+
+    public Optional<ClusterOidcKey> findKeyByCluster(String region, String clusterName) {
+        return readKey(null, region, clusterName);
     }
 
     @Override
