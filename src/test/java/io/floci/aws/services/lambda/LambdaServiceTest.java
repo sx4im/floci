@@ -195,6 +195,40 @@ class LambdaServiceTest {
         assertEquals("InvalidParameterValueException", error.getErrorCode());
     }
 
+    @Test
+    void createFunctionRejectsEnvironmentVariablesOver4Kb() {
+        Map<String, Object> request = baseRequest("big-env-function");
+        request.put("Environment", Map.of("Variables", Map.of("BIG", "x".repeat(5000))));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.createFunction(REGION, request));
+        assertEquals("InvalidParameterValueException", error.getErrorCode());
+        assertThrows(AwsException.class, () -> service.getFunction(REGION, "big-env-function"));
+    }
+
+    @Test
+    void createFunctionAcceptsEnvironmentVariablesAtExactly4Kb() {
+        Map<String, Object> request = baseRequest("at-limit-env-function");
+        request.put("Environment", Map.of("Variables", Map.of("BIG", "x".repeat(4093))));
+
+        LambdaFunction fn = service.createFunction(REGION, request);
+        assertEquals(4093, fn.getEnvironment().get("BIG").length());
+    }
+
+    @Test
+    void updateFunctionConfigurationRejectsEnvironmentVariablesOver4Kb() {
+        Map<String, Object> request = baseRequest("update-big-env-function");
+        request.put("Environment", Map.of("Variables", Map.of("MARKER", "original")));
+        service.createFunction(REGION, request);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.updateFunctionConfiguration(REGION, "update-big-env-function",
+                        Map.of("Environment", Map.of("Variables", Map.of("BIG", "x".repeat(5000))))));
+        assertEquals("InvalidParameterValueException", error.getErrorCode());
+        assertEquals(Map.of("MARKER", "original"),
+                service.getFunction(REGION, "update-big-env-function").getEnvironment());
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {
             "arn:aws-cn:elasticfilesystem:cn-north-1:",

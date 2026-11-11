@@ -133,6 +133,7 @@ public class LambdaService implements ResourceProvider {
     private static final int MAX_DURABLE_RETENTION_DAYS = 90;
     private static final int DEFAULT_DURABLE_RETENTION_DAYS = 14;
     private static final int MAX_FUNCTION_TIMEOUT_SECONDS = 900;
+    private static final int MAX_ENVIRONMENT_VARIABLES_SIZE_BYTES = 4096;
     private static final int SYNC_DURABLE_GRACE_SECONDS = 5;
     private static final Pattern DURABLE_EXECUTION_NAME_PATTERN = Pattern.compile("[a-zA-Z0-9-_]+");
     private static final Pattern LAYER_VERSION_ARN_PATTERN = Pattern.compile(
@@ -558,6 +559,7 @@ public class LambdaService implements ResourceProvider {
         }
         validateEnum(runtime, "runtime", RUNTIME_VALUES);
         validateMaxLength(description, "description", 256);
+        validateEnvironmentVariablesSize(environmentVariables);
         if (codeSigningConfigArn != null) {
             if (codeSigningConfigService == null) {
                 throw new IllegalStateException("Lambda code-signing configuration service is unavailable");
@@ -1059,6 +1061,7 @@ public class LambdaService implements ResourceProvider {
             validateLayersResolvable(layerList);
         }
         validateMaxLength(request.get("Description"), "description", 256);
+        validateEnvironmentVariablesSize(environmentVariables);
         if (request.containsKey("Runtime")) {
             validateEnum(request.get("Runtime"), "runtime", RUNTIME_VALUES);
         }
@@ -3118,6 +3121,30 @@ public class LambdaService implements ResourceProvider {
         throw SmithyValidationErrors.validationException(
                 "Value at '" + field + "' failed to satisfy constraint: "
                         + "Member must have length less than or equal to " + maxLength);
+    }
+
+    /**
+     * AWS caps a function's environment variables at 4 KB in total, measured as the
+     * sum of the UTF-8 byte lengths of every variable name and value. A set over the
+     * limit is rejected with InvalidParameterValueException, matching the AWS error.
+     * A null map means the request carries no Environment member, so there is
+     * nothing to measure.
+     */
+    static void validateEnvironmentVariablesSize(Map<String, String> variables) {
+        if (variables == null) {
+            return;
+        }
+        int totalBytes = 0;
+        for (Map.Entry<String, String> entry : variables.entrySet()) {
+            totalBytes += entry.getKey().getBytes(StandardCharsets.UTF_8).length;
+            if (entry.getValue() != null) {
+                totalBytes += entry.getValue().getBytes(StandardCharsets.UTF_8).length;
+            }
+        }
+        if (totalBytes > MAX_ENVIRONMENT_VARIABLES_SIZE_BYTES) {
+            throw new AwsException("InvalidParameterValueException",
+                    "The environment variables you have provided exceeded the 4KB limit.", 400);
+        }
     }
 
     /**
